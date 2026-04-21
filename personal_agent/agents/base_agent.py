@@ -18,6 +18,8 @@ class BaseAgent(ABC):
         self,
         event,
         on_update: Optional[Callable[[str, str], None]] = None,
+        *,
+        stream_updates_sync_with_llm: bool = False,
     ) -> str:
         """
         处理一条消息事件，生成并返回回复内容。
@@ -37,6 +39,11 @@ class BaseAgent(ABC):
                        - content: 当前已生成的文本内容
                        - status:  "generating" | "done" | "error"
                        为 None 时表示无需实时更新（纯文本模式或测试场景）
+
+            stream_updates_sync_with_llm:
+                       为 True 时，在 LLM 每收到一段流式增量后立刻调用 on_update（由平台侧
+                       再做流式上屏，例如飞书 CardKit）。为 False 时由 Agent 内部按
+                       CARD_UPDATE_INTERVAL 节流并模拟打字机（用于旧版卡片 PATCH）。
 
         Returns:
             完整的回复文本字符串

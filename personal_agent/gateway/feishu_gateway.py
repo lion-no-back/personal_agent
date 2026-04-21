@@ -2,15 +2,36 @@ import json
 import logging
 import os
 import re
+import threading
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
 import lark_oapi as lark
+from lark_oapi.api.cardkit.v1.model.content_card_element_request import (
+    ContentCardElementRequest,
+)
+from lark_oapi.api.cardkit.v1.model.content_card_element_request_body import (
+    ContentCardElementRequestBody,
+)
+from lark_oapi.api.cardkit.v1.model.create_card_request import CreateCardRequest
+from lark_oapi.api.cardkit.v1.model.card import Card
+from lark_oapi.api.cardkit.v1.model.create_card_request_body import (
+    CreateCardRequestBody,
+)
+from lark_oapi.api.cardkit.v1.model.settings_card_request import SettingsCardRequest
+from lark_oapi.api.cardkit.v1.model.settings_card_request_body import (
+    SettingsCardRequestBody,
+)
+from lark_oapi.api.cardkit.v1.model.update_card_request import UpdateCardRequest
+from lark_oapi.api.cardkit.v1.model.update_card_request_body import (
+    UpdateCardRequestBody,
+)
 from lark_oapi.api.im.v1 import (
+    P2ImMessageMessageReadV1,
     P2ImMessageReceiveV1,
-    PatchMessageRequest,
-    PatchMessageRequestBody,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
@@ -51,13 +72,105 @@ class MessageEvent:
 #   卡片配置常量
 # ──────────────────────────────────────────────────────────────
 
-# 卡片标题与颜色主题，对应 3 种稳定状态 + 1 种错误状态
+# 卡片标题与颜色主题：创建=思考中，首次输出前切到生成中，收尾=完成/出错
 _CARD_CONFIG = {
     "thinking": {"title": "🤔 思考中...", "color": "blue"},
     "generating": {"title": "⚡ 生成中...", "color": "turquoise"},
     "done": {"title": "✅ 完成", "color": "green"},
     "error": {"title": "❌ 出错了", "color": "red"},
 }
+
+# 流式正文的 markdown 组件 element_id（需与创建卡片实体时的 JSON 一致）
+_STREAM_BODY_ELEMENT_ID = "body_md"
+# 创建后、首包正文前的占位（与飞书卡片初始展示一致，便于首包 content 做增量）
+_STREAM_PLACEHOLDER_BODY = "..."
+
+
+@dataclass
+class _StreamingCardSession:
+    """一次回复对应的 CardKit 卡片实体与流式序号。"""
+
+    card_id: str
+    sequence: int = 0
+    last_pushed_markdown: str = ""
+    header_is_generating: bool = False
+
+
+def _strip_stream_cursor(text: str) -> str:
+    """去掉 Agent 旧版打字机光标，避免破坏飞书「新内容为旧内容前缀」的流式增量规则。"""
+    if text.endswith(" ▌"):
+        return text[:-2]
+    if text.endswith("▌"):
+        return text[:-1]
+    return text
+
+
+class _CardStreamAsyncSink:
+    """
+    将 CardKit 流式更新放到独立线程：LLM 的 on_update(generating) 立即返回，不再被
+    每次 HTTP 阻塞；后台顺序推送并合并突发增量，整体墙钟时间显著缩短。
+    """
+
+    def __init__(self, gateway: "FeishuGateway", session: _StreamingCardSession) -> None:
+        self._gw = gateway
+        self._sess = session
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._latest: str = ""
+        self._end: Optional[str] = None
+        self._end_text: str = ""
+        self._finished = threading.Event()
+        self._t = threading.Thread(
+            target=self._loop, daemon=True, name="feishu-card-flush"
+        )
+        self._t.start()
+
+    def feed(self, content: str, status: str) -> None:
+        text = _strip_stream_cursor(content)
+        with self._cv:
+            if status == "generating":
+                if text:
+                    self._latest = text
+            elif status == "done":
+                self._end = "done"
+                self._end_text = text
+            else:
+                self._end = "error"
+                if text:
+                    self._end_text = text
+            self._cv.notify_all()
+        if status in ("done", "error"):
+            self._finished.wait(timeout=180)
+
+    def _loop(self) -> None:
+        try:
+            while True:
+                with self._lock:
+                    end = self._end
+                    et = self._end_text
+                    latest = self._latest
+                if end is not None:
+                    final = et or latest
+                    prev = self._sess.last_pushed_markdown
+                    delta_chars = max(0, len(final) - len(prev)) if final else 0
+                    if final and final != prev:
+                        self._gw._card_stream_push_markdown(self._sess, final)
+                    theme = "error" if end == "error" else "done"
+                    body_out = (et or latest) or self._sess.last_pushed_markdown
+                    self._gw._card_stream_finalize_card(
+                        self._sess,
+                        theme,
+                        body_out,
+                        last_content_delta_chars=delta_chars,
+                    )
+                    return
+                if latest and latest != self._sess.last_pushed_markdown:
+                    self._gw._card_stream_push_markdown(self._sess, latest)
+                    continue
+                with self._cv:
+                    self._cv.wait(timeout=0.05)
+        finally:
+            self._finished.set()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -73,7 +186,9 @@ class FeishuGateway:
     1. 维护与飞书服务器的 WebSocket 长连接，接收消息推送事件
     2. 解析事件，进行 @提及过滤、消息去重、内容清洗
     3. 将有效消息异步分发给 Agent 层处理（ThreadPool，不阻塞事件回调）
-    4. 管理飞书交互卡片的生命周期：创建"思考中"卡片 → 流式更新 → 完成/错误
+    4. 管理飞书卡片生命周期：CardKit 创建 JSON 2.0 流式卡片实体 → 回复消息挂载 card_id
+       → 默认由后台线程异步刷 CardKit（LLM 不被 HTTP 阻塞；客户端仍按 streaming_config 逐字渲染）
+       → 关闭 streaming_mode
 
     两个飞书客户端：
     - _api_client:  lark.Client        主动调用飞书 REST API（发消息、更新卡片）
@@ -124,6 +239,9 @@ class FeishuGateway:
         _handler = (
             lark.EventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(self._on_message_receive)
+            # 已读回执：开放平台/应用若订阅了 im.message.message_read_v1，长连接会推送；
+            # 未注册对应 processor 时 SDK 报 processor not found（与业务无关但必须接住）。
+            .register_p2_im_message_message_read_v1(self._on_im_message_read_v1)
             .build()
         )
 
@@ -150,48 +268,450 @@ class FeishuGateway:
         print("🚀 PersonalAgent 飞书网关已启动，等待消息...", flush=True)
         self._ws_client.start()
 
-    def update_card(
+    # ──────────────────────────────────────────────────────────
+    #   CardKit 流式卡片（JSON 2.0 + 流式更新文本 OpenAPI）
+    #   参考：https://open.feishu.cn/document/cardkit-v1/streaming-updates-openapi-overview
+    # ──────────────────────────────────────────────────────────
+
+    def _read_streaming_render_params(self) -> tuple[int, int, str]:
+        """
+        客户端打字机参数：频率(ms)、步长(字符)、策略(fast|delay)。
+        print_step=1 为逐字上屏；print_frequency_ms 越小动画越快（受客户端实现限制）。
+        读取 os.environ（由 main.py 从项目根 .env 注入）。未设置时本仓库回退默认 10ms；
+        飞书流式文档示例中 print_frequency_ms 默认为 70ms。
+        """
+        freq = int(os.getenv("FEISHU_STREAM_PRINT_FREQ_MS", "10"))
+        step = int(os.getenv("FEISHU_STREAM_PRINT_STEP", "1"))
+        strategy = os.getenv("FEISHU_STREAM_PRINT_STRATEGY", "fast")
+        freq = max(1, freq)
+        step = max(1, step)
+        return freq, step, strategy
+
+    def _sleep_before_stream_finalize(
         self,
-        message_id: str,
-        content: str,
-        status: str,
+        body_markdown: str,
+        *,
+        last_content_delta_chars: Optional[int] = None,
     ) -> None:
         """
-        更新已发送的飞书交互卡片内容。
-        由 Agent 层通过 on_update 回调间接调用。
+        最后一次流式 content 推送后，客户端仍按 print_frequency_ms / print_step 做打字机。
+        若立刻全量 PUT 收尾，会打断动画，尾部常「整块蹦出」。此处留出扫尾时间。
 
-        Args:
-            message_id: 需要更新的卡片消息 ID（由 _send_thinking_card 返回）
-            content:    卡片正文（Markdown 格式）
-            status:     卡片状态："generating" | "done" | "error"
+        last_content_delta_chars:
+            相对「上一次已成功推送的正文」本次多出来的字符数（通常等于最后一次 content
+            里客户端要动画播放的增量）。异步刷盘时 LLM 多段会合并成一次 HTTP，增量可能很大，
+            必须用增量估时；若省略则回退为按全文长度的保守估时。
+        设 FEISHU_STREAM_FINISH_GRACE_MS=0 可关闭等待。
         """
-        card = self._build_card(status=status, content=content)
-        card_str = json.dumps(card, ensure_ascii=False)
+        raw = os.getenv("FEISHU_STREAM_FINISH_GRACE_MS", "900").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return
+        base_ms = int(os.getenv("FEISHU_STREAM_FINISH_GRACE_MS", "900"))
+        freq = max(1, int(os.getenv("FEISHU_STREAM_PRINT_FREQ_MS", "10")))
+        step = max(1, int(os.getenv("FEISHU_STREAM_PRINT_STEP", "1")))
+        cap_ms = int(os.getenv("FEISHU_STREAM_FINISH_GRACE_MAX_MS", "12000"))
+        if last_content_delta_chars is not None and last_content_delta_chars > 0:
+            steps = (last_content_delta_chars + step - 1) // step
+            tail_ms = steps * freq
+        else:
+            # 无增量信息时：按全文保守估时（系数避免收尾过久）
+            tail_ms = (len(body_markdown) * freq) // 3
+        total_ms = min(cap_ms, max(0, base_ms) + tail_ms)
+        if total_ms > 0:
+            time.sleep(total_ms / 1000.0)
 
+    def _stream_async_flush_enabled(self) -> bool:
+        v = os.getenv("FEISHU_STREAM_ASYNC_FLUSH", "1").strip().lower()
+        return v not in ("0", "false", "no", "off")
+
+    def _build_streaming_card_v2(self, status: str, body_markdown: str) -> dict:
+        cfg = _CARD_CONFIG.get(status, _CARD_CONFIG["done"])
+        freq, step, strategy = self._read_streaming_render_params()
+        return {
+            "schema": "2.0",
+            "config": {
+                "update_multi": True,
+                "streaming_mode": True,
+                "summary": {"content": ""},
+                "streaming_config": {
+                    "print_frequency_ms": {
+                        "default": freq,
+                        "android": freq,
+                        "ios": freq,
+                        "pc": freq,
+                    },
+                    "print_step": {
+                        "default": step,
+                        "android": step,
+                        "ios": step,
+                        "pc": step,
+                    },
+                    "print_strategy": strategy,
+                },
+            },
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": cfg["title"],
+                },
+                "template": cfg["color"],
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": body_markdown,
+                        "element_id": _STREAM_BODY_ELEMENT_ID,
+                    }
+                ]
+            },
+        }
+
+    def _card_stream_put_streaming_snapshot(
+        self,
+        session: _StreamingCardSession,
+        status_key: str,
+        body_markdown: str,
+    ) -> bool:
+        """
+        流式过程中全量 PUT（仍为 streaming_mode=true）：用于在首次正文推送前把标题从「思考中」切到「生成中」。
+        partial_update 无法改 header，故与收尾一样走 card.update。
+        """
+        if self._api_client.cardkit is None:
+            return False
+        inner = json.dumps(
+            self._build_streaming_card_v2(status_key, body_markdown),
+            ensure_ascii=False,
+        )
+        session.sequence += 1
+        seq = session.sequence
         try:
-            request = (
-                PatchMessageRequest.builder()
-                .message_id(message_id)
+            card_obj = Card.builder().type("card_json").data(inner).build()
+            req = (
+                UpdateCardRequest.builder()
+                .card_id(session.card_id)
                 .request_body(
-                    PatchMessageRequestBody.builder().content(card_str).build()
+                    UpdateCardRequestBody.builder()
+                    .card(card_obj)
+                    .uuid(str(uuid.uuid4()))
+                    .sequence(seq)
+                    .build()
                 )
                 .build()
             )
-
-            response = self._api_client.im.v1.message.patch(request)  # type: ignore[union-attr]
-
-            if not response.success():
+            resp = self._api_client.cardkit.v1.card.update(req)
+            if not resp.success():
                 logger.warning(
-                    f"更新卡片失败 | message_id={message_id} "
-                    f"code={response.code} msg={response.msg}"
+                    "流式中途更新卡片快照失败 | card_id=%s seq=%s code=%s msg=%s",
+                    session.card_id,
+                    seq,
+                    resp.code,
+                    resp.msg,
                 )
-
+                return False
+            return True
         except Exception as e:
-            logger.error(f"更新卡片异常 | message_id={message_id} error={e}")
+            logger.error(
+                "流式中途更新卡片快照异常 | card_id=%s error=%s",
+                session.card_id,
+                e,
+                exc_info=True,
+            )
+            return False
+
+    def _card_stream_ensure_generating_header(self, session: _StreamingCardSession) -> None:
+        if session.header_is_generating:
+            return
+        if not self._card_stream_put_streaming_snapshot(
+            session, "generating", _STREAM_PLACEHOLDER_BODY
+        ):
+            return
+        session.header_is_generating = True
+        session.last_pushed_markdown = _STREAM_PLACEHOLDER_BODY
+
+    def _cardkit_create_entity(self, status: str, body_markdown: str) -> Optional[str]:
+        if self._api_client.cardkit is None:
+            logger.error("CardKit 服务不可用")
+            return None
+        payload = self._build_streaming_card_v2(status, body_markdown)
+        inner = json.dumps(payload, ensure_ascii=False)
+        try:
+            req = (
+                CreateCardRequest.builder()
+                .request_body(
+                    CreateCardRequestBody.builder()
+                    .type("card_json")
+                    .data(inner)
+                    .build()
+                )
+                .build()
+            )
+            resp = self._api_client.cardkit.v1.card.create(req)
+            if not resp.success():
+                logger.error(
+                    "创建卡片实体失败 | code=%s msg=%s log_id=%s",
+                    resp.code,
+                    resp.msg,
+                    resp.get_log_id(),
+                )
+                return None
+            if resp.data is None or not resp.data.card_id:
+                logger.error("创建卡片实体失败 | response.data 无 card_id")
+                return None
+            return resp.data.card_id
+        except Exception as e:
+            logger.error("创建卡片实体异常 | error=%s", e, exc_info=True)
+            return None
+
+    def _card_stream_push_markdown(
+        self, session: _StreamingCardSession, markdown: str
+    ) -> None:
+        if self._api_client.cardkit is None:
+            return
+        if markdown and not session.header_is_generating:
+            self._card_stream_ensure_generating_header(session)
+        session.sequence += 1
+        seq = session.sequence
+        op_uuid = str(uuid.uuid4())
+        try:
+            req = (
+                ContentCardElementRequest.builder()
+                .card_id(session.card_id)
+                .element_id(_STREAM_BODY_ELEMENT_ID)
+                .request_body(
+                    ContentCardElementRequestBody.builder()
+                    .uuid(op_uuid)
+                    .content(markdown)
+                    .sequence(seq)
+                    .build()
+                )
+                .build()
+            )
+            resp = self._api_client.cardkit.v1.card_element.content(req)
+            if not resp.success():
+                logger.warning(
+                    "流式更新正文失败 | card_id=%s seq=%s code=%s msg=%s",
+                    session.card_id,
+                    seq,
+                    resp.code,
+                    resp.msg,
+                )
+            else:
+                session.last_pushed_markdown = markdown
+        except Exception as e:
+            logger.error(
+                "流式更新正文异常 | card_id=%s error=%s",
+                session.card_id,
+                e,
+                exc_info=True,
+            )
+
+    def _card_stream_build_final_card_dict(
+        self, theme_key: str, body_markdown: str
+    ) -> dict:
+        """非流式收尾用完整 JSON：新标题 + 正文快照 + streaming_mode=false。"""
+        cfg = _CARD_CONFIG.get(theme_key, _CARD_CONFIG["done"])
+        return {
+            "schema": "2.0",
+            "config": {"update_multi": True, "streaming_mode": False},
+            "header": {
+                "title": {"tag": "plain_text", "content": cfg["title"]},
+                "template": cfg["color"],
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": body_markdown,
+                        "element_id": _STREAM_BODY_ELEMENT_ID,
+                    }
+                ]
+            },
+        }
+
+    def _card_stream_finalize_card(
+        self,
+        session: _StreamingCardSession,
+        theme_key: str,
+        body_markdown: str,
+        *,
+        last_content_delta_chars: Optional[int] = None,
+    ) -> None:
+        """
+        全量更新卡片实体（PUT）：同时更新标题栏、正文与关闭流式。
+        partial_update_setting 仅支持 config/card_link，不能改 header，故必须用本接口。
+        文档：https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/cardkit-v1/card/update
+        """
+        if self._api_client.cardkit is None:
+            return
+        self._sleep_before_stream_finalize(
+            body_markdown, last_content_delta_chars=last_content_delta_chars
+        )
+        inner = json.dumps(
+            self._card_stream_build_final_card_dict(theme_key, body_markdown),
+            ensure_ascii=False,
+        )
+        session.sequence += 1
+        seq = session.sequence
+        try:
+            card_obj = Card.builder().type("card_json").data(inner).build()
+            req = (
+                UpdateCardRequest.builder()
+                .card_id(session.card_id)
+                .request_body(
+                    UpdateCardRequestBody.builder()
+                    .card(card_obj)
+                    .uuid(str(uuid.uuid4()))
+                    .sequence(seq)
+                    .build()
+                )
+                .build()
+            )
+            resp = self._api_client.cardkit.v1.card.update(req)
+            if not resp.success():
+                logger.warning(
+                    "全量收尾卡片失败 | card_id=%s seq=%s code=%s msg=%s log_id=%s",
+                    session.card_id,
+                    seq,
+                    resp.code,
+                    resp.msg,
+                    resp.get_log_id(),
+                )
+                self._card_stream_disable_mode(session)
+            else:
+                session.last_pushed_markdown = body_markdown
+        except Exception as e:
+            logger.error(
+                "全量收尾卡片异常 | card_id=%s error=%s",
+                session.card_id,
+                e,
+                exc_info=True,
+            )
+            self._card_stream_disable_mode(session)
+
+    def _card_stream_disable_mode(self, session: _StreamingCardSession) -> None:
+        """结束流式模式，恢复会话列表摘要与转发能力。参见流式文档步骤四。"""
+        if self._api_client.cardkit is None:
+            return
+        settings_obj = {"config": {"streaming_mode": False}}
+        settings_str = json.dumps(settings_obj, ensure_ascii=False)
+        session.sequence += 1
+        seq = session.sequence
+        try:
+            req = (
+                SettingsCardRequest.builder()
+                .card_id(session.card_id)
+                .request_body(
+                    SettingsCardRequestBody.builder()
+                    .settings(settings_str)
+                    .uuid(str(uuid.uuid4()))
+                    .sequence(seq)
+                    .build()
+                )
+                .build()
+            )
+            resp = self._api_client.cardkit.v1.card.settings(req)
+            if not resp.success():
+                logger.warning(
+                    "关闭卡片流式模式失败 | card_id=%s code=%s msg=%s",
+                    session.card_id,
+                    resp.code,
+                    resp.msg,
+                )
+        except Exception as e:
+            logger.error(
+                "关闭卡片流式模式异常 | card_id=%s error=%s",
+                session.card_id,
+                e,
+                exc_info=True,
+            )
+
+    def _on_streaming_card_update(
+        self,
+        session: _StreamingCardSession,
+        content: str,
+        status: str,
+    ) -> None:
+        text = _strip_stream_cursor(content)
+        if status == "generating":
+            if text and text != session.last_pushed_markdown:
+                self._card_stream_push_markdown(session, text)
+            return
+        if status == "done":
+            prev = session.last_pushed_markdown
+            if text != prev:
+                self._card_stream_push_markdown(session, text)
+            delta = max(0, len(text) - len(prev))
+            self._card_stream_finalize_card(
+                session, "done", text, last_content_delta_chars=delta
+            )
+            return
+        if status == "error":
+            prev = session.last_pushed_markdown
+            if text and text != prev:
+                self._card_stream_push_markdown(session, text)
+            body_out = text or session.last_pushed_markdown
+            delta = max(0, len(body_out) - len(prev))
+            self._card_stream_finalize_card(
+                session,
+                "error",
+                body_out,
+                last_content_delta_chars=delta,
+            )
+
+    def _send_streaming_card_session(self, event: MessageEvent) -> Optional[_StreamingCardSession]:
+        """
+        创建流式卡片实体，并以回复消息方式发送 card_id（保持在原话题线程内）。
+        """
+        card_id = self._cardkit_create_entity("thinking", _STREAM_PLACEHOLDER_BODY)
+        if not card_id:
+            return None
+        reply_content = json.dumps(
+            {"type": "card", "data": {"card_id": card_id}},
+            ensure_ascii=False,
+        )
+        try:
+            request = (
+                ReplyMessageRequest.builder()
+                .message_id(event.message_id)
+                .request_body(
+                    ReplyMessageRequestBody.builder()
+                    .content(reply_content)
+                    .msg_type("interactive")
+                    .build()
+                )
+                .build()
+            )
+            response = self._api_client.im.v1.message.reply(request)  # type: ignore[union-attr]
+            if not response.success():
+                logger.error(
+                    "发送流式卡片消息失败 | code=%s msg=%s log_id=%s",
+                    response.code,
+                    response.msg,
+                    response.get_log_id(),
+                )
+                return None
+            logger.info("✉️ 流式卡片已发送 | card_id=%s", card_id)
+            return _StreamingCardSession(card_id=card_id)
+        except Exception as e:
+            logger.error("发送流式卡片消息异常 | error=%s", e, exc_info=True)
+            return None
 
     # ──────────────────────────────────────────────────────────
     #   事件回调（必须在 3 秒内返回）
     # ──────────────────────────────────────────────────────────
+
+
+    def _on_im_message_read_v1(self, data: P2ImMessageMessageReadV1) -> None:
+        """消息已读事件：用户侧已读会话中的消息时飞书会推送，本机器人无需处理，仅消费事件以完成 SDK 分发。"""
+        if logger.isEnabledFor(logging.DEBUG) and data.event is not None:
+            mids = data.event.message_id_list
+            reader = data.event.reader
+            logger.debug(
+                "im.message.message_read_v1 | reader=%s message_ids=%s",
+                getattr(reader, "reader_id", reader) if reader else None,
+                mids[:5] if mids else None,
+            )
 
     def _on_message_receive(self, data: P2ImMessageReceiveV1) -> None:
         """
@@ -236,7 +756,8 @@ class FeishuGateway:
         Args:
             event: 已解析的消息事件
         """
-        reply_message_id: Optional[str] = None
+        stream_session: Optional[_StreamingCardSession] = None
+        stream_sink: Optional[_CardStreamAsyncSink] = None
 
         # ── 注册后台任务 ──────────────────────────────────────
         task_id: Optional[str] = None
@@ -255,27 +776,33 @@ class FeishuGateway:
             )
 
         try:
-            # ── Step 1: 发送"思考中"初始卡片 ─────────────────
-            reply_message_id = self._send_thinking_card(event)
-            if not reply_message_id:
+            # ── Step 1: CardKit 创建流式卡片实体并回复 card_id ──
+            stream_session = self._send_streaming_card_session(event)
+            if not stream_session:
                 logger.error(
-                    f"发送初始卡片失败，终止处理 | message_id={event.message_id}"
+                    f"发送流式卡片失败，终止处理 | message_id={event.message_id}"
                 )
                 if task_id and self._task_manager:
-                    self._task_manager.fail(task_id, "发送初始卡片失败")
+                    self._task_manager.fail(task_id, "发送流式卡片失败")
                 return
 
-            # ── Step 2: 构造卡片更新回调 ──────────────────────
-            # 节流由 Agent 层的 card-flusher 线程统一负责，
-            # Gateway 层只需无条件转发给 update_card。
+            # ── Step 2: CardKit 刷新：默认异步，避免 LLM 被每次 HTTP 阻塞 ──
+            if self._stream_async_flush_enabled():
+                stream_sink = _CardStreamAsyncSink(self, stream_session)
 
-            def on_update(content: str, status: str) -> None:
-                """转发卡片更新到飞书 REST API（节流已在 Agent 层处理）。"""
-                if reply_message_id:
-                    self.update_card(reply_message_id, content, status)
+                def on_update(content: str, status: str) -> None:
+                    stream_sink.feed(content, status)
+            else:
 
-            # ── Step 3: 调用 Agent 处理（LLM 推理在此发生）──
-            self._agent.process(event, on_update=on_update)
+                def on_update(content: str, status: str) -> None:
+                    self._on_streaming_card_update(stream_session, content, status)
+
+            # ── Step 3: 调用 Agent（CardKit 流式下不受 im PATCH 5QPS 限制）──
+            self._agent.process(
+                event,
+                on_update=on_update,
+                stream_updates_sync_with_llm=True,
+            )
 
             # ── Step 4: 标记任务完成 ──────────────────────────
             if task_id and self._task_manager:
@@ -286,70 +813,19 @@ class FeishuGateway:
                 f"消息处理异常 | message_id={event.message_id} error={e}",
                 exc_info=True,
             )
-            # 将错误信息展示在卡片上，让用户看到（而非静默失败）
-            if reply_message_id:
-                self.update_card(
-                    reply_message_id,
+            if stream_sink is not None:
+                stream_sink.feed(
                     f"处理消息时发生内部错误，请稍后重试。\n\n> `{e}`",
-                    status="error",
+                    "error",
                 )
-            # 标记任务失败
+            elif stream_session:
+                self._on_streaming_card_update(
+                    stream_session,
+                    f"处理消息时发生内部错误，请稍后重试。\n\n> `{e}`",
+                    "error",
+                )
             if task_id and self._task_manager:
                 self._task_manager.fail(task_id, str(e))
-
-    # ──────────────────────────────────────────────────────────
-    #   卡片发送
-    # ──────────────────────────────────────────────────────────
-
-    def _send_thinking_card(self, event: MessageEvent) -> Optional[str]:
-        """
-        以"回复"方式向用户发送初始"思考中"状态的交互卡片。
-        使用 ReplyMessageRequest 确保卡片出现在用户消息的同一话题线程中。
-
-        Args:
-            event: 消息事件（使用其 message_id 作为回复目标）
-
-        Returns:
-            新创建的卡片消息 ID，失败时返回 None
-        """
-        card = self._build_card(status="thinking", content="")
-        card_str = json.dumps(card, ensure_ascii=False)
-
-        try:
-            request = (
-                ReplyMessageRequest.builder()
-                .message_id(event.message_id)
-                .request_body(
-                    ReplyMessageRequestBody.builder()
-                    .content(card_str)
-                    .msg_type("interactive")
-                    .build()
-                )
-                .build()
-            )
-
-            response = self._api_client.im.v1.message.reply(request)  # type: ignore[union-attr]
-
-            if not response.success():
-                logger.error(
-                    f"发送初始卡片失败 | "
-                    f"code={response.code} msg={response.msg} "
-                    f"log_id={response.get_log_id()}"
-                )
-                return None
-
-            resp_data = response.data
-            if resp_data is None:
-                logger.error("发送初始卡片失败 | response.data 为 None")
-                return None
-
-            card_message_id: str = resp_data.message_id or ""
-            logger.info(f"✉️  初始卡片已发送 | card_message_id={card_message_id}")
-            return card_message_id or None
-
-        except Exception as e:
-            logger.error(f"发送初始卡片异常 | error={e}", exc_info=True)
-            return None
 
     # ──────────────────────────────────────────────────────────
     #   事件解析与过滤
@@ -485,53 +961,3 @@ class FeishuGateway:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
         return cleaned
-
-    # ──────────────────────────────────────────────────────────
-    #   卡片 JSON 构建
-    # ──────────────────────────────────────────────────────────
-
-    def _build_card(self, status: str, content: str) -> dict:
-        """
-        构建飞书交互卡片的 JSON 结构。
-
-        卡片格式：标准飞书卡片（兼容所有客户端版本）
-        - config.update_multi=true：更新对所有可见用户生效
-        - header: 带颜色主题的标题栏，反映当前状态
-        - elements: 正文区域，使用 lark_md 格式支持 Markdown
-
-        Args:
-            status:  卡片状态（"thinking" | "generating" | "done" | "error"）
-            content: 卡片正文内容（Markdown 格式），thinking 状态可为空
-
-        Returns:
-            卡片 JSON 字典，需调用方序列化为字符串
-        """
-        cfg = _CARD_CONFIG.get(status, _CARD_CONFIG["done"])
-
-        # 正文元素
-        body_content = content if content else "..."
-        elements = [
-            {
-                "tag": "div",
-                "text": {
-                    "tag": "lark_md",
-                    "content": body_content,
-                },
-            }
-        ]
-
-        return {
-            "config": {
-                "wide_screen_mode": True,
-                # update_multi=true: 卡片更新对所有看到此卡片的用户生效
-                "update_multi": True,
-            },
-            "header": {
-                "title": {
-                    "tag": "plain_text",
-                    "content": cfg["title"],
-                },
-                "template": cfg["color"],
-            },
-            "elements": elements,
-        }

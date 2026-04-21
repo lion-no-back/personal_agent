@@ -64,7 +64,8 @@ class ConversationAgent(BaseAgent):
     解耦设计：
     - 不直接引用任何飞书 SDK 类，平台细节由 Gateway 层处理
     - on_update 回调由 Gateway 层注入，Agent 只负责何时调用
-    - card_update_interval 控制回调频率，避免超出飞书 API 限速（5 QPS）
+    - card_update_interval 控制回调频率（旧版 PATCH 卡片；飞书 CardKit 流式模式应使用
+      stream_updates_sync_with_llm=True，由客户端按 print_step 做打字机）
     """
 
     def __init__(
@@ -107,6 +108,8 @@ class ConversationAgent(BaseAgent):
         self,
         event,
         on_update: Optional[Callable[[str, str], None]] = None,
+        *,
+        stream_updates_sync_with_llm: bool = False,
     ) -> str:
         """
         处理一条消息事件的完整链路：
@@ -149,7 +152,9 @@ class ConversationAgent(BaseAgent):
         logger.debug(f"LLM 输入 | session={session_key} messages_count={len(messages)}")
 
         # ── 5. 流式 LLM 调用 + 卡片更新 ─────────────────────
-        full_response = self._stream_and_update(messages, on_update)
+        full_response = self._stream_and_update(
+            messages, on_update, stream_updates_sync_with_llm
+        )
 
         # ── 6. 写入 AI 回复到上下文 ──────────────────────────
         if full_response:
@@ -372,6 +377,7 @@ class ConversationAgent(BaseAgent):
         self,
         messages: list,
         on_update: Optional[Callable[[str, str], None]],
+        stream_updates_sync_with_llm: bool = False,
     ) -> str:
         """
         调用 LLM 流式接口，通过后台 flusher 线程解耦 token 消费与卡片刷新。
@@ -380,7 +386,10 @@ class ConversationAgent(BaseAgent):
         - 主流程（当前工作线程）：从 think_stream() 消费 token，写入共享 buffer，
           完全不阻塞于任何 HTTP 调用。
         - card-flusher 线程：每隔 card_update_interval 秒读取 buffer，
-          调用 on_update 触发飞书卡片 PATCH，与主流程完全解耦。
+          调用 on_update 触发平台更新；与主流程完全解耦。
+        - stream_updates_sync_with_llm=True 时：不启用 flusher，在 LLM 流式循环内
+          每次收到累计文本即 on_update(..., "generating")，结束时 on_update(..., "done")，
+          供飞书 CardKit 流式接口推送全文并由客户端逐字渲染。
         - 两者通过 threading.Event 同步生命周期：主流程结束后 set() 通知
           flusher 做最终一次刷新并退出。
 
@@ -405,6 +414,30 @@ class ConversationAgent(BaseAgent):
         _stop = threading.Event()
         _has_content = threading.Event()  # 首个 token 到达时 set，唤醒 flusher 推首帧
         _flusher_thread: Optional[threading.Thread] = None
+
+        if on_update and stream_updates_sync_with_llm:
+            try:
+                full_response = ""
+                for _delta, accumulated in self._llm.think_stream(messages):
+                    full_response = accumulated
+                    on_update(accumulated, "generating")
+                on_update(full_response or "", "done")
+                return full_response
+            except Exception as e:
+                if _is_llm_auth_error(e):
+                    logger.error(
+                        "❌ LLM API 认证失败（请检查 LLM_API_KEY / LLM_BASE_URL）：%s",
+                        e,
+                        exc_info=False,
+                    )
+                    on_update(_LLM_AUTH_USER_MESSAGE, "error")
+                    return ""
+                error_msg = (
+                    f"抱歉，AI 调用过程中出现了错误，请稍后重试。\n\n> 错误信息：`{e}`"
+                )
+                on_update(error_msg, "error")
+                logger.error(f"❌ LLM 流式调用失败：{e}", exc_info=True)
+                raise
 
         if on_update:
 

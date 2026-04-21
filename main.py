@@ -14,8 +14,13 @@ PersonalAgent 启动入口
 import logging
 import os
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
+
+# 项目根目录（与 main.py 同级，固定加载此处的 .env，避免从其它 cwd 启动时读不到配置）
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_DOTENV_PATH = _PROJECT_ROOT / ".env"
 
 
 def setup_logging() -> None:
@@ -45,9 +50,12 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     # ── Step 1: 加载 .env ────────────────────────────────────
-    # load_dotenv 会从项目根目录的 .env 文件加载环境变量
-    # override=False 表示不覆盖系统中已存在的同名环境变量
-    load_dotenv(override=False)
+    # 优先读取与 main.py 同目录的 .env（不依赖当前工作目录）。
+    # override=False：若操作系统/启动器里已设置同名变量，则不会用 .env 覆盖。
+    if _DOTENV_PATH.is_file():
+        load_dotenv(_DOTENV_PATH, override=False)
+    else:
+        load_dotenv(override=False)
 
     # ── Step 2: 配置日志 ─────────────────────────────────────
     setup_logging()
