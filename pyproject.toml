@@ -1,0 +1,19 @@
+[project]
+name = "personalagent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "lark-oapi>=1.5.3",
+    "openai>=2.32.0",
+    "python-dotenv>=1.0.0",
+    "qrcode>=8.2",
+]
+
+[project.optional-dependencies]
+# 安装后可在首次配置向导中显示终端二维码（纯 Python，无需 Pillow）
+# 安装方式：uv add qrcode  或  pip install qrcode
+setup = [
+    "qrcode>=7.0",
+]
