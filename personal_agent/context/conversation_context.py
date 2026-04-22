@@ -83,16 +83,17 @@ class ConversationContext:
     #   消息历史管理
     # ──────────────────────────────────────────────
 
-    def add_message(self, session_key: str, role: str, content: str) -> None:
+    def add_message(self, session_key: str, role: str, content: Optional[str] = None, **kwargs) -> None:
         """
         向指定会话追加一条消息。
 
         Args:
             session_key: 会话唯一标识
-            role:        消息角色，"user" 或 "assistant"
+            role:        消息角色，"user", "assistant" 或 "tool"
             content:     消息内容
+            **kwargs:    如 tool_calls 诸类拓展字段
         """
-        if not content or not content.strip():
+        if not content and not kwargs:
             logger.debug(f"跳过空消息 | session={session_key} role={role}")
             return
 
@@ -100,14 +101,22 @@ class ConversationContext:
         session = self._get_session(session_key)
 
         with lock:
-            session.append({"role": role, "content": content.strip()})
+            msg = {"role": role}
+            if content is not None:
+                msg["content"] = content.strip() if isinstance(content, str) else str(content)
+            else:
+                msg["content"] = None
+            
+            msg.update(kwargs)
+            session.append(msg)
 
             # 滑动窗口：超出限制时从队头删除最旧的消息
             while len(session) > self._max_history:
                 removed = session.popleft()
+                removed_preview = str(removed.get('content', ''))[:30] if removed.get('content') else '[Tools]'
                 logger.debug(
                     f"滑动窗口裁剪 | session={session_key} "
-                    f"已移除: [{removed['role']}] {removed['content'][:30]}..."
+                    f"已移除: [{removed.get('role')}] {removed_preview}..."
                 )
 
         logger.debug(
@@ -247,8 +256,15 @@ class ConversationContext:
         if not session:
             return "(空)"
         last_msg = list(session)[-1]
-        content: str = last_msg.get("content", "")
-        preview = content.replace("\n", " ").strip()
+        content = last_msg.get("content")
+        
+        if content is None:
+            tool_calls = last_msg.get("tool_calls")
+            if tool_calls:
+                return f"[调用了 {len(tool_calls)} 个工具]"
+            return "(空)"
+            
+        preview = str(content).replace("\n", " ").strip()
         if len(preview) > 40:
             return preview[:40] + "..."
         return preview if preview else "(空)"

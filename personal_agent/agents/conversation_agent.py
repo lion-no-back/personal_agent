@@ -2,6 +2,8 @@ import logging
 import os
 import threading
 import time
+import json
+import concurrent.futures
 from typing import Callable, Optional
 
 from openai import APIStatusError, AuthenticationError
@@ -10,6 +12,7 @@ from ..agents.base_agent import BaseAgent
 from ..context.conversation_context import ConversationContext
 from ..core.llm import PersonalAgentLLM
 from ..core.task_manager import TaskManager
+from ..tools import get_all_tools, get_tools_openai_schema
 
 logger = logging.getLogger(__name__)
 
@@ -93,11 +96,17 @@ class ConversationAgent(BaseAgent):
         )
         self._stream_chars_per_tick = int(os.getenv("STREAM_CHARS_PER_TICK", "10"))
 
+        # 工具集预加载缓冲
+        self._tool_list = get_all_tools()
+        self._tools_schema = get_tools_openai_schema()
+        self._tool_map = {t.name: t for t in self._tool_list}
+
         logger.info(
             f"✅ ConversationAgent 初始化完成 | "
             f"card_update_interval={self._card_update_interval}s | "
             f"stream_chars_per_tick={self._stream_chars_per_tick} | "
-            f"task_manager={'启用' if task_manager else '未启用'}"
+            f"task_manager={'启用' if task_manager else '未启用'} | "
+            f"已加载 {len(self._tool_list)} 个外挂工具"
         )
 
     # ──────────────────────────────────────────────────────────
@@ -147,34 +156,100 @@ class ConversationAgent(BaseAgent):
         # ── 3. 写入用户消息到上下文 ──────────────────────────
         self._context.add_message(session_key, "user", event.content)
 
-        # ── 4. 组装完整 messages（含历史） ───────────────────
-        messages = self._context.get_messages(session_key)
+        final_response = ""
+        ui_text_buffer = ""  # UI历史累计区，确保多轮迭代输出不会覆写先前的文字
         
-        # ── 4.5. 瞬态注入文件上下文（仅对本次 LLM 请求可见）─────
-        file_ctx = getattr(event, "file_context", None)
-        if file_ctx and messages and messages[-1]["role"] == "user":
-            # 创建字典浅拷贝以免污染 _context 里面原有的引用
-            last_msg = dict(messages[-1])
-            last_msg["content"] = f"{file_ctx}\n\n[用户请求]\n{last_msg['content']}"
-            messages[-1] = last_msg
+        for i in range(5):
+            # ── 4. 组装完整 messages（含历史） ───────────────────
+            messages = self._context.get_messages(session_key)
+            
+            # ── 4.5. 瞬态注入文件上下文 ─────
+            file_ctx = getattr(event, "file_context", None)
+            if file_ctx and messages and messages[-1]["role"] == "user":
+                last_msg = dict(messages[-1])
+                last_msg["content"] = f"{file_ctx}\n\n[用户请求]\n{last_msg['content']}"
+                messages[-1] = last_msg
 
-        logger.debug(f"LLM 输入 | session={session_key} messages_count={len(messages)}")
+            logger.debug(f"LLM 输入 | session={session_key} 轮次={i+1} messages_count={len(messages)}")
 
-        # ── 5. 流式 LLM 调用 + 卡片更新 ─────────────────────
-        full_response = self._stream_and_update(
-            messages, on_update, stream_updates_sync_with_llm
-        )
+            # 定义携带 buffer 的专属卡片刷入函数
+            def custom_on_update(content: str, status: str) -> None:
+                if on_update:
+                    combined = ui_text_buffer + content
+                    on_update(combined.strip(), status)
 
-        # ── 6. 写入 AI 回复到上下文 ──────────────────────────
-        if full_response:
-            self._context.add_message(session_key, "assistant", full_response)
-            logger.info(
-                f"✅ 回复完成 | session={session_key} response_len={len(full_response)}"
+            # ── 5. 流式 LLM 调用 + 卡片更新 ─────────────────────
+            full_response, tool_calls = self._stream_and_update(
+                messages, custom_on_update, stream_updates_sync_with_llm,
+                tools=self._tools_schema
             )
-        else:
-            logger.warning(f"⚠️  LLM 返回空响应 | session={session_key}")
 
-        return full_response or ""
+            # ── 6. 写入 AI 回复到上下文 ──────────────────────────
+            if full_response or tool_calls:
+                self._context.add_message(
+                    session_key, 
+                    "assistant", 
+                    content=full_response, 
+                    tool_calls=tool_calls if tool_calls else None
+                )
+            else:
+                logger.warning(f"⚠️  LLM 返回空响应 | session={session_key}")
+                return ""
+                
+            final_response = full_response or ""
+
+            if tool_calls:
+                # 产生工具调用了，在此轮思考末尾做一点格式美化和保留
+                additional_ui_text = (final_response + "\n\n") if final_response else ""
+                
+                # 并发执行的子例程
+                def execute_single_tool(tc: dict) -> dict:
+                    c_func_name = tc.get("function", {}).get("name", "")
+                    c_func_args_str = tc.get("function", {}).get("arguments", "{}")
+                    c_tc_id = tc.get("id", "")
+                    
+                    c_tool = self._tool_map.get(c_func_name)
+                    if not c_tool:
+                        res = f"Error: 找不到工具 '{c_func_name}'"
+                    else:
+                        try:
+                            kwargs_dict = json.loads(c_func_args_str)
+                            res = c_tool.call(**kwargs_dict)
+                        except Exception as e:
+                            res = f"Error: 执行工具 '{c_func_name}' 失败: {str(e)}"
+                    return {"name": c_func_name, "id": c_tc_id, "result": res}
+
+                # 拼接并发提示
+                func_names = [tc.get("function", {}).get("name", "") for tc in tool_calls]
+                status_text = f"{additional_ui_text}> 🛠️ 正在执行工具：`{', '.join(func_names)}`..."
+                custom_on_update(status_text, "generating")
+                
+                results_collected = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tool_calls), 5)) as executor:
+                    futures = [executor.submit(execute_single_tool, tc) for tc in tool_calls]
+                    for fut in concurrent.futures.as_completed(futures):
+                        results_collected.append(fut.result())
+
+                for res in results_collected:
+                    self._context.add_message(session_key, "tool", content=res["result"], tool_call_id=res["id"], name=res["name"])
+                    logger.info(f"🛠️ 工具执行完成 | {res['name']} -> {res['result'][:30]}...")
+
+                ui_text_buffer += additional_ui_text
+                continue  # 进入下一轮思考
+                
+            else:
+                logger.info(f"✅ 回复完成 | session={session_key} response_len={len(final_response)}")
+                ui_text_buffer += final_response
+                if on_update:
+                    on_update(ui_text_buffer.strip(), "done")
+                return ui_text_buffer
+
+        timeout_msg = "\n\n> ⏰ 抱歉，经过多次尝试未能完成请求，请尝试重组您的问题。"
+        ui_text_buffer += final_response + timeout_msg
+        if on_update:
+            on_update(ui_text_buffer.strip(), "done")
+        self._context.add_message(session_key, "assistant", content=timeout_msg)
+        return ui_text_buffer
 
     # ──────────────────────────────────────────────────────────
     #   内置指令处理
@@ -387,7 +462,8 @@ class ConversationAgent(BaseAgent):
         messages: list,
         on_update: Optional[Callable[[str, str], None]],
         stream_updates_sync_with_llm: bool = False,
-    ) -> str:
+        tools: Optional[list] = None,
+    ) -> tuple[str, Optional[list]]:
         """
         调用 LLM 流式接口，通过后台 flusher 线程解耦 token 消费与卡片刷新。
 
@@ -419,7 +495,7 @@ class ConversationAgent(BaseAgent):
             Exception: 非认证类 LLM 调用异常
         """
         # ── 共享状态（CPython GIL 保证简单赋值的原子性） ────────
-        _buf: dict = {"text": "", "error": None}
+        _buf: dict = {"text": "", "error": None, "has_tools": False}
         _stop = threading.Event()
         _has_content = threading.Event()  # 首个 token 到达时 set，唤醒 flusher 推首帧
         _flusher_thread: Optional[threading.Thread] = None
@@ -427,11 +503,18 @@ class ConversationAgent(BaseAgent):
         if on_update and stream_updates_sync_with_llm:
             try:
                 full_response = ""
-                for _delta, accumulated in self._llm.think_stream(messages):
+                final_tool_calls = None
+                for _delta, accumulated, tcs in self._llm.think_stream(messages, tools=tools):
                     full_response = accumulated
-                    on_update(accumulated, "generating")
-                on_update(full_response or "", "done")
-                return full_response
+                    final_tool_calls = tcs
+                    if accumulated:
+                        on_update(accumulated, "generating")
+                # When flow finishes, if no tools, it's safe to mark 'done'. If there are tools, we still mark generating until final loop.
+                if final_tool_calls:
+                    pass  # Keep it generating because tools will be called.
+                else:
+                    on_update(full_response or "", "done")
+                return full_response, final_tool_calls
             except Exception as e:
                 if _is_llm_auth_error(e):
                     logger.error(
@@ -440,7 +523,7 @@ class ConversationAgent(BaseAgent):
                         exc_info=False,
                     )
                     on_update(_LLM_AUTH_USER_MESSAGE, "error")
-                    return ""
+                    return "", None
                 error_msg = (
                     f"抱歉，AI 调用过程中出现了错误，请稍后重试。\n\n> 错误信息：`{e}`"
                 )
@@ -493,14 +576,16 @@ class ConversationAgent(BaseAgent):
                         caught_up = display_idx >= avail
 
                         if llm_done and caught_up:
-                            on_update(visible, "done")
+                            final_status = "generating" if _buf.get("has_tools") else "done"
+                            on_update(visible, final_status)
                             return
                         else:
                             on_update(visible + " ▌", "generating")
 
                     elif llm_done:
                         # display_idx 已追上 buffer 且 LLM 已结束
-                        on_update(full_text, "done")
+                        final_status = "generating" if _buf.get("has_tools") else "done"
+                        on_update(full_text, final_status)
                         return
                     # else: LLM 仍在生成，buffer 暂无新内容，等下一帧
 
@@ -513,14 +598,21 @@ class ConversationAgent(BaseAgent):
 
         try:
             full_response = ""
-            for _delta, accumulated in self._llm.think_stream(messages):
+            final_tool_calls = None
+            for _delta, accumulated, tcs in self._llm.think_stream(messages, tools=tools):
                 full_response = accumulated
-                # 非阻塞写入共享 buffer，flusher 会自行读取
-                _buf["text"] = accumulated
-                # 首次调用时唤醒 flusher 推送首帧；后续调用为 no-op
+                final_tool_calls = tcs
+                if tcs:
+                    _buf["has_tools"] = True
+                if accumulated:
+                    # 非阻塞写入共享 buffer，flusher 会自行读取
+                    _buf["text"] = accumulated
+                # 无论是否有文本，首次调用时唤醒 flusher 推送首帧
                 _has_content.set()
 
-            return full_response
+            # 由于有可能是纯 tools 的结果（accumulated 为空），如果没设文本但也结束了
+            _buf["text"] = full_response
+            return full_response, final_tool_calls
 
         except Exception as e:
             if _is_llm_auth_error(e):
@@ -530,7 +622,7 @@ class ConversationAgent(BaseAgent):
                     exc_info=False,
                 )
                 _buf["error"] = _LLM_AUTH_USER_MESSAGE
-                return ""
+                return "", None
 
             error_msg = (
                 f"抱歉，AI 调用过程中出现了错误，请稍后重试。\n\n> 错误信息：`{e}`"

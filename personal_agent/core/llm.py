@@ -50,18 +50,24 @@ class PersonalAgentLLM:
         self,
         messages: List[Dict[str, Any]],
         temperature: float = 0.7,
-    ) -> Generator[Tuple[str, str], None, None]:
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = "auto",
+    ) -> Generator[Tuple[str, str, Optional[List[Dict[str, Any]]]], None, None]:
         """
-        流式调用大语言模型，逐块 yield 结果。
+        流式调用大语言模型，逐块 yield 结果。支持 tool_calls 解析拼接。
 
         Args:
             messages:    消息列表，格式为 [{"role": "...", "content": "..."}]
             temperature: 生成温度，默认 0.7
+            tools:       可选的工具列表 schema
+            tool_choice: 工具选择策略
 
         Yields:
-            (delta, accumulated) 元组：
-            - delta:       本次新增的文本片段
+            (delta, accumulated, tool_calls) 元组：
+            - delta:       本次新增的文本片段（可能是 None）
             - accumulated: 截止当前已累积的完整文本
+            - tool_calls:  截止当前已被拼接的完整 tool_calls 列表
+
 
         Raises:
             Exception: LLM API 调用异常时向上抛出，由调用方处理
@@ -71,25 +77,57 @@ class PersonalAgentLLM:
 
         logger.info(f"🧠 流式调用 {self.model} | 消息轮数: {len(messages)}")
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,  # type: ignore[arg-type]
-            temperature=temperature,
-            stream=True,
-        )
+        kwargs = {
+            "model": self.model,
+            "messages": messages,  # type: ignore[arg-type]
+            "temperature": temperature,
+            "stream": True,
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice
+
+        response = self.client.chat.completions.create(**kwargs)
 
         accumulated = ""
+        tool_calls: List[Dict[str, Any]] = []
 
         for chunk in response:
             if not chunk.choices:
                 continue
 
-            delta = chunk.choices[0].delta.content
-            if not delta:
-                continue
+            delta_obj = chunk.choices[0].delta
 
-            accumulated += delta
-            yield delta, accumulated
+            # 处理 tool_calls 增量拼接
+            if hasattr(delta_obj, "tool_calls") and delta_obj.tool_calls:
+                for tc_chunk in delta_obj.tool_calls:
+                    idx = tc_chunk.index
+                    # 确保 tool_calls 列表长度足够
+                    while len(tool_calls) <= idx:
+                        tool_calls.append({
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""}
+                        })
+                    
+                    tc = tool_calls[idx]
+                    if tc_chunk.id:
+                        tc["id"] += tc_chunk.id
+                    if tc_chunk.type:
+                        tc["type"] = tc_chunk.type
+                    if tc_chunk.function:
+                        if tc_chunk.function.name:
+                            tc["function"]["name"] += tc_chunk.function.name
+                        if tc_chunk.function.arguments:
+                            tc["function"]["arguments"] += tc_chunk.function.arguments
+
+            delta = delta_obj.content
+            if delta:
+                accumulated += delta
+            
+            # 无论是否有文字输出，有 tools 或文字更新时都向外 yield 一次最新全貌
+            if delta is not None or tool_calls:
+                yield delta or "", accumulated, tool_calls if tool_calls else None
 
         logger.info(f"✅ 流式响应完成 | 共 {len(accumulated)} 字符")
 
@@ -113,7 +151,7 @@ class PersonalAgentLLM:
 
         try:
             full_text = ""
-            for _delta, accumulated in self.think_stream(messages, temperature):
+            for _delta, accumulated, _tool_calls in self.think_stream(messages, temperature):
                 full_text = accumulated
             return full_text
 
