@@ -149,6 +149,15 @@ class ConversationAgent(BaseAgent):
 
         # ── 4. 组装完整 messages（含历史） ───────────────────
         messages = self._context.get_messages(session_key)
+        
+        # ── 4.5. 瞬态注入文件上下文（仅对本次 LLM 请求可见）─────
+        file_ctx = getattr(event, "file_context", None)
+        if file_ctx and messages and messages[-1]["role"] == "user":
+            # 创建字典浅拷贝以免污染 _context 里面原有的引用
+            last_msg = dict(messages[-1])
+            last_msg["content"] = f"{file_ctx}\n\n[用户请求]\n{last_msg['content']}"
+            messages[-1] = last_msg
+
         logger.debug(f"LLM 输入 | session={session_key} messages_count={len(messages)}")
 
         # ── 5. 流式 LLM 调用 + 卡片更新 ─────────────────────

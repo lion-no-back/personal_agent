@@ -108,6 +108,13 @@ def main() -> None:
     )
     logger.info("✅ ConversationAgent 就绪")
 
+    # ── Step 6.5: 初始化文件暂存管理器 ───────────────────────
+    from personal_agent.core.file_stash import FileStash
+
+    file_stash = FileStash(artifact_dir=_PROJECT_ROOT / "artifact")
+    file_stash.start_disk_cleanup_timer()
+    logger.info("✅ FileStash 就绪")
+
     # ── Step 7: 初始化飞书网关并启动（阻塞） ─────────────────
     # 若飞书凭证缺失，先运行首次配置向导；向导通过 os.environ 直接同步，无需重载 .env
     from personal_agent.core.setup_wizard import needs_setup, run_feishu_setup_wizard
@@ -121,7 +128,13 @@ def main() -> None:
     try:
         from personal_agent.gateway.feishu_gateway import FeishuGateway
 
-        gateway = FeishuGateway(agent=agent, context=context, task_manager=task_manager)
+        gateway = FeishuGateway(
+            agent=agent, 
+            context=context, 
+            task_manager=task_manager,
+            file_stash=file_stash
+        )
+        file_stash.set_remind_callback(gateway.send_stash_remind_card)
         logger.info("✅ FeishuGateway 就绪")
     except ValueError as e:
         logger.error(f"❌ 飞书网关初始化失败：{e}")

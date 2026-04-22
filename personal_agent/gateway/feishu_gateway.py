@@ -66,6 +66,8 @@ class MessageEvent:
     content: str
     sender_open_id: str
     thread_id: Optional[str] = field(default=None)
+    parent_id: Optional[str] = field(default=None)
+    attached_files: list = field(default_factory=list)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -199,12 +201,9 @@ class FeishuGateway:
     - context:  ConversationContext 实例（用于消息去重）
     """
 
-    def __init__(self, agent, context, task_manager: Optional["TaskManager"] = None):
+    def __init__(self, agent, context, task_manager: Optional["TaskManager"] = None, file_stash=None):
         """
-        Args:
-            agent:        已初始化的 Agent 实例（实现 BaseAgent 接口）
-            context:      已初始化的 ConversationContext 实例
-            task_manager: 后台任务管理器（可选），用于追踪消息处理状态
+        ...
         """
         self._app_id: str = os.getenv("FEISHU_APP_ID") or ""
         self._app_secret: str = os.getenv("FEISHU_APP_SECRET") or ""
@@ -218,6 +217,7 @@ class FeishuGateway:
         self._agent = agent
         self._context = context
         self._task_manager = task_manager
+        self._file_stash = file_stash
 
         # 线程池：承载 LLM 推理等耗时操作，确保事件回调在 3s 内返回
         self._executor = ThreadPoolExecutor(
@@ -697,6 +697,52 @@ class FeishuGateway:
             logger.error("发送流式卡片消息异常 | error=%s", e, exc_info=True)
             return None
 
+    def _send_text_message(self, chat_id: str, text: str) -> None:
+        """发送普通文本消息"""
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+        req = (CreateMessageRequest.builder()
+               .receive_id_type("chat_id")
+               .request_body(CreateMessageRequestBody.builder()
+                             .receive_id(chat_id)
+                             .msg_type("text")
+                             .content(json.dumps({"text": text}, ensure_ascii=False))
+                             .build())
+               .build())
+        self._api_client.im.v1.message.create(req)
+
+    def send_stash_remind_card(self, chat_id: str, file_name: str) -> None:
+        """发送超时卡片提醒"""
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+        card_content = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": "orange",
+                "title": {
+                    "content": "⏰ 文件暂存提醒",
+                    "tag": "plain_text"
+                }
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"你之前发送的 `{file_name}` 还没有说明 **处理意图**。"
+                },
+                {
+                    "tag": "markdown",
+                    "content": "请在 **2 分钟**内 发送文字说明 **要做什么**（如整理、分析、翻译等）。否则会话中的 **文件暂存记录** 将 **自动清除**。"
+                }
+            ]
+        }
+        req = (CreateMessageRequest.builder()
+               .receive_id_type("chat_id")
+               .request_body(CreateMessageRequestBody.builder()
+                             .receive_id(chat_id)
+                             .msg_type("interactive")
+                             .content(json.dumps(card_content, ensure_ascii=False))
+                             .build())
+               .build())
+        self._api_client.im.v1.message.create(req)
+
     # ──────────────────────────────────────────────────────────
     #   事件回调（必须在 3 秒内返回）
     # ──────────────────────────────────────────────────────────
@@ -722,7 +768,7 @@ class FeishuGateway:
         """
         # ── 解析和过滤事件 ────────────────────────────────────
         event = self._parse_event(data)
-        if event is None:
+        if event is None or isinstance(event, str):
             return
 
         # ── 消息去重（防飞书重推） ────────────────────────────
@@ -776,6 +822,41 @@ class FeishuGateway:
             )
 
         try:
+            # ── Step 0: 文件挂载/合并处理 ───────────────────────
+            if getattr(self, "_file_stash", None):
+                # 1. 优先尝试合并单聊遗留的文件暂存
+                if event.chat_type == "p2p" and session_key:
+                    stashed_files = self._file_stash.pop_all(session_key)
+                    if stashed_files:
+                        event.attached_files.extend(stashed_files)
+                
+                # 2. 对于群聊处理 parent_id 获取原生附件
+                if event.chat_type == "group" and getattr(event, "parent_id", None):
+                    from lark_oapi.api.im.v1 import GetMessageRequest
+                    req = GetMessageRequest.builder().message_id(event.parent_id).build()
+                    resp = self._api_client.im.v1.message.get(req)
+                    if resp.success() and resp.data and resp.data.items:
+                        parent_msg = resp.data.items[0]
+                        if parent_msg.msg_type == "file":
+                            try:
+                                parent_content = json.loads(parent_msg.body.content)
+                                file_key = parent_content.get("file_key")
+                                file_name = parent_content.get("file_name")
+                                if file_key and file_name:
+                                    if not self._file_stash.is_allowed(file_name):
+                                        self._send_text_message(event.chat_id, "不支持此文件类型")
+                                    else:
+                                        dl_file = self._file_stash.download_direct(
+                                            file_key, file_name, event.parent_id, self._api_client
+                                        )
+                                        if dl_file:
+                                            event.attached_files.append(dl_file)
+                            except Exception as e:
+                                logger.error(f"解析群聊父消息文件失败: {e}", exc_info=True)
+                
+                if event.attached_files:
+                    event.file_context = self._file_stash.build_file_context(event.attached_files)
+
             # ── Step 1: CardKit 创建流式卡片实体并回复 card_id ──
             stream_session = self._send_streaming_card_session(event)
             if not stream_session:
@@ -858,13 +939,51 @@ class FeishuGateway:
             if msg is None or sender is None:
                 return None
 
-            # ── 仅处理文本消息 ────────────────────────────────
+            # ── 媒体或文本类型的分流处理 ──────────────────────
             msg_type: str = getattr(msg, "message_type", "") or ""
-            if msg_type != "text":
-                logger.debug(f"非文本消息，跳过 | type={msg_type}")
+            chat_type: str = getattr(msg, "chat_type", "") or ""
+            
+            if msg_type == "file":
+                if chat_type == "group":
+                    logger.debug("群聊文件消息，静默忽略待用户回复追溯。")
+                    return None
+                    
+                raw_content = getattr(msg, "content", "") or ""
+                try:
+                    content_dict = json.loads(raw_content)
+                    file_key = content_dict.get("file_key", "")
+                    file_name = content_dict.get("file_name", "")
+                except json.JSONDecodeError:
+                    return None
+                    
+                if getattr(self, "_file_stash", None):
+                    message_id: str = getattr(msg, "message_id", "") or ""
+                    chat_id: str = getattr(msg, "chat_id", "") or ""
+
+                    from ..context.conversation_context import ConversationContext
+                    if self._context.is_processed(message_id):
+                        logger.debug(f"文件消息重复投递，已跳过 | message_id={message_id}")
+                        return "file_stashed_discarded"
+                    self._context.mark_processed(message_id)
+
+                    if not self._file_stash.is_allowed(file_name):
+                        self._send_text_message(chat_id, "不支持此文件类型")
+                        return "file_stashed_discarded"
+                        
+                    downloaded = self._file_stash.download_direct(file_key, file_name, message_id, self._api_client)
+                    if downloaded:
+                        sender_id_obj = getattr(sender, "sender_id", None)
+                        sender_open_id = (getattr(sender_id_obj, "open_id", None) or "") if sender_id_obj else ""
+                        thread_id = getattr(msg, "thread_id", None) or None
+                        session_key = ConversationContext.build_session_key(chat_type, sender_open_id, chat_id, thread_id)
+                        self._file_stash.stash_file(session_key, chat_id, downloaded)
+                return "file_stashed"
+
+            elif msg_type != "text":
+                logger.debug(f"非文本/文件消息，跳过 | type={msg_type}")
                 return None
 
-            # ── 解析消息内容 JSON ─────────────────────────────
+            # ── 解析文本消息内容 JSON ─────────────────────────────
             # 飞书文本消息 content 格式：{"text": "消息内容"}
             raw_content: str = getattr(msg, "content", "") or ""
             try:
@@ -877,8 +996,6 @@ class FeishuGateway:
             if not raw_text:
                 return None
 
-            chat_type: str = getattr(msg, "chat_type", "") or ""
-
             # ── 群聊：@提及过滤 ───────────────────────────────
             if chat_type == "group":
                 mentions = getattr(msg, "mentions", None) or []
@@ -887,11 +1004,9 @@ class FeishuGateway:
                 if not mentions:
                     return None
 
-                # 检查是否有机器人被提及（is_bot 为 True 即为机器人）
-                bot_mentioned = any(getattr(m, "is_bot", False) for m in mentions)
-                if not bot_mentioned:
-                    logger.debug("群消息中未 @机器人，跳过")
-                    return None
+                # 暂不检查 is_bot，因为 SDK 的 MentionEvent 并未暴露出 is_bot，
+                # 退而求其次，只要有 @提及 就认为可能是对机器人说话，交给下游处理。
+                pass
 
                 # 清除文本中的 @占位符，保留纯业务内容
                 clean_text = self._strip_mentions(raw_text, mentions)
@@ -907,6 +1022,7 @@ class FeishuGateway:
             message_id: str = getattr(msg, "message_id", "") or ""
             chat_id: str = getattr(msg, "chat_id", "") or ""
             thread_id: Optional[str] = getattr(msg, "thread_id", None) or None
+            parent_id: Optional[str] = getattr(msg, "parent_id", None) or None
 
             sender_id_obj = getattr(sender, "sender_id", None)
             sender_open_id: str = (
@@ -926,6 +1042,7 @@ class FeishuGateway:
                 content=clean_text,
                 sender_open_id=sender_open_id,
                 thread_id=thread_id,
+                parent_id=parent_id,
             )
 
         except Exception as e:
