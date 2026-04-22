@@ -80,13 +80,25 @@ def main() -> None:
 
     # ── Step 4: 初始化会话上下文管理器 ───────────────────────
     # max_history 读取 .env 中的 AGENT_MAX_HISTORY，默认 20 条
-    # system_prompt 读取 .env 中的 AGENT_SYSTEM_PROMPT，默认内置提示词
+    # 自动融合读取 .env 中的 AGENT_SYSTEM_PROMPT 以及项目的 AGENTS.md 约束
     from personal_agent.context.conversation_context import ConversationContext
+    import re
 
-    _system_prompt = os.getenv("AGENT_SYSTEM_PROMPT") or None
+    extra_prompts = []
+    if env_prompt := os.getenv("AGENT_SYSTEM_PROMPT"):
+        extra_prompts.append(env_prompt)
+        
+    agents_md = _PROJECT_ROOT / "AGENTS.md"
+    if agents_md.is_file():
+        content = agents_md.read_text(encoding='utf-8')
+        # 仅提取“处理原则”部分，不把“开发环境(uv run)”等无用信息发给大模型浪费 token
+        match = re.search(r'##\s*处理原则\n([\s\S]+?)(?=\n##\s|$)', content)
+        if match:
+            extra_prompts.append(f"【核心处理原则】\n{match.group(1).strip()}")
+
     context = ConversationContext(
         max_history=int(os.getenv("AGENT_MAX_HISTORY", "20")),
-        system_prompt=_system_prompt,
+        extra_system_prompt="\n\n".join(extra_prompts) if extra_prompts else None,
     )
     logger.info("✅ ConversationContext 就绪")
 

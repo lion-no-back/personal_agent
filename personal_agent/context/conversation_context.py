@@ -22,26 +22,27 @@ class ConversationContext:
     - 群聊（无话题） → "group_{chat_id}"
     """
 
-    # 默认系统提示词，可通过构造函数覆盖
-    _DEFAULT_SYSTEM_PROMPT = (
+    # 基础系统提示词（确立核心身份与底层防范）
+    _BASE_SYSTEM_PROMPT = (
         "你是一个专业、友好的个人 AI 助理，名叫 PersonalAgent。\n"
         "请用简洁、准确的语言回答问题，必要时使用 Markdown 格式增强可读性。\n"
-        "如果用户要求你处理文件，但当前上下文中没有提供任何[附件信息]，请务必直接告知用户“请提供需要处理的文件”，绝对不要凭空捏造虚构的文件名或文件内容。\n"
-        "如果你不确定，请直接说明，不要编造内容。"
+        "处理文件必须基于上下文附件，严禁凭空捏造。\n"
     )
 
     def __init__(
         self,
         max_history: int = 20,
-        system_prompt: Optional[str] = None,
+        extra_system_prompt: Optional[str] = None,
     ):
         """
         Args:
             max_history:   每个会话最多保留的历史消息条数（不含系统提示），默认 20 条（即 10 轮对话）
-            system_prompt: 系统提示词，为 None 时使用默认值
+            extra_system_prompt: 附加的系统级提示词约束（将叠加在基础提示词之后）
         """
         self._max_history = max_history
-        self._system_prompt = system_prompt or self._DEFAULT_SYSTEM_PROMPT
+        self._system_prompt = self._BASE_SYSTEM_PROMPT
+        if extra_system_prompt:
+            self._system_prompt += f"\n\n{extra_system_prompt.strip()}"
 
         # 存储各会话的消息历史：session_key → deque[{"role": ..., "content": ...}]
         self._sessions: Dict[str, deque] = {}
