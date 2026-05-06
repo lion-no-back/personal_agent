@@ -48,6 +48,77 @@ def setup_logging() -> None:
 logger = logging.getLogger(__name__)
 
 
+# ──────────────────────────────────────────────────────────────
+#   技能加载辅助函数
+# ──────────────────────────────────────────────────────────────
+
+
+def _parse_skill_frontmatter(content: str) -> tuple:
+    """解析 SKILL.md 的 YAML frontmatter，返回 (name, description, body)。"""
+    name = description = ""
+    body = content
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            for line in parts[1].strip().splitlines():
+                if line.startswith("name:"):
+                    name = line.split(":", 1)[1].strip()
+                elif line.startswith("description:"):
+                    description = line.split(":", 1)[1].strip()
+            body = parts[2].strip()
+    return name, description, body
+
+
+def _load_skills_prompt(project_root: Path) -> str:
+    """
+    扫描 personal_agent/skills/*/SKILL.md，构建注入 LLM 的技能提示词段落。
+    每个技能段落自动附加脚本目录的绝对路径（方案B：由系统注入，LLM 无需猜测路径）。
+    """
+    skills_dir = project_root / "personal_agent" / "skills"
+    if not skills_dir.is_dir():
+        return ""
+
+    sections = []
+    for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
+        try:
+            content = skill_md.read_text(encoding="utf-8")
+            name, description, body = _parse_skill_frontmatter(content)
+            if not name:
+                logger.warning(f"SKILL.md 缺少 name 字段，已跳过: {skill_md}")
+                continue
+
+            lines = [f"【技能：{name}】"]
+            if description:
+                lines.append(f"描述：{description}")
+
+            scripts_dir = skill_md.parent / "scripts"
+            if scripts_dir.is_dir():
+                lines.append(
+                    f"脚本目录（执行脚本时必须使用此绝对路径）：{scripts_dir.resolve()}"
+                )
+            else:
+                lines.append(f"技能目录：{skill_md.parent.resolve()}")
+
+            if body:
+                lines.append("")
+                lines.append(body)
+
+            sections.append("\n".join(lines))
+            logger.debug(f"已加载技能: {name}")
+        except Exception as e:
+            logger.warning(f"加载技能 {skill_md} 失败: {e}")
+
+    if not sections:
+        return ""
+
+    return (
+        "【可用技能列表】\n"
+        "当用户意图匹配以下技能时，必须严格按照该技能的工作流程执行，"
+        "禁止自行探索文件系统或改变执行方式：\n\n"
+        + "\n\n".join(sections)
+    )
+
+
 def main() -> None:
     # ── Step 1: 加载 .env ────────────────────────────────────
     # 优先读取与 main.py 同目录的 .env（不依赖当前工作目录）。
@@ -91,10 +162,18 @@ def main() -> None:
     agents_md = _PROJECT_ROOT / "AGENTS.md"
     if agents_md.is_file():
         content = agents_md.read_text(encoding='utf-8')
-        # 仅提取“处理原则”部分，不把“开发环境(uv run)”等无用信息发给大模型浪费 token
+        # 仅提取"处理原则"部分，不把"开发环境(uv run)"等无用信息发给大模型浪费 token
         match = re.search(r'##\s*处理原则\n([\s\S]+?)(?=\n##\s|$)', content)
         if match:
             extra_prompts.append(f"【核心处理原则】\n{match.group(1).strip()}")
+
+    # ── 加载技能列表 (skills/*/SKILL.md) ────────────────────────
+    skills_prompt = _load_skills_prompt(_PROJECT_ROOT)
+    if skills_prompt:
+        extra_prompts.append(skills_prompt)
+        logger.info("✅ 技能列表已注入系统提示词")
+    else:
+        logger.info("未发现任何 SKILL.md，技能列表为空")
 
     context = ConversationContext(
         max_history=int(os.getenv("AGENT_MAX_HISTORY", "20")),
@@ -108,6 +187,13 @@ def main() -> None:
     task_manager = TaskManager()
     logger.info("✅ TaskManager 就绪")
 
+    # ── Step 5.5: 初始化交互日志记录器 ───────────────────────
+    from personal_agent.core.interaction_logger import InteractionLogger
+
+    logs_dir = _PROJECT_ROOT / "logs"
+    interaction_logger = InteractionLogger(log_dir=logs_dir)
+    logger.info(f"✅ InteractionLogger 就绪 | 日志目录: {logs_dir}")
+
     # ── Step 6: 初始化对话 Agent ─────────────────────────────
     # card_update_interval 读取 .env 中的 CARD_UPDATE_INTERVAL，默认 0.5s
     from personal_agent.agents.conversation_agent import ConversationAgent
@@ -117,6 +203,7 @@ def main() -> None:
         context=context,
         card_update_interval=float(os.getenv("CARD_UPDATE_INTERVAL", "0.5")),
         task_manager=task_manager,
+        interaction_logger=interaction_logger,
     )
     logger.info("✅ ConversationAgent 就绪")
 

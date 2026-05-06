@@ -10,6 +10,7 @@ from openai import APIStatusError, AuthenticationError
 
 from ..agents.base_agent import BaseAgent
 from ..context.conversation_context import ConversationContext
+from ..core.interaction_logger import InteractionLogger
 from ..core.llm import PersonalAgentLLM
 from ..core.task_manager import TaskManager
 from ..tools import get_all_tools, get_tools_openai_schema
@@ -77,6 +78,7 @@ class ConversationAgent(BaseAgent):
         context: ConversationContext,
         card_update_interval: Optional[float] = None,
         task_manager: Optional[TaskManager] = None,
+        interaction_logger: Optional[InteractionLogger] = None,
     ):
         """
         Args:
@@ -91,6 +93,7 @@ class ConversationAgent(BaseAgent):
         self._llm = llm
         self._context = context
         self._task_manager = task_manager
+        self._interaction_logger = interaction_logger
         self._card_update_interval = card_update_interval or float(
             os.getenv("CARD_UPDATE_INTERVAL", "0.3")
         )
@@ -119,6 +122,7 @@ class ConversationAgent(BaseAgent):
         on_update: Optional[Callable[[str, str], None]] = None,
         *,
         stream_updates_sync_with_llm: bool = False,
+        push_fn: Optional[Callable[[str], None]] = None,
     ) -> str:
         """
         处理一条消息事件的完整链路：
@@ -144,6 +148,9 @@ class ConversationAgent(BaseAgent):
             f"📨 处理消息 | message_id={event.message_id} "
             f"session={session_key} content={event.content[:50]!r}"
         )
+
+        if self._interaction_logger:
+            self._interaction_logger.log_session_start(session_key, event.content)
 
         # ── 2. 内置指令拦截 ──────────────────────────────────
         command_response = self._handle_command(event.content, session_key)
@@ -179,10 +186,14 @@ class ConversationAgent(BaseAgent):
                     on_update(combined.strip(), status)
 
             # ── 5. 流式 LLM 调用 + 卡片更新 ─────────────────────
+            if self._interaction_logger:
+                self._interaction_logger.log_llm_call(session_key, i + 1, messages)
             full_response, tool_calls = self._stream_and_update(
                 messages, custom_on_update, stream_updates_sync_with_llm,
                 tools=self._tools_schema
             )
+            if self._interaction_logger:
+                self._interaction_logger.log_llm_response(session_key, i + 1, full_response, tool_calls)
 
             # ── 6. 写入 AI 回复到上下文 ──────────────────────────
             if full_response or tool_calls:
@@ -207,17 +218,22 @@ class ConversationAgent(BaseAgent):
                     c_func_name = tc.get("function", {}).get("name", "")
                     c_func_args_str = tc.get("function", {}).get("arguments", "{}")
                     c_tc_id = tc.get("id", "")
-                    
+                    log_args: dict = {}
+
                     c_tool = self._tool_map.get(c_func_name)
                     if not c_tool:
                         res = f"Error: 找不到工具 '{c_func_name}'"
                     else:
                         try:
                             kwargs_dict = json.loads(c_func_args_str)
+                            log_args = kwargs_dict.copy()
+                            # 注入上下文供支持后台通知的工具（如 exec）使用
+                            if push_fn is not None:
+                                kwargs_dict["_tool_ctx"] = {"push_fn": push_fn}
                             res = c_tool.call(**kwargs_dict)
                         except Exception as e:
                             res = f"Error: 执行工具 '{c_func_name}' 失败: {str(e)}"
-                    return {"name": c_func_name, "id": c_tc_id, "result": res}
+                    return {"name": c_func_name, "id": c_tc_id, "result": res, "args": log_args}
 
                 # 拼接并发提示
                 func_names = [tc.get("function", {}).get("name", "") for tc in tool_calls]
@@ -233,6 +249,8 @@ class ConversationAgent(BaseAgent):
                 for res in results_collected:
                     self._context.add_message(session_key, "tool", content=res["result"], tool_call_id=res["id"], name=res["name"])
                     logger.info(f"🛠️ 工具执行完成 | {res['name']} -> {res['result'][:30]}...")
+                    if self._interaction_logger:
+                        self._interaction_logger.log_tool_result(session_key, res["name"], res.get("args", {}), res["result"])
 
                 ui_text_buffer += additional_ui_text
                 continue  # 进入下一轮思考
@@ -240,12 +258,16 @@ class ConversationAgent(BaseAgent):
             else:
                 logger.info(f"✅ 回复完成 | session={session_key} response_len={len(final_response)}")
                 ui_text_buffer += final_response
+                if self._interaction_logger:
+                    self._interaction_logger.log_final(session_key, ui_text_buffer)
                 if on_update:
                     on_update(ui_text_buffer.strip(), "done")
                 return ui_text_buffer
 
         timeout_msg = "\n\n> ⏰ 抱歉，经过多次尝试未能完成请求，请尝试重组您的问题。"
         ui_text_buffer += final_response + timeout_msg
+        if self._interaction_logger:
+            self._interaction_logger.log_final(session_key, ui_text_buffer)
         if on_update:
             on_update(ui_text_buffer.strip(), "done")
         self._context.add_message(session_key, "assistant", content=timeout_msg)

@@ -697,8 +697,9 @@ class FeishuGateway:
             logger.error("发送流式卡片消息异常 | error=%s", e, exc_info=True)
             return None
 
-    def _send_text_message(self, chat_id: str, text: str) -> None:
-        """发送普通文本消息"""
+    def _send_text_message(self, chat_id: str, text: str, *, _retries: int = 1) -> None:
+        """发送普通文本消息，失败时最多重试 _retries 次（间隔 2s）。"""
+        import time
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
         req = (CreateMessageRequest.builder()
                .receive_id_type("chat_id")
@@ -708,7 +709,19 @@ class FeishuGateway:
                              .content(json.dumps({"text": text}, ensure_ascii=False))
                              .build())
                .build())
-        self._api_client.im.v1.message.create(req)
+        for attempt in range(1 + _retries):
+            try:
+                resp = self._api_client.im.v1.message.create(req)
+                if resp.success():
+                    return
+                logger.error(
+                    "发送文本消息失败 | attempt=%d code=%s msg=%s",
+                    attempt + 1, resp.code, resp.msg,
+                )
+            except Exception as e:
+                logger.error("发送文本消息异常 | attempt=%d error=%s", attempt + 1, e)
+            if attempt < _retries:
+                time.sleep(2)
 
     def send_stash_remind_card(self, chat_id: str, file_name: str) -> None:
         """发送超时卡片提醒"""
@@ -879,10 +892,13 @@ class FeishuGateway:
                     self._on_streaming_card_update(stream_session, content, status)
 
             # ── Step 3: 调用 Agent（CardKit 流式下不受 im PATCH 5QPS 限制）──
+            # push_fn 用于 exec 等工具在后台任务完成后主动推送飞书文本消息
+            push_fn = lambda msg: self._send_text_message(event.chat_id, msg)
             self._agent.process(
                 event,
                 on_update=on_update,
                 stream_updates_sync_with_llm=True,
+                push_fn=push_fn,
             )
 
             # ── Step 4: 标记任务完成 ──────────────────────────

@@ -1,5 +1,6 @@
 from typing import List
 from .types import ToolDef
+from .exec_tool import build_exec_tool
 from .read_file_tool import build_read_file_tool
 from .web_fetch_tool import build_web_fetch_tool
 
@@ -12,6 +13,7 @@ def get_all_tools() -> List[ToolDef]:
     return [
         build_read_file_tool(),
         build_web_fetch_tool(),
+        build_exec_tool(),
     ]
 
 def get_tools_openai_schema() -> List[dict]:
