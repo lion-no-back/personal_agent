@@ -1,10 +1,72 @@
 import asyncio
 import threading
 import sys
+import re as _re
 from typing import List
 from mcp.client.session import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from .types import ToolDef
+
+# Roles that carry actionable ref IDs the model actually needs
+_INTERACTIVE_ROLES = frozenset({
+    'input', 'button', 'link', 'textbox', 'combobox', 'checkbox',
+    'radio', 'select', 'textarea', 'searchbox', 'menuitem', 'option', 'tab',
+})
+
+# Per-session snapshot dedup state
+_snap_state: dict = {'url': '', 'count': 0}
+
+
+def _compress_snapshot(text: str) -> str:
+    """
+    Replace a large browser_snapshot result with only its interactive elements.
+    Tracks same-URL repeated calls and escalates guidance accordingly.
+    """
+    orig_len = len(text)
+    if orig_len <= 3000:
+        return text
+
+    # Extract current URL for dedup tracking
+    url_m = _re.search(r'- Page URL: (.+)', text)
+    current_url = url_m.group(1).strip() if url_m else ''
+    if current_url != _snap_state['url']:
+        _snap_state['url'] = current_url
+        _snap_state['count'] = 1
+    else:
+        _snap_state['count'] += 1
+    call_no = _snap_state['count']
+
+    # Extract page header block (everything before the yaml block)
+    header_m = _re.search(r'^(.*?)```yaml', text, _re.DOTALL)
+    header = header_m.group(1).rstrip() if header_m else text[:200]
+
+    # Extract only interactive-element lines from the YAML block
+    yaml_m = _re.search(r'```yaml\n(.*?)```', text, _re.DOTALL)
+    interactive: list[str] = []
+    if yaml_m:
+        for line in yaml_m.group(1).splitlines():
+            stripped = line.strip()
+            if not stripped or '[ref=' not in stripped:
+                continue
+            # First token after "- " is the ARIA role
+            role = stripped.lstrip('- ').split()[0].lower()
+            if role in _INTERACTIVE_ROLES:
+                interactive.append('  ' + stripped)
+
+    elem_text = '\n'.join(interactive) if interactive else '(未检测到可交互元素)'
+
+    if call_no == 1:
+        note = f"⚙️ 快照已精简：{orig_len} 字符 → 提取 {len(interactive)} 个交互元素。若需提取正文内容请用 browser_evaluate + JS。"
+    else:
+        note = (
+            f"🔁 [同页第 {call_no} 次快照，ref 可能已更新]\n"
+            "💡 ref 失效时请直接用 browser_evaluate 执行 JS，例如：\n"
+            "   `document.querySelector('input[name=wd]').value='关键词'; "
+            "document.querySelector('#su').click()`"
+        )
+
+    return f"{header}\n### 可交互元素 (精简快照)\n```yaml\n{elem_text}\n```\n{note}"
+
 
 def build_playwright_tools() -> List[ToolDef]:
     loop = asyncio.new_event_loop()
@@ -56,12 +118,22 @@ def build_playwright_tools() -> List[ToolDef]:
                     hint = ""
                     if "Timeout" in err_msg and ("not visible" in err_msg or "not stable" in err_msg):
                         hint = "\n💡 提示：该元素可能被前端遮挡或存在动态渲染。请勿继续尝试原生 click/fill，请立即改用 `browser_evaluate` 执行 JS 强制操作（例如：document.querySelector('...').value='...'）。"
-                        
+                    elif "does not match any elements" in err_msg:
+                        hint = (
+                            "\n💡 ref 已失效（页面更新后 ref ID 会变化）。"
+                            "请立即改用 CSS 选择器通过 browser_evaluate 操作，"
+                            "例如：`document.querySelector('input[name=wd]').value='...'`，"
+                            "不要再调用 browser_snapshot 重新扫描。"
+                        )
+
                     return f"❌ 工具内部报错: {err_msg}。{hint}"
 
                 # 2. 正常返回结果
                 if res.content and hasattr(res.content[0], 'text'):
-                    return res.content[0].text
+                    result_text = res.content[0].text
+                    if name == "browser_snapshot":
+                        result_text = _compress_snapshot(result_text)
+                    return result_text
                 return str(res.content)
 
             except Exception as e:
