@@ -170,7 +170,12 @@ class ConversationAgent(BaseAgent):
         final_response = ""
         ui_text_buffer = ""  # UI历史累计区，确保多轮迭代输出不会覆写先前的文字
         
-        for i in range(5):
+        turns_base = int(os.getenv("AGENT_MAX_TURNS_BASE", "5"))
+        turns_per_tool = int(os.getenv("AGENT_TURNS_PER_TOOL", "2"))
+        turns_hard = int(os.getenv("AGENT_MAX_TURNS_HARD", "30"))
+        remaining = turns_base
+        i = 0
+        while remaining > 0 and i < turns_hard:
             # ── 4. 组装完整 messages（含历史） ───────────────────
             messages = self._context.get_messages(session_key)
             
@@ -188,7 +193,9 @@ class ConversationAgent(BaseAgent):
                 last_msg["content"] = f"【当前技能完整文档】\n{skill_body}\n\n{last_msg['content']}"
                 messages[-1] = last_msg
 
-            logger.debug(f"LLM 输入 | session={session_key} 轮次={i+1} messages_count={len(messages)}")
+            i += 1
+            remaining -= 1
+            logger.debug(f"LLM 输入 | session={session_key} 轮次={i} 剩余={remaining} messages_count={len(messages)}")
 
             # 定义携带 buffer 的专属卡片刷入函数
             def custom_on_update(content: str, status: str) -> None:
@@ -198,13 +205,13 @@ class ConversationAgent(BaseAgent):
 
             # ── 5. 流式 LLM 调用 + 卡片更新 ─────────────────────
             if self._interaction_logger:
-                self._interaction_logger.log_llm_call(session_key, i + 1, messages)
+                self._interaction_logger.log_llm_call(session_key, i, messages)
             full_response, tool_calls = self._stream_and_update(
                 messages, custom_on_update, stream_updates_sync_with_llm,
                 tools=self._tools_schema
             )
             if self._interaction_logger:
-                self._interaction_logger.log_llm_response(session_key, i + 1, full_response, tool_calls)
+                self._interaction_logger.log_llm_response(session_key, i, full_response, tool_calls)
 
             # ── 6. 写入 AI 回复到上下文 ──────────────────────────
             if full_response or tool_calls:
@@ -262,6 +269,11 @@ class ConversationAgent(BaseAgent):
                     logger.info(f"🛠️ 工具执行完成 | {res['name']} -> {res['result'][:30]}...")
                     if self._interaction_logger:
                         self._interaction_logger.log_tool_result(session_key, res["name"], res.get("args", {}), res["result"])
+
+                # 每个工具调用追加预算，但受硬上限约束
+                bonus = turns_per_tool * len(tool_calls)
+                remaining = min(remaining + bonus, turns_hard - i)
+                logger.debug(f"工具调用追加预算 +{bonus} | 剩余={remaining} | i={i} hard={turns_hard}")
 
                 ui_text_buffer += additional_ui_text
                 continue  # 进入下一轮思考
