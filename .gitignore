@@ -12,3 +12,8 @@ wheels/
 
 # Artifacts (temp downloads, auto-cleaned every 24h)
 artifact/
+
+# Playwright MCP runtime snapshots (page accessibility trees + console logs)
+.playwright-mcp/
+
+logs

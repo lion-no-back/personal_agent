@@ -3,7 +3,7 @@ from .types import ToolDef
 from .exec_tool import build_exec_tool
 from .read_file_tool import build_read_file_tool
 from .web_fetch_tool import build_web_fetch_tool
-
+from .playwright_mcp_tool import build_playwright_tools  # 1. 引入我们的 MCP 桥接工厂   
 
 def get_all_tools() -> List[ToolDef]:
     """
@@ -14,6 +14,7 @@ def get_all_tools() -> List[ToolDef]:
         build_read_file_tool(),
         build_web_fetch_tool(),
         build_exec_tool(),
+        *build_playwright_tools(),  # 2. 解包批量挂载 Playwright MCP 提供的所有工具
     ]
 
 def get_tools_openai_schema() -> List[dict]:
