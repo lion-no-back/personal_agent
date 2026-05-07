@@ -290,26 +290,38 @@ class ConversationAgent(BaseAgent):
 
     def _resolve_skill_body(self, user_text: str) -> str:
         """
-        通过 2-gram 关键词匹配判断用户消息是否触发某个技能。
+        通过 LLM 语义判断用户消息是否匹配某个技能。
 
-        匹配策略：
-        - 提取技能描述中所有连续中文字符的 2 字 n-gram 及大写缩写（≥2字符）
-        - 只要有一个 n-gram 或缩写出现在用户消息中，则视为意图匹配
-        - 命中则返回该技能的完整 body，供瞬态注入当次 LLM 消息
-        - 未命中返回空字符串（不注入）
-
-        优先级：按 skill_bodies 字典顺序取第一个匹配项。
+        发起一次独立的非流式 LLM 调用（temperature=0），仅请求返回技能名或 none。
+        命中则返回该技能完整 body，供瞬态注入当次消息；未命中返回空字符串。
+        调用异常时静默降级，不影响主流程。
         """
-        for data in self._skill_bodies.values():
-            desc: str = data.get("description", "")
-            body: str = data.get("body", "")
-            if not body:
-                continue
-            cn_chars = re.sub(r"[^一-鿿]", "", desc)
-            ngrams = {cn_chars[i: i + 2] for i in range(len(cn_chars) - 1)}
-            abbrs = set(re.findall(r"[A-Z]{2,}", desc))
-            if any(g in user_text for g in ngrams) or any(a in user_text for a in abbrs):
-                return body
+        if not self._skill_bodies:
+            return ""
+
+        skill_list = "\n".join(
+            f"- {name}: {data['description']}"
+            for name, data in self._skill_bodies.items()
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是意图识别助手，判断用户消息是否明确匹配以下技能之一。\n"
+                    "规则：只回复技能名称（必须与列表完全一致），或回复 none。"
+                    "不得输出任何解释或多余内容。\n\n"
+                    f"可用技能：\n{skill_list}"
+                ),
+            },
+            {"role": "user", "content": user_text},
+        ]
+        try:
+            result = (self._llm.think(messages, temperature=0) or "").strip()
+            for name, data in self._skill_bodies.items():
+                if name.lower() in result.lower():
+                    return data.get("body", "")
+        except Exception:
+            pass
         return ""
 
     # ──────────────────────────────────────────────────────────
