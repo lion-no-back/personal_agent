@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import threading
 import time
 import json
@@ -79,6 +80,7 @@ class ConversationAgent(BaseAgent):
         card_update_interval: Optional[float] = None,
         task_manager: Optional[TaskManager] = None,
         interaction_logger: Optional[InteractionLogger] = None,
+        skill_bodies: Optional[dict] = None,
     ):
         """
         Args:
@@ -94,6 +96,7 @@ class ConversationAgent(BaseAgent):
         self._context = context
         self._task_manager = task_manager
         self._interaction_logger = interaction_logger
+        self._skill_bodies: dict = skill_bodies or {}
         self._card_update_interval = card_update_interval or float(
             os.getenv("CARD_UPDATE_INTERVAL", "0.3")
         )
@@ -109,7 +112,8 @@ class ConversationAgent(BaseAgent):
             f"card_update_interval={self._card_update_interval}s | "
             f"stream_chars_per_tick={self._stream_chars_per_tick} | "
             f"task_manager={'启用' if task_manager else '未启用'} | "
-            f"已加载 {len(self._tool_list)} 个外挂工具"
+            f"已加载 {len(self._tool_list)} 个外挂工具 | "
+            f"已注册 {len(self._skill_bodies)} 个技能文档（按需注入）"
         )
 
     # ──────────────────────────────────────────────────────────
@@ -175,6 +179,13 @@ class ConversationAgent(BaseAgent):
             if file_ctx and messages and messages[-1]["role"] == "user":
                 last_msg = dict(messages[-1])
                 last_msg["content"] = f"{file_ctx}\n\n[用户请求]\n{last_msg['content']}"
+                messages[-1] = last_msg
+
+            # ── 4.6. 瞬态注入技能完整文档（仅在用户消息轮次按需触发）─────
+            skill_body = self._resolve_skill_body(event.content)
+            if skill_body and messages and messages[-1]["role"] == "user":
+                last_msg = dict(messages[-1])
+                last_msg["content"] = f"【当前技能完整文档】\n{skill_body}\n\n{last_msg['content']}"
                 messages[-1] = last_msg
 
             logger.debug(f"LLM 输入 | session={session_key} 轮次={i+1} messages_count={len(messages)}")
@@ -272,6 +283,34 @@ class ConversationAgent(BaseAgent):
             on_update(ui_text_buffer.strip(), "done")
         self._context.add_message(session_key, "assistant", content=timeout_msg)
         return ui_text_buffer
+
+    # ──────────────────────────────────────────────────────────
+    #   技能正文按需匹配
+    # ──────────────────────────────────────────────────────────
+
+    def _resolve_skill_body(self, user_text: str) -> str:
+        """
+        通过 2-gram 关键词匹配判断用户消息是否触发某个技能。
+
+        匹配策略：
+        - 提取技能描述中所有连续中文字符的 2 字 n-gram 及大写缩写（≥2字符）
+        - 只要有一个 n-gram 或缩写出现在用户消息中，则视为意图匹配
+        - 命中则返回该技能的完整 body，供瞬态注入当次 LLM 消息
+        - 未命中返回空字符串（不注入）
+
+        优先级：按 skill_bodies 字典顺序取第一个匹配项。
+        """
+        for data in self._skill_bodies.values():
+            desc: str = data.get("description", "")
+            body: str = data.get("body", "")
+            if not body:
+                continue
+            cn_chars = re.sub(r"[^一-鿿]", "", desc)
+            ngrams = {cn_chars[i: i + 2] for i in range(len(cn_chars) - 1)}
+            abbrs = set(re.findall(r"[A-Z]{2,}", desc))
+            if any(g in user_text for g in ngrams) or any(a in user_text for a in abbrs):
+                return body
+        return ""
 
     # ──────────────────────────────────────────────────────────
     #   内置指令处理

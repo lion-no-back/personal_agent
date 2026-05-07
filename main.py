@@ -69,16 +69,22 @@ def _parse_skill_frontmatter(content: str) -> tuple:
     return name, description, body
 
 
-def _load_skills_prompt(project_root: Path) -> str:
+def _load_skills(project_root: Path) -> tuple[str, dict]:
     """
-    扫描 personal_agent/skills/*/SKILL.md，构建注入 LLM 的技能提示词段落。
-    每个技能段落自动附加脚本目录的绝对路径（方案B：由系统注入，LLM 无需猜测路径）。
+    扫描 personal_agent/skills/*/SKILL.md，分离元数据与详细文档。
+
+    Returns:
+        meta_prompt:  仅含名称/描述/脚本路径的简短系统提示词，body 不在其中
+        skill_bodies: {skill_name: {"body": str, "description": str}}
+                      供 ConversationAgent 检测到意图时按需瞬态注入
     """
     skills_dir = project_root / "personal_agent" / "skills"
     if not skills_dir.is_dir():
-        return ""
+        return "", {}
 
-    sections = []
+    meta_sections = []
+    skill_bodies: dict = {}
+
     for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
         try:
             content = skill_md.read_text(encoding="utf-8")
@@ -99,24 +105,26 @@ def _load_skills_prompt(project_root: Path) -> str:
             else:
                 lines.append(f"技能目录：{skill_md.parent.resolve()}")
 
-            if body:
-                lines.append("")
-                lines.append(body)
+            meta_sections.append("\n".join(lines))
 
-            sections.append("\n".join(lines))
+            # body 单独缓存，不写入 system prompt，由 ConversationAgent 按需注入
+            if body:
+                skill_bodies[name] = {"body": body, "description": description}
+
             logger.debug(f"已加载技能: {name}")
         except Exception as e:
             logger.warning(f"加载技能 {skill_md} 失败: {e}")
 
-    if not sections:
-        return ""
+    if not meta_sections:
+        return "", {}
 
-    return (
+    meta_prompt = (
         "【可用技能列表】\n"
         "当用户意图匹配以下技能时，必须严格按照该技能的工作流程执行，"
         "禁止自行探索文件系统或改变执行方式：\n\n"
-        + "\n\n".join(sections)
+        + "\n\n".join(meta_sections)
     )
+    return meta_prompt, skill_bodies
 
 
 def main() -> None:
@@ -168,12 +176,15 @@ def main() -> None:
             extra_prompts.append(f"【核心处理原则】\n{match.group(1).strip()}")
 
     # ── 加载技能列表 (skills/*/SKILL.md) ────────────────────────
-    skills_prompt = _load_skills_prompt(_PROJECT_ROOT)
+    skills_prompt, skill_bodies = _load_skills(_PROJECT_ROOT)
     if skills_prompt:
         extra_prompts.append(skills_prompt)
-        logger.info("✅ 技能列表已注入系统提示词")
+        logger.info(
+            f"✅ 技能列表已注入系统提示词 | {len(skill_bodies)} 个技能含完整文档（按需注入）"
+        )
     else:
         logger.info("未发现任何 SKILL.md，技能列表为空")
+        skill_bodies = {}
 
     context = ConversationContext(
         max_history=int(os.getenv("AGENT_MAX_HISTORY", "20")),
@@ -204,6 +215,7 @@ def main() -> None:
         card_update_interval=float(os.getenv("CARD_UPDATE_INTERVAL", "0.5")),
         task_manager=task_manager,
         interaction_logger=interaction_logger,
+        skill_bodies=skill_bodies,
     )
     logger.info("✅ ConversationAgent 就绪")
 
