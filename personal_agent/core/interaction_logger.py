@@ -1,110 +1,322 @@
 """
-LLM 交互日志记录器
+LLM 交互日志记录器 v4
 
-职责：
-- 按天写入独立文件（logs/interaction_YYYY-MM-DD.log）
-- 完整记录每次 LLM 调用的 messages 数组、工具调用参数、工具结果、最终回复
-- 线程安全，多 worker 并发写入不乱序
+日志目录（按 session 聚合）：
+  logs/2026.5/7/p2p_7f25e707.log   — 同一用户当天所有对话，重启后 append
+
+文件格式（逐字对齐）：
+  %(asctime)s.%(msecs)03d  %(levelname)-8s  %(trace)-8s  %(evt)-20s  %(message)s
+
+  2026-05-07 14:23:01.234  INFO      a3f2b1c4  agent.start           🚀 USER: ...
+  2026-05-07 14:23:01.456  INFO      a3f2b1c4  llm.request           ▶ LLM CALL #1 · 2 messages
+  2026-05-07 14:23:01.457  DEBUG     a3f2b1c4  llm.request           ├─ system: 你是助手...
+  2026-05-07 14:23:01.457  DEBUG     a3f2b1c4  llm.request           │  请用简洁语言回答...
+  2026-05-07 14:23:01.458  DEBUG     a3f2b1c4  llm.request           └─ user: 查询天气
+  2026-05-07 14:23:03.201  INFO      a3f2b1c4  llm.response          ✔ #1 · 1.74s · tool_calls=1
+  2026-05-07 14:23:03.202  DEBUG     a3f2b1c4  llm.response          └─ web_fetch({"url":"..."})
+  2026-05-07 14:23:04.000  INFO      a3f2b1c4  tool.invoke           🔧 web_fetch  args=...
+  2026-05-07 14:23:04.800  INFO      a3f2b1c4  tool.result           ├─ 晴天 25°C
+  2026-05-07 14:23:04.800  INFO      a3f2b1c4  tool.result           └─ ...
+  2026-05-07 14:23:06.890  INFO      a3f2b1c4  agent.end             🎯 FINAL · 5.66s · 234c
+
+终端（Rich，INFO+，每事件≤3行）：
+  trace_id  🚀 USER: ...
+  trace_id  ▶ LLM CALL #1 · 2 messages
+  trace_id  ✔ #1 · 1.74s · text=234c
+  trace_id  🎯 FINAL · 5.66s · 234c
+
+环境变量：
+  LOG_FILE_LEVEL     文件级别（默认 DEBUG，与全局 LOG_LEVEL 解耦）
+  LOG_CONSOLE_LEVEL  终端级别（默认 INFO）
+  LOG_DIR            覆盖日志根目录
 """
 
 import json
+import logging
+import os
+import re
+import secrets
 import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, Generator, List, Optional
 
-# 单条消息内容在日志中的最大显示长度（不影响实际调用，只影响记录详细度）
-_MSG_PREVIEW_LEN = 2000
-# 工具结果在日志中的最大显示长度
-_TOOL_RESULT_LEN = 3000
-# 最终回复在日志中的最大显示长度
-_FINAL_LEN = 3000
+try:
+    from rich.console import Console as _RichConsole
+    _console = _RichConsole(stderr=True, highlight=False)
+except ImportError:
+    _console = None  # type: ignore[assignment]
 
+logging.captureWarnings(True)
+
+# ── 常量 ──────────────────────────────────────────────────────────────────────
+_MSG_LINE_LEN = 500    # 每行最多字符数
+_MSG_MAX_LINES = 20    # 每条消息最多行数
+_RESULT_MAX_LEN = 3000 # 工具结果最大总字符
+_RESULT_MAX_LINES = 30 # 工具结果最多行数
+
+
+# ── 截断辅助 ──────────────────────────────────────────────────────────────────
 
 def _trunc(text: str, limit: int) -> str:
-    """截断超长文本，附加省略提示。"""
     if len(text) <= limit:
         return text
     return text[:limit] + f"... (省略 {len(text) - limit} 字符)"
 
 
-def _fmt_content(msg: dict) -> str:
-    """格式化单条消息内容用于日志输出。"""
+# ── 消息树形拆分 ──────────────────────────────────────────────────────────────
+
+def _split_message(msg: dict, is_last: bool) -> List[str]:
+    """
+    将单条消息拆成树形行列表，每行将作为独立 log record 写入。
+
+    首行:  ├─/└─ role: content_first_line
+    续行:  │  /    content_next_line
+    """
     role = msg.get("role", "?")
     content = msg.get("content")
     tool_calls = msg.get("tool_calls")
-    tool_call_id = msg.get("tool_call_id")
     name = msg.get("name")
 
+    tree = "└─" if is_last else "├─"
+    cont = "   " if is_last else "│  "
+
     if role == "tool":
-        header = f"[tool:{name or '?'}]"
-        body = _trunc(str(content or ""), _MSG_PREVIEW_LEN).replace("\n", "↵")
-        return f"{header} {body}"
+        label = f"tool:{name or '?'}"
+        body = str(content or "")
+    elif role == "assistant":
+        label = "assistant"
+        parts = []
+        if content:
+            parts.append(str(content))
+        if tool_calls:
+            calls = " | ".join(
+                f"{tc.get('function', {}).get('name', '?')}"
+                f"({tc.get('function', {}).get('arguments', '')[:80]})"
+                for tc in tool_calls
+            )
+            parts.append(f"<tool_calls> {calls}")
+        body = "\n".join(parts) if parts else ""
+    else:
+        label = role
+        body = str(content or "")
 
-    if tool_calls:
-        calls = []
-        for tc in tool_calls:
-            fn = tc.get("function", {})
-            calls.append(f"{fn.get('name', '?')}({fn.get('arguments', '')[:200]})")
-        return f"[{role}] <tool_calls> " + " | ".join(calls)
+    # 截断后按换行拆分，忽略空行
+    body = _trunc(body, _MSG_LINE_LEN * _MSG_MAX_LINES)
+    lines = [l for l in body.split("\n") if l.strip()] or ["(empty)"]
 
-    body = _trunc(str(content or ""), _MSG_PREVIEW_LEN).replace("\n", "↵")
-    return f"[{role}] {body}"
+    result: List[str] = []
+    result.append(f"{tree} {label}: {lines[0][:_MSG_LINE_LEN]}")
+    for line in lines[1:_MSG_MAX_LINES]:
+        result.append(f"{cont}{line[:_MSG_LINE_LEN]}")
+    if len(lines) > _MSG_MAX_LINES:
+        result.append(f"{cont}... (+{len(lines) - _MSG_MAX_LINES} more lines)")
+    return result
 
+
+def _split_result(result_str: str) -> List[str]:
+    """将工具结果按行拆分，用于 tool.result 文件输出。"""
+    truncated = _trunc(result_str, _RESULT_MAX_LEN)
+    lines = [l for l in truncated.split("\n") if l.strip()] or ["(empty)"]
+    out = lines[:_RESULT_MAX_LINES]
+    if len(lines) > _RESULT_MAX_LINES:
+        out.append(f"... (+{len(lines) - _RESULT_MAX_LINES} more lines)")
+    return out
+
+
+# ── 文件 Formatter ────────────────────────────────────────────────────────────
+
+class _TraceFormatter(logging.Formatter):
+    """
+    格式：YYYY-MM-DD HH:MM:SS.mmm  LEVEL     trace     evt                   message
+    """
+    _FMT = "%(asctime)s.%(msecs)03d  %(levelname)-8s  %(trace)-8s  %(evt)-20s  %(message)s"
+
+    def __init__(self) -> None:
+        super().__init__(datefmt="%Y-%m-%d %H:%M:%S")
+
+    def format(self, record: logging.LogRecord) -> str:
+        if not hasattr(record, "trace"):
+            record.trace = "--------"  # type: ignore[attr-defined]
+        if not hasattr(record, "evt"):
+            record.evt = ""  # type: ignore[attr-defined]
+        record.message = record.getMessage()
+        record.asctime = self.formatTime(record, self.datefmt)
+        s = self._FMT % record.__dict__
+        if record.exc_info and not record.exc_text:
+            record.exc_text = self.formatException(record.exc_info)
+        if record.exc_text:
+            s = s + "\n" + record.exc_text
+        return s
+
+
+# ── 终端输出 ──────────────────────────────────────────────────────────────────
+
+_LEVEL_STYLE: Dict[str, str] = {
+    "INFO":     "cyan",
+    "WARNING":  "yellow",
+    "ERROR":    "bold red",
+    "CRITICAL": "bold red on white",
+}
+
+
+def _term(level_name: str, trace: str, line: str) -> None:
+    if _console is None:
+        return
+    style = _LEVEL_STYLE.get(level_name, "white")
+    _console.print(
+        f"[dim]{trace}[/dim]  [{style}]{line}[/{style}]",
+        soft_wrap=True,
+    )
+
+
+# ── 会话状态 ──────────────────────────────────────────────────────────────────
+
+class _SessionState:
+    __slots__ = ("path", "trace_id", "logger", "handler", "llm_starts", "start_time")
+
+    def __init__(
+        self,
+        path: Path,
+        trace_id: str,
+        logger: logging.Logger,
+        handler: logging.FileHandler,
+    ) -> None:
+        self.path = path
+        self.trace_id = trace_id
+        self.logger = logger
+        self.handler = handler
+        self.llm_starts: Dict[int, float] = {}
+        self.start_time: float = time.monotonic()
+
+
+# ── 主类 ──────────────────────────────────────────────────────────────────────
 
 class InteractionLogger:
-    """
-    按日期分文件写入 LLM 交互日志。
-
-    日志目录结构：
-      logs/
-        interaction_2026-05-05.log
-        interaction_2026-05-06.log
-        ...
-    """
-
-    def __init__(self, log_dir: Path) -> None:
-        self._log_dir = log_dir
+    def __init__(self, log_dir: Optional[Path] = None) -> None:
+        env_dir = os.getenv("LOG_DIR")
+        self._log_dir = Path(env_dir) if env_dir else (log_dir or Path("logs"))
         self._log_dir.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
 
-    # ──────────────────────────────────────────────
-    #   底层写入
-    # ──────────────────────────────────────────────
+        # LOG_FILE_LEVEL 独立于全局 LOG_LEVEL，默认 DEBUG（记录完整调用链）
+        self._file_level = self._parse_level(os.getenv("LOG_FILE_LEVEL", "DEBUG"))
+        self._console_level = self._parse_level(os.getenv("LOG_CONSOLE_LEVEL", "INFO"))
 
-    def _path(self) -> Path:
-        return self._log_dir / f"interaction_{datetime.now():%Y-%m-%d}.log"
+        self._dict_lock = threading.Lock()
+        self._sessions: Dict[str, _SessionState] = {}
 
-    def _write(self, text: str) -> None:
-        """线程安全地追加写入当日日志文件。"""
-        with self._lock:
-            with open(self._path(), "a", encoding="utf-8") as f:
-                f.write(text)
+        self._cleanup_legacy_logs()
 
-    # ──────────────────────────────────────────────
-    #   公开日志接口
-    # ──────────────────────────────────────────────
+    @staticmethod
+    def _parse_level(name: str) -> int:
+        return getattr(logging, name.upper(), logging.DEBUG)
+
+    # ── 初始化清理 ────────────────────────────────────────────────────────────
+
+    def _cleanup_legacy_logs(self) -> None:
+        """删除旧格式文件：interaction_*.log 和时间戳命名的 HH.MM.SS.log。"""
+        for f in self._log_dir.glob("interaction_*.log"):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+        _ts_pat = re.compile(r"^\d{2}\.\d{2}\.\d{2}(_\d+)?\.log$")
+        for f in self._log_dir.rglob("*.log"):
+            if _ts_pat.match(f.name):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+    # ── 路径与 Logger ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _session_slug(session_key: str) -> str:
+        """p2p_ou_...7f25e707  →  p2p_7f25e707（稳定短名，用作文件名）"""
+        first = session_key.split("_")[0]
+        prefix = first if first in ("p2p", "group", "thread") else "sess"
+        return f"{prefix}_{session_key[-8:]}"
+
+    def _make_log_path(self, session_key: str) -> Path:
+        """同 session 同一天返回同一路径（重启后 append 同文件）。"""
+        now = datetime.now()
+        dir_path = self._log_dir / f"{now.year}.{now.month}" / str(now.day)
+        dir_path.mkdir(parents=True, exist_ok=True)
+        return dir_path / f"{self._session_slug(session_key)}.log"
+
+    def _make_session_logger(
+        self, trace_id: str, path: Path
+    ) -> tuple[logging.Logger, logging.FileHandler]:
+        logger = logging.getLogger(f"interaction.{trace_id}")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+        handler.setLevel(self._file_level)
+        handler.setFormatter(_TraceFormatter())
+        logger.addHandler(handler)
+        return logger, handler
+
+    # ── 内部写入 ──────────────────────────────────────────────────────────────
+
+    def _log(
+        self,
+        session_key: str,
+        level: int,
+        evt: str,
+        msg: str,
+        *,
+        to_console: bool = False,
+    ) -> None:
+        with self._dict_lock:
+            state = self._sessions.get(session_key)
+        if state is None:
+            return
+        extra = {"trace": state.trace_id, "evt": evt}
+        state.logger.log(level, msg, extra=extra)
+        if to_console and level >= self._console_level:
+            _term(logging.getLevelName(level), state.trace_id, msg)
+
+    # ── 公开日志接口 ──────────────────────────────────────────────────────────
 
     def log_session_start(self, session_key: str, user_input: str) -> None:
-        """记录一次对话的开始：时间戳、会话 key、用户输入。"""
+        """每次用户消息开始时调用：分配 trace_id，写入分隔线，记录 agent.start。"""
+        path = self._make_log_path(session_key)
+        trace_id = secrets.token_hex(4)
+        logger, handler = self._make_session_logger(trace_id, path)
+        state = _SessionState(path, trace_id, logger, handler)
+        with self._dict_lock:
+            self._sessions[session_key] = state
+
+        # 交互分隔线（直接写流，绕过 formatter）
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        text = (
-            f"\n{'═' * 80}\n"
-            f"[{ts}] SESSION: {session_key}\n"
-            f"USER: {_trunc(user_input, 500)}\n"
-            f"{'═' * 80}\n"
+        sep = "━" * 80
+        handler.stream.write(
+            f"\n{sep}\n[{ts}]  trace={trace_id}  session={session_key}\n{sep}\n"
         )
-        self._write(text)
+        handler.stream.flush()
+
+        preview = _trunc(user_input, 200).replace("\n", " ")
+        self._log(session_key, logging.INFO, "agent.start",
+                  f"🚀 USER: {preview}", to_console=True)
 
     def log_llm_call(
         self, session_key: str, round_n: int, messages: List[Dict[str, Any]]
     ) -> None:
-        """记录一次 LLM 调用：发送的完整 messages 数组。"""
-        lines = [f"\n── LLM CALL #{round_n} SESSION={session_key} {'─' * 40}"]
-        lines.append(f"MESSAGES ({len(messages)} 条):")
-        for msg in messages:
-            lines.append(f"  {_fmt_content(msg)}")
-        self._write("\n".join(lines) + "\n")
+        with self._dict_lock:
+            state = self._sessions.get(session_key)
+        if state:
+            state.llm_starts[round_n] = time.monotonic()
+
+        summary = f"▶ LLM CALL #{round_n} · {len(messages)} messages"
+        # INFO：同时写文件和终端（一行摘要）
+        self._log(session_key, logging.INFO, "llm.request", summary, to_console=True)
+        # DEBUG：消息明细（仅文件）
+        for i, msg in enumerate(messages):
+            for line in _split_message(msg, is_last=(i == len(messages) - 1)):
+                self._log(session_key, logging.DEBUG, "llm.request", line)
 
     def log_llm_response(
         self,
@@ -113,19 +325,32 @@ class InteractionLogger:
         text: str,
         tool_calls: Optional[List[Dict[str, Any]]],
     ) -> None:
-        """记录 LLM 的回复：文本内容与工具调用列表。"""
-        lines = [f"LLM RESPONSE #{round_n} SESSION={session_key}:"]
+        with self._dict_lock:
+            state = self._sessions.get(session_key)
+
+        elapsed_str = ""
+        if state and round_n in state.llm_starts:
+            elapsed = time.monotonic() - state.llm_starts.pop(round_n)
+            elapsed_str = f" · {elapsed:.2f}s"
+
         if text:
-            lines.append(f"  TEXT: {_trunc(text, 1000).replace(chr(10), '↵')}")
+            preview = _trunc(text, 300).replace("\n", " ")
+            self._log(session_key, logging.INFO, "llm.response",
+                      f"✔ #{round_n}{elapsed_str} · text={len(text)}c  {preview}",
+                      to_console=True)
         if tool_calls:
-            lines.append(f"  TOOL_CALLS ({len(tool_calls)} 个):")
+            self._log(session_key, logging.INFO, "llm.response",
+                      f"✔ #{round_n}{elapsed_str} · {len(tool_calls)} tool_calls",
+                      to_console=True)
             for i, tc in enumerate(tool_calls, 1):
                 fn = tc.get("function", {})
-                args_str = fn.get("arguments", "")
-                lines.append(f"    #{i} {fn.get('name', '?')}  args: {args_str[:300]}")
+                prefix = "└─" if i == len(tool_calls) else "├─"
+                args = fn.get("arguments", "")[:200]
+                self._log(session_key, logging.DEBUG, "llm.response",
+                          f"{prefix} {fn.get('name', '?')}({args})")
         if not text and not tool_calls:
-            lines.append("  (空响应)")
-        self._write("\n".join(lines) + "\n")
+            self._log(session_key, logging.WARNING, "llm.response",
+                      f"⚠️  #{round_n}{elapsed_str} · (空响应)", to_console=True)
 
     def log_tool_result(
         self,
@@ -134,25 +359,95 @@ class InteractionLogger:
         args: Dict[str, Any],
         result: str,
     ) -> None:
-        """记录单次工具调用的参数与返回结果。"""
         try:
-            args_str = json.dumps(args, ensure_ascii=False)
+            args_str = json.dumps(args, ensure_ascii=False)[:300]
         except Exception:
-            args_str = str(args)
-        result_preview = _trunc(result, _TOOL_RESULT_LEN).replace("\n", "↵")
-        text = (
-            f"\n── TOOL: {tool_name} {'─' * 60}\n"
-            f"  ARGS:   {args_str[:500]}\n"
-            f"  RESULT: {result_preview}\n"
-        )
-        self._write(text)
+            args_str = str(args)[:300]
+
+        # 根据内容判断是成功还是失败
+        is_error = result.startswith("Error:") or result.startswith("错误")
+        invoke_evt = "tool.error" if is_error else "tool.invoke"
+        result_evt = "tool.error" if is_error else "tool.result"
+        icon = "⚠️ " if is_error else "🔧"
+
+        self._log(session_key, logging.INFO, invoke_evt,
+                  f"{icon} {tool_name}  args={args_str}", to_console=True)
+
+        result_lines = _split_result(result)
+        for i, line in enumerate(result_lines):
+            prefix = "└─" if i == len(result_lines) - 1 else "├─"
+            self._log(session_key, logging.INFO, result_evt, f"{prefix} {line}")
 
     def log_final(self, session_key: str, response: str) -> None:
-        """记录本次对话的最终回复，并写入结束分隔线。"""
-        preview = _trunc(response, _FINAL_LEN)
-        text = (
-            f"\n── FINAL RESPONSE {'─' * 60}\n"
-            f"{preview}\n"
-            f"{'═' * 80}\n"
-        )
-        self._write(text)
+        """记录最终回复，关闭本次交互的 FileHandler（文件留存，下次 append）。"""
+        with self._dict_lock:
+            state = self._sessions.get(session_key)
+
+        elapsed_str = ""
+        if state:
+            elapsed = time.monotonic() - state.start_time
+            elapsed_str = f" · {elapsed:.2f}s"
+
+        # 终端：一行摘要
+        term_preview = _trunc(response, 120).replace("\n", " ")
+        self._log(session_key, logging.INFO, "agent.end",
+                  f"🎯 FINAL{elapsed_str} · {len(response)}c  {term_preview}",
+                  to_console=True)
+        # 文件：完整内容按行拆分
+        result_lines = _split_result(response)
+        for i, line in enumerate(result_lines):
+            prefix = "└─" if i == len(result_lines) - 1 else "├─"
+            self._log(session_key, logging.INFO, "agent.end", f"{prefix} {line}")
+
+        with self._dict_lock:
+            state = self._sessions.pop(session_key, None)
+        if state:
+            state.handler.flush()
+            state.handler.close()
+            state.logger.removeHandler(state.handler)
+
+    # ── 装饰器 & 上下文管理器 ─────────────────────────────────────────────────
+
+    def log_agent(self, session_key_arg: str = "session_key") -> Callable:
+        """
+        方法装饰器：自动记录函数入口/出口。
+
+        用法：
+            @interaction_logger.log_agent()
+            def process(self, event, ..., session_key: str): ...
+        """
+        def decorator(fn: Callable) -> Callable:
+            @wraps(fn)
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                sk = kwargs.get(session_key_arg, "?")
+                self._log(sk, logging.INFO, "agent.enter",
+                          f"▶ {fn.__qualname__}", to_console=True)
+                try:
+                    result = fn(*args, **kwargs)
+                    self._log(sk, logging.INFO, "agent.exit",
+                              f"✔ {fn.__qualname__}", to_console=True)
+                    return result
+                except Exception as exc:
+                    self._log(sk, logging.ERROR, "agent.exit",
+                              f"❌ {fn.__qualname__}  err={exc}", to_console=True)
+                    raise
+            return wrapper
+        return decorator
+
+    @contextmanager
+    def log_span(self, session_key: str, name: str) -> Generator[None, None, None]:
+        """上下文管理器：测量并记录代码块耗时。"""
+        self._log(session_key, logging.DEBUG, f"span.{name}", f"▶ {name} start")
+        t0 = time.monotonic()
+        try:
+            yield
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            self._log(session_key, logging.ERROR, f"span.{name}",
+                      f"❌ {name} failed · {elapsed:.3f}s · err={exc}",
+                      to_console=True)
+            raise
+        else:
+            elapsed = time.monotonic() - t0
+            self._log(session_key, logging.DEBUG, f"span.{name}",
+                      f"✔ {name} done · {elapsed:.3f}s")
