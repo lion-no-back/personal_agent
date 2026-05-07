@@ -163,7 +163,25 @@ def main() -> None:
     from personal_agent.context.conversation_context import ConversationContext
     import re
 
+    import platform
+
     extra_prompts = []
+    # 注入运行环境信息，指导 LLM 使用正确的系统命令
+    _os = platform.system()
+    if _os == "Windows":
+        _env_hint = (
+            f"【运行环境】操作系统：Windows {platform.release()}，"
+            "Shell：PowerShell / cmd。"
+            "请使用 Windows 命令（dir、type、where、icacls 等），"
+            "禁止使用 Linux/Unix 命令（find、head、grep、ls、cat 等）。"
+        )
+    else:
+        _env_hint = (
+            f"【运行环境】操作系统：{_os} {platform.release()}，"
+            "Shell：bash/sh。"
+            "请使用标准 Unix 命令（find、grep、ls、cat 等）。"
+        )
+    extra_prompts.append(_env_hint)
     if env_prompt := os.getenv("AGENT_SYSTEM_PROMPT"):
         extra_prompts.append(env_prompt)
         
