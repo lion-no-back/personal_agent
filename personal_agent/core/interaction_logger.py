@@ -1,8 +1,12 @@
 """
-LLM 交互日志记录器 v4
+LLM 交互日志记录器 v5
 
-日志目录（按 session 聚合）：
-  logs/2026.5/7/p2p_7f25e707.log   — 同一用户当天所有对话，重启后 append
+日志目录（按 session + 进程启动时间聚合）：
+  logs/2026.5/7/p2p_7f25e707@152001.log  — 同一用户 × 同一次运行的全部对话
+  logs/2026.5/7/p2p_7f25e707@163045.log  — 重启后自动新建文件
+
+  每次进程启动生成唯一 Run ID（HHMMss），写入文件顶部 Banner。
+  同一运行内的多轮对话仍追加到同一文件，用 ━━━ 分隔。
 
 文件格式（逐字对齐）：
   %(asctime)s.%(msecs)03d  %(levelname)-8s  %(trace)-8s  %(evt)-20s  %(message)s
@@ -51,6 +55,11 @@ except ImportError:
     _console = None  # type: ignore[assignment]
 
 logging.captureWarnings(True)
+
+# 进程启动时间 — 每次重启唯一，用于日志文件名和 Banner
+_RUN_START_DT = datetime.now()
+_RUN_ID = _RUN_START_DT.strftime("%H%M%S")          # 嵌入文件名，如 152001
+_RUN_START_TS = _RUN_START_DT.strftime("%Y-%m-%d %H:%M:%S")
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 _MSG_LINE_LEN = 500    # 每行最多字符数
@@ -241,11 +250,10 @@ class InteractionLogger:
         return f"{prefix}_{session_key[-8:]}"
 
     def _make_log_path(self, session_key: str) -> Path:
-        """同 session 同一天返回同一路径（重启后 append 同文件）。"""
-        now = datetime.now()
-        dir_path = self._log_dir / f"{now.year}.{now.month}" / str(now.day)
+        """同 session × 同次运行返回同一路径；重启后 _RUN_ID 变化，自动新建文件。"""
+        dir_path = self._log_dir / f"{_RUN_START_DT.year}.{_RUN_START_DT.month}" / str(_RUN_START_DT.day)
         dir_path.mkdir(parents=True, exist_ok=True)
-        return dir_path / f"{self._session_slug(session_key)}.log"
+        return dir_path / f"{self._session_slug(session_key)}@{_RUN_ID}.log"
 
     def _make_session_logger(
         self, trace_id: str, path: Path
@@ -284,11 +292,23 @@ class InteractionLogger:
     def log_session_start(self, session_key: str, user_input: str) -> None:
         """每次用户消息开始时调用：分配 trace_id，写入分隔线，记录 agent.start。"""
         path = self._make_log_path(session_key)
+        is_new_file = not path.exists()          # 文件不存在 = 本次运行首次写入
         trace_id = secrets.token_hex(4)
         logger, handler = self._make_session_logger(trace_id, path)
         state = _SessionState(path, trace_id, logger, handler)
         with self._dict_lock:
             self._sessions[session_key] = state
+
+        # 新文件顶部写入启动 Banner（标明是哪次重启产生的日志）
+        if is_new_file:
+            bar = "═" * 60
+            handler.stream.write(
+                f"{bar}\n"
+                f"  PersonalAgent  启动: {_RUN_START_TS}  run={_RUN_ID}\n"
+                f"  session: {session_key}\n"
+                f"{bar}\n\n"
+            )
+            handler.stream.flush()
 
         # 交互分隔线（直接写流，绕过 formatter）
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
