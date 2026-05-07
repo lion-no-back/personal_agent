@@ -155,21 +155,37 @@ class FileStash:
             lines.append(f"  本地读取路径：{f.local_path}")
         return "\n".join(lines)
 
-    def start_disk_cleanup_timer(self) -> None:
-        """后台守护进程，每小时清理过期磁盘文件。不需要清理目录结构。"""
+    def start_disk_cleanup_timer(self, extra_dirs: list[Path] | None = None) -> None:
+        """
+        启动磁盘清理：启动时立即执行一次，之后每小时循环。
+        extra_dirs: 额外需要清理的目录列表（如 .playwright-mcp），
+                    其中的文件同样按 FILE_STASH_DISK_TTL 判断是否过期。
+        """
+        _extra = list(extra_dirs or [])
+
+        def _do_cleanup() -> None:
+            now = time.time()
+            try:
+                # artifact/ 子目录
+                scan_dirs: list[Path] = []
+                if self._artifact_dir.is_dir():
+                    scan_dirs += [d for d in self._artifact_dir.iterdir() if d.is_dir()]
+                # 额外目录（扁平，直接扫目录下的文件）
+                scan_dirs += [d for d in _extra if d.is_dir()]
+
+                for d in scan_dirs:
+                    for f in d.iterdir():
+                        if f.is_file() and now - f.stat().st_ctime > self._disk_ttl:
+                            f.unlink(missing_ok=True)
+                            logger.info(f"🗑️ 已清理过期文件 | path={f}")
+            except Exception as e:
+                logger.error(f"磁盘清理异常 | error={e}")
+
         def _loop():
+            _do_cleanup()          # 启动时立即清一次
             while True:
-                time.sleep(3600)
-                now = time.time()
-                try:
-                    target_dirs = [d for d in self._artifact_dir.iterdir() if d.is_dir()]
-                    for d in target_dirs:
-                        for f in d.iterdir():
-                            if f.is_file() and now - f.stat().st_ctime > self._disk_ttl:
-                                f.unlink(missing_ok=True)
-                                logger.info(f"🗑️ 已清理过期本地文件 | path={f}")
-                except Exception as e:
-                    logger.error(f"磁盘清理异常 | error={e}")
-                    
+                time.sleep(3600)   # 之后每小时再清
+                _do_cleanup()
+
         t = threading.Thread(target=_loop, daemon=True, name="file-stash-cleanup")
         t.start()

@@ -241,7 +241,9 @@ def main() -> None:
     from personal_agent.core.file_stash import FileStash
 
     file_stash = FileStash(artifact_dir=_PROJECT_ROOT / "artifact")
-    file_stash.start_disk_cleanup_timer()
+    file_stash.start_disk_cleanup_timer(
+        extra_dirs=[_PROJECT_ROOT / ".playwright-mcp"]
+    )
     logger.info("✅ FileStash 就绪")
 
     # ── Step 7: 初始化飞书网关并启动（阻塞） ─────────────────
