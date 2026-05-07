@@ -225,6 +225,11 @@ class FeishuGateway:
             thread_name_prefix="feishu-worker",
         )
 
+        # 会话级串行锁：同一 session_key 的请求必须排队，防止并发写共享上下文
+        # 导致 assistant/tool 消息交错，引发 OpenAI 400 invalid_request_error
+        self._session_run_locks: dict[str, threading.Lock] = {}
+        self._session_run_locks_guard = threading.Lock()
+
         # ── API Client（主动调用）────────────────────────────
         self._api_client = (
             lark.Client.builder()
@@ -815,20 +820,30 @@ class FeishuGateway:
         Args:
             event: 已解析的消息事件
         """
+        # ── 计算 session_key（加锁和注册任务均需要）──────────
+        from ..context.conversation_context import ConversationContext
+        session_key = ConversationContext.build_session_key(
+            chat_type=event.chat_type,
+            sender_open_id=event.sender_open_id,
+            chat_id=event.chat_id,
+            thread_id=event.thread_id,
+        )
+
+        # ── 会话串行锁：同 session 并发请求排队，防止上下文消息交错 ──
+        with self._session_run_locks_guard:
+            if session_key not in self._session_run_locks:
+                self._session_run_locks[session_key] = threading.Lock()
+        with self._session_run_locks[session_key]:
+            self._handle_async_body(event, session_key)
+
+    def _handle_async_body(self, event: "MessageEvent", session_key: str) -> None:
+        """_handle_async 的实际执行体，在会话串行锁保护下运行。"""
         stream_session: Optional[_StreamingCardSession] = None
         stream_sink: Optional[_CardStreamAsyncSink] = None
 
         # ── 注册后台任务 ──────────────────────────────────────
         task_id: Optional[str] = None
         if self._task_manager is not None:
-            from ..context.conversation_context import ConversationContext
-
-            session_key = ConversationContext.build_session_key(
-                chat_type=event.chat_type,
-                sender_open_id=event.sender_open_id,
-                chat_id=event.chat_id,
-                thread_id=event.thread_id,
-            )
             task_id = self._task_manager.create(
                 session_key=session_key,
                 description=event.content[:50],
