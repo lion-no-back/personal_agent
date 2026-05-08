@@ -239,6 +239,9 @@ class FeishuGateway:
             .build()
         )
 
+        # ── 获取机器人自身 open_id（用于群聊 @提及过滤）──────────
+        self._bot_open_id: str = self._fetch_bot_open_id()
+
         # ── 事件分发器（注册消息接收处理函数）───────────────────
         # 长连接模式下 builder 参数必须传空字符串
         _handler = (
@@ -258,7 +261,49 @@ class FeishuGateway:
             log_level=lark.LogLevel.WARNING,
         )
 
-        logger.info(f"✅ FeishuGateway 初始化完成 | app_id={self._app_id[:8]}...")
+        logger.info(f"✅ FeishuGateway 初始化完成 | app_id={self._app_id[:8]}... bot_open_id={self._bot_open_id or '未获取'}")
+
+    # ──────────────────────────────────────────────────────────
+    #   机器人身份获取
+    # ──────────────────────────────────────────────────────────
+
+    def _fetch_bot_open_id(self) -> str:
+        """
+        调用飞书 bot/v3/info API 获取机器人自身的 open_id。
+        用于群聊 @提及过滤：只有 @机器人 才触发处理。
+        """
+        import httpx
+
+        try:
+            # 先获取 tenant_access_token
+            token_resp = httpx.post(
+                "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                json={"app_id": self._app_id, "app_secret": self._app_secret},
+                timeout=10,
+            )
+            token_data = token_resp.json()
+            token = token_data.get("tenant_access_token", "")
+            if not token:
+                logger.warning("获取 tenant_access_token 失败: %s", token_data)
+                return ""
+
+            # 调用 bot/v3/info 获取机器人信息
+            bot_resp = httpx.get(
+                "https://open.feishu.cn/open-apis/bot/v3/info/",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+            bot_data = bot_resp.json()
+            bot_info = bot_data.get("bot", {})
+            open_id = bot_info.get("open_id", "")
+            if open_id:
+                logger.info("✅ 获取机器人 open_id 成功 | open_id=%s", open_id)
+            else:
+                logger.warning("bot/v3/info 返回中无 open_id: %s", bot_data)
+            return open_id
+        except Exception as e:
+            logger.error("获取机器人 open_id 失败: %s", e, exc_info=True)
+            return ""
 
     # ──────────────────────────────────────────────────────────
     #   公共接口
@@ -728,6 +773,10 @@ class FeishuGateway:
             if attempt < _retries:
                 time.sleep(2)
 
+    def send_text(self, chat_id: str, text: str) -> None:
+        """发送普通文本消息（供外部调用，如定时任务结果投递）。"""
+        self._send_text_message(chat_id, text)
+
     def send_stash_remind_card(self, chat_id: str, file_name: str) -> None:
         """发送超时卡片提醒"""
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
@@ -1035,9 +1084,31 @@ class FeishuGateway:
                 if not mentions:
                     return None
 
-                # 暂不检查 is_bot，因为 SDK 的 MentionEvent 并未暴露出 is_bot，
-                # 退而求其次，只要有 @提及 就认为可能是对机器人说话，交给下游处理。
-                pass
+                # 检查 mentions 中是否包含对机器人自身的 @提及
+                # mention.id 对应被 @ 对象的 open_id（类型由 id_type 指定）
+                bot_mentioned = False
+                if self._bot_open_id:
+                    for mention in mentions:
+                        mention_id = getattr(mention, "id", None) or ""
+                        mention_open_id = (
+                            getattr(mention_id, "open_id", None)
+                            if hasattr(mention_id, "open_id")
+                            else str(mention_id)
+                        )
+                        if mention_open_id == self._bot_open_id:
+                            bot_mentioned = True
+                            break
+                else:
+                    # bot_open_id 获取失败时回退到旧逻辑（有 @就处理），防止机器人完全沉默
+                    logger.warning("bot_open_id 未获取，回退为所有 @提及均处理")
+                    bot_mentioned = True
+
+                if not bot_mentioned:
+                    logger.debug(
+                        "群聊消息未 @机器人，跳过 | mentions=%s",
+                        [getattr(m, "id", None) for m in mentions],
+                    )
+                    return None
 
                 # 清除文本中的 @占位符，保留纯业务内容
                 clean_text = self._strip_mentions(raw_text, mentions)
