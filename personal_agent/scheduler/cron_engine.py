@@ -1,0 +1,302 @@
+"""
+Cron 引擎
+
+基于 APScheduler AsyncIOScheduler 实现，全部配置从 YAML 加载。
+
+约束保证：
+- 任务必须 async，统一通过 _wrap_job 装饰
+- 每个任务独立超时（asyncio.wait_for）
+- 防重入：per-job asyncio.Lock，上轮未完成则跳过
+- 统一异常捕获包装在 _wrap_job 最外层
+- 时区统一 UTC（由调用方通过 timezone 参数传入）
+- 进程退出时 graceful shutdown（scheduler.shutdown(wait=True)）
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+import logging
+import time
+import uuid
+from typing import Callable, Optional
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from .config_loader import CronJobConfig
+
+logger = logging.getLogger(__name__)
+
+
+def _is_valid_receive_id(value: str) -> bool:
+    """判断 deliver_to 是否像一个合法的飞书 ID（ou_ / oc_ / p2p_），排除占位符。"""
+    if not value:
+        return False
+    return value.startswith(("ou_", "oc_", "p2p_"))
+
+
+def _wrap_job(
+    job_config: CronJobConfig,
+    inner: Callable[[], "asyncio.Coroutine"],
+    lock: asyncio.Lock,
+) -> Callable[[], "asyncio.Coroutine"]:
+    """
+    统一执行器包装：
+      1. 防重入 — lock 已占用则跳过本次，不排队
+      2. 独立超时 — asyncio.wait_for
+      3. 统一异常捕获 — 任何 Exception 均被捕获并记录，不向外传播
+    """
+
+    async def wrapped() -> None:
+        if lock.locked():
+            logger.warning(
+                "[cron:%s] 上轮执行尚未完成，跳过本次 | name=%s",
+                job_config.id,
+                job_config.name,
+            )
+            return
+
+        async with lock:
+            logger.info(
+                "[cron:%s] 开始执行 | name=%s schedule=%r",
+                job_config.id,
+                job_config.name,
+                job_config.schedule,
+            )
+            t0 = time.monotonic()
+            try:
+                await asyncio.wait_for(inner(), timeout=job_config.timeout)
+                logger.info(
+                    "[cron:%s] 执行完成 | elapsed=%.1fs",
+                    job_config.id,
+                    time.monotonic() - t0,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "[cron:%s] 执行超时 | timeout=%.0fs",
+                    job_config.id,
+                    job_config.timeout,
+                )
+            except Exception:
+                logger.exception(
+                    "[cron:%s] 执行异常 | name=%s",
+                    job_config.id,
+                    job_config.name,
+                )
+
+    return wrapped
+
+
+def _parse_cron(schedule: str) -> dict:
+    """
+    将标准 5 字段 cron 表达式解析为 APScheduler CronTrigger 关键字参数。
+
+    例：'0 9 * * *' → {'minute': '0', 'hour': '9', 'day': '*', 'month': '*', 'day_of_week': '*'}
+    """
+    parts = schedule.strip().split()
+    if len(parts) != 5:
+        raise ValueError(
+            f"cron 表达式需要 5 个字段（分 时 日 月 周），实际: {schedule!r}"
+        )
+    minute, hour, day, month, day_of_week = parts
+    return dict(
+        minute=minute,
+        hour=hour,
+        day=day,
+        month=month,
+        day_of_week=day_of_week,
+    )
+
+
+class CronEngine:
+    """
+    基于 APScheduler AsyncIOScheduler 的定时任务引擎。
+
+    支持两种任务类型：
+    - agent_message: 向 ConversationAgent 发送 prompt，可选投递到飞书
+    - python_function: 导入指定模块函数并执行（async/sync 均支持）
+    """
+
+    def __init__(
+        self,
+        jobs: list[CronJobConfig],
+        timezone: str = "UTC",
+        agent=None,
+        notify_fn: Optional[Callable[[str, str], None]] = None,
+    ) -> None:
+        """
+        Args:
+            jobs:      cron 任务配置列表
+            timezone:  调度时区，约束要求统一 UTC
+            agent:     ConversationAgent 实例（agent_message 类型需要）
+            notify_fn: notify_fn(chat_id, text) 投递结果到飞书（可选）
+        """
+        self._jobs = jobs
+        self._timezone = timezone
+        self._agent = agent
+        self._notify_fn = notify_fn
+        self._scheduler: Optional[AsyncIOScheduler] = None
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    async def start(self) -> None:
+        """在调用方的 asyncio 事件循环中启动调度器。"""
+        if not self._jobs:
+            logger.info("[CronEngine] 无定时任务配置，跳过启动")
+            return
+
+        self._scheduler = AsyncIOScheduler(timezone=self._timezone)
+
+        for job_cfg in self._jobs:
+            lock = asyncio.Lock()
+            self._locks[job_cfg.id] = lock
+
+            inner = self._make_inner(job_cfg)
+            wrapped = _wrap_job(job_cfg, inner, lock)
+
+            try:
+                cron_kwargs = _parse_cron(job_cfg.schedule)
+            except ValueError as e:
+                logger.error("[CronEngine] 跳过无效任务 | id=%s error=%s", job_cfg.id, e)
+                continue
+
+            self._scheduler.add_job(
+                wrapped,
+                trigger="cron",
+                id=job_cfg.id,
+                name=job_cfg.name,
+                **cron_kwargs,
+                timezone=self._timezone,
+                misfire_grace_time=60,  # 错过的触发最多追 60s 内补跑一次
+                coalesce=True,          # 多个积压触发只执行一次
+                max_instances=1,        # 单任务最多 1 个并发实例
+            )
+            logger.info(
+                "[CronEngine] 注册任务 | id=%s name=%s schedule=%r",
+                job_cfg.id,
+                job_cfg.name,
+                job_cfg.schedule,
+            )
+
+        self._scheduler.start()
+        logger.info(
+            "[CronEngine] 调度器已启动 | tasks=%d timezone=%s",
+            len(self._jobs),
+            self._timezone,
+        )
+
+    async def stop(self) -> None:
+        """优雅停止：等待正在运行的任务结束后再退出。
+
+        scheduler.shutdown(wait=True) 是同步阻塞调用，必须放到线程池里执行，
+        否则会在 asyncio 事件循环里等待同一循环里的 job future，造成死锁。
+        """
+        if self._scheduler and self._scheduler.running:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._scheduler.shutdown)
+            logger.info("[CronEngine] 调度器已停止")
+
+    # ──────────────────────────────────────────────────────────
+    #   内部任务工厂
+    # ──────────────────────────────────────────────────────────
+
+    def _make_inner(self, job_cfg: CronJobConfig) -> Callable[[], "asyncio.Coroutine"]:
+        if job_cfg.type == "agent_message":
+            return self._make_agent_message(job_cfg)
+        if job_cfg.type == "python_function":
+            return self._make_python_function(job_cfg)
+        raise ValueError(f"未知任务类型: {job_cfg.type!r}")
+
+    def _make_agent_message(self, job_cfg: CronJobConfig):
+        """构造 agent_message 类型的 inner 协程函数。"""
+
+        async def inner() -> None:
+            if self._agent is None:
+                logger.warning("[cron:%s] agent 未注入，跳过", job_cfg.id)
+                return
+
+            from personal_agent.gateway.feishu_gateway import MessageEvent
+
+            # ConversationContext 对 p2p 会话的 key 规则：p2p_{sender_open_id}
+            # 用 job_cfg.session_key 作为 sender_open_id，保证不同任务会话互相隔离
+            cron_session_key = f"p2p_{job_cfg.session_key}"
+
+            # ① 每次执行前清空上下文，防止历史跨轮累积（token 膨胀 + 语义污染）
+            context = getattr(self._agent, "_context", None)
+            if context is not None:
+                context.clear(cron_session_key)
+
+            # ② 静默该会话的终端日志（仍写文件），避免 cron 日志淹没主流输出
+            ilogger = getattr(self._agent, "_interaction_logger", None)
+            if ilogger is not None:
+                ilogger.suppress_console(cron_session_key)
+
+            try:
+                fake_event = MessageEvent(
+                    message_id=f"cron_{job_cfg.id}_{uuid.uuid4().hex[:8]}",
+                    chat_id=f"cron_{job_cfg.session_key}",
+                    chat_type="p2p",
+                    content=job_cfg.prompt,
+                    sender_open_id=job_cfg.session_key,
+                    is_scheduled=True,
+                )
+
+                loop = asyncio.get_running_loop()
+                result: str = await loop.run_in_executor(
+                    None, self._agent.process, fake_event
+                )
+            finally:
+                # ③ 无论成功/异常都恢复，避免永久静默该 session_key
+                if ilogger is not None:
+                    ilogger.restore_console(cron_session_key)
+
+            logger.info(
+                "[cron:%s] Agent 回复完成 | chars=%d deliver_to=%r",
+                job_cfg.id,
+                len(result),
+                job_cfg.deliver_to or "(none)",
+            )
+
+            if job_cfg.deliver_to and self._notify_fn:
+                if not _is_valid_receive_id(job_cfg.deliver_to):
+                    logger.error(
+                        "[cron:%s] deliver_to=%r 不是有效的飞书 ID，跳过投递。"
+                        " 格式应为 ou_xxx（用户 open_id）或 oc_xxx / p2p_xxx（chat_id）。"
+                        " 向机器人发一条消息后，从日志 'session=p2p_<open_id>' 中提取 open_id。",
+                        job_cfg.id,
+                        job_cfg.deliver_to,
+                    )
+                else:
+                    try:
+                        self._notify_fn(job_cfg.deliver_to, result)
+                    except Exception:
+                        logger.exception("[cron:%s] 投递消息失败", job_cfg.id)
+
+        return inner
+
+    def _make_python_function(self, job_cfg: CronJobConfig):
+        """构造 python_function 类型的 inner 协程函数。"""
+
+        async def inner() -> None:
+            try:
+                mod = importlib.import_module(job_cfg.module)
+            except ModuleNotFoundError:
+                logger.error("[cron:%s] 模块不存在: %s", job_cfg.id, job_cfg.module)
+                return
+
+            fn = getattr(mod, job_cfg.function, None)
+            if fn is None:
+                logger.error(
+                    "[cron:%s] 函数 %s.%s 不存在",
+                    job_cfg.id,
+                    job_cfg.module,
+                    job_cfg.function,
+                )
+                return
+
+            if asyncio.iscoroutinefunction(fn):
+                await fn()
+            else:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, fn)
+
+        return inner

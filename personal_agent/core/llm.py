@@ -52,6 +52,7 @@ class PersonalAgentLLM:
         temperature: float = 0.7,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Any = "auto",
+        _quiet: bool = False,
     ) -> Generator[Tuple[str, str, Optional[List[Dict[str, Any]]]], None, None]:
         """
         流式调用大语言模型，逐块 yield 结果。支持 tool_calls 解析拼接。
@@ -61,6 +62,7 @@ class PersonalAgentLLM:
             temperature: 生成温度，默认 0.7
             tools:       可选的工具列表 schema
             tool_choice: 工具选择策略
+            _quiet:      True 时不打印自身日志（供 think() 内部复用时避免双重打印）
 
         Yields:
             (delta, accumulated, tool_calls) 元组：
@@ -68,14 +70,14 @@ class PersonalAgentLLM:
             - accumulated: 截止当前已累积的完整文本
             - tool_calls:  截止当前已被拼接的完整 tool_calls 列表
 
-
         Raises:
             Exception: LLM API 调用异常时向上抛出，由调用方处理
         """
         if not self.model:
             raise RuntimeError("模型ID未初始化，请检查配置")
 
-        logger.info(f"🧠 流式调用 {self.model} | 消息轮数: {len(messages)}")
+        if not _quiet:
+            logger.info(f"🧠 流式调用 {self.model} | 消息轮数: {len(messages)}")
 
         kwargs = {
             "model": self.model,
@@ -151,7 +153,7 @@ class PersonalAgentLLM:
 
         try:
             full_text = ""
-            for _delta, accumulated, _tool_calls in self.think_stream(messages, temperature):
+            for _delta, accumulated, _tool_calls in self.think_stream(messages, temperature, _quiet=True):
                 full_text = accumulated
             return full_text
 

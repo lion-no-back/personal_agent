@@ -186,8 +186,13 @@ class ConversationAgent(BaseAgent):
                 last_msg["content"] = f"{file_ctx}\n\n[用户请求]\n{last_msg['content']}"
                 messages[-1] = last_msg
 
-            # ── 4.6. 瞬态注入技能完整文档（仅在用户消息轮次按需触发）─────
-            skill_body = self._resolve_skill_body(event.content)
+            # ── 4.6. 瞬态注入技能完整文档（仅首轮、非定时任务时触发一次）─────
+            # i==0：工具调用后续轮不重复识别；is_scheduled：定时任务 prompt 已知，跳过
+            skill_body = (
+                self._resolve_skill_body(event.content)
+                if i == 0 and not getattr(event, "is_scheduled", False)
+                else ""
+            )
             if skill_body and messages and messages[-1]["role"] == "user":
                 last_msg = dict(messages[-1])
                 last_msg["content"] = f"【当前技能完整文档】\n{skill_body}\n\n{last_msg['content']}"

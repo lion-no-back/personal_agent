@@ -272,6 +272,19 @@ def main() -> None:
         logger.error("请检查 .env 文件中的 FEISHU_APP_ID、FEISHU_APP_SECRET 配置")
         sys.exit(1)
 
+    # ── Step 7.5: 启动调度器（定时任务 + 心跳引擎） ──────────
+    from personal_agent.scheduler import SchedulerDaemon
+
+    scheduler = SchedulerDaemon(
+        config_path=_PROJECT_ROOT / "config" / "scheduler.yaml"
+    )
+    scheduler.start(
+        agent=agent,
+        notify_fn=gateway.send_text,
+        alert_callback=None,  # 仅日志；传入回调即可接入飞书告警
+    )
+    logger.info("✅ SchedulerDaemon 就绪")
+
     logger.info("=" * 60)
     logger.info("  所有组件初始化完成，正在连接飞书...")
     logger.info("  发送 /help 给机器人查看可用指令（含 /resume /export /tasks）")

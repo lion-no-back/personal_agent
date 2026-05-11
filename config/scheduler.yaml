@@ -1,0 +1,61 @@
+# ──────────────────────────────────────────────────────────────
+# 调度器配置
+# 时区统一使用 UTC
+# ──────────────────────────────────────────────────────────────
+timezone: UTC
+alert_to: "ou_df92a89ee7a6c632ec7a210a7f25e707"  # 心跳告警投递目标（飞书 open_id）
+
+# ──────────────────────────────────────────────────────────────
+# 定时任务（Cron）
+# schedule 使用标准 5 字段 cron 表达式（分 时 日 月 周）
+# type 可选值：
+#   agent_message  — 向 ConversationAgent 发送 prompt，可选投递到飞书
+#   python_function — 导入指定模块的 async/sync 函数并执行
+# ──────────────────────────────────────────────────────────────
+# 示例（取消注释以启用）：
+#
+# cron:
+#   jobs:
+#     - id: daily_status
+#       name: "每日状态报告"
+#       schedule: "0 9 * * *"       # 每天 UTC 09:00
+#       type: agent_message
+#       session_key: "cron_daily"   # 虚拟会话 Key，隔离 cron 上下文历史
+#       prompt: "请简要汇报当前系统运行状态"
+#       deliver_to: ""              # 留空=仅日志；填入飞书 open_id(ou_xxx) 则推送消息
+#       timeout: 120                # 秒，超时跳过，不阻塞下次执行
+#
+#     - id: hourly_cleanup
+#       name: "示例 Python 任务"
+#       schedule: "0 * * * *"       # 每小时整点
+#       type: python_function
+#       module: "personal_agent.tasks.example"
+#       function: "run"
+#       timeout: 60
+
+# ──────────────────────────────────────────────────────────────
+# 心跳检测
+# 支持 ${ENV_VAR} 占位符（从进程环境变量 / .env 读取）
+# interval      — 检测间隔（秒）
+# timeout       — 单次请求超时（秒）
+# failure_threshold — 连续失败达此次数才判定 Down（防抖）
+# ──────────────────────────────────────────────────────────────
+heartbeat:
+  checks:
+    - id: llm_api
+      name: "LLM API"
+      url: "${LLM_BASE_URL}/models"
+      method: GET
+      timeout: 10
+      interval: 60
+      failure_threshold: 3
+      headers:
+        Authorization: "Bearer ${LLM_API_KEY}"
+
+    - id: feishu_api
+      name: "飞书 API"
+      url: "https://open.feishu.cn"
+      method: GET
+      timeout: 10
+      interval: 120
+      failure_threshold: 3

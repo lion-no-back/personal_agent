@@ -68,6 +68,7 @@ class MessageEvent:
     thread_id: Optional[str] = field(default=None)
     parent_id: Optional[str] = field(default=None)
     attached_files: list = field(default_factory=list)
+    is_scheduled: bool = field(default=False)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -747,14 +748,24 @@ class FeishuGateway:
             logger.error("发送流式卡片消息异常 | error=%s", e, exc_info=True)
             return None
 
-    def _send_text_message(self, chat_id: str, text: str, *, _retries: int = 1) -> None:
-        """发送普通文本消息，失败时最多重试 _retries 次（间隔 2s）。"""
+    # 永久性错误码：重试无意义，直接放弃
+    _PERMANENT_ERROR_CODES = frozenset({230001, 230002, 10014, 99991400})
+
+    def _send_text_message(
+        self,
+        receive_id: str,
+        text: str,
+        *,
+        receive_id_type: str = "chat_id",
+        _retries: int = 1,
+    ) -> None:
+        """发送普通文本消息，失败时最多重试 _retries 次（间隔 2s）。永久错误码不重试。"""
         import time
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
         req = (CreateMessageRequest.builder()
-               .receive_id_type("chat_id")
+               .receive_id_type(receive_id_type)
                .request_body(CreateMessageRequestBody.builder()
-                             .receive_id(chat_id)
+                             .receive_id(receive_id)
                              .msg_type("text")
                              .content(json.dumps({"text": text}, ensure_ascii=False))
                              .build())
@@ -765,17 +776,25 @@ class FeishuGateway:
                 if resp.success():
                     return
                 logger.error(
-                    "发送文本消息失败 | attempt=%d code=%s msg=%s",
-                    attempt + 1, resp.code, resp.msg,
+                    "发送文本消息失败 | receive_id=%s type=%s attempt=%d code=%s msg=%s",
+                    receive_id, receive_id_type, attempt + 1, resp.code, resp.msg,
                 )
+                if resp.code in self._PERMANENT_ERROR_CODES:
+                    return  # 永久错误，不重试
             except Exception as e:
-                logger.error("发送文本消息异常 | attempt=%d error=%s", attempt + 1, e)
+                logger.error(
+                    "发送文本消息异常 | receive_id=%s attempt=%d error=%s",
+                    receive_id, attempt + 1, e,
+                )
             if attempt < _retries:
                 time.sleep(2)
 
-    def send_text(self, chat_id: str, text: str) -> None:
-        """发送普通文本消息（供外部调用，如定时任务结果投递）。"""
-        self._send_text_message(chat_id, text)
+    def send_text(self, receive_id: str, text: str) -> None:
+        """发送普通文本消息（供外部调用，如定时任务结果投递）。
+        自动识别 receive_id 类型：ou_ 前缀用 open_id，其余用 chat_id。
+        """
+        receive_id_type = "open_id" if receive_id.startswith("ou_") else "chat_id"
+        self._send_text_message(receive_id, text, receive_id_type=receive_id_type)
 
     def send_stash_remind_card(self, chat_id: str, file_name: str) -> None:
         """发送超时卡片提醒"""

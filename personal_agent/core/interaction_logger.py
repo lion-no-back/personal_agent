@@ -216,6 +216,7 @@ class InteractionLogger:
 
         self._dict_lock = threading.Lock()
         self._sessions: Dict[str, _SessionState] = {}
+        self._suppressed_sessions: set[str] = set()
 
         self._cleanup_legacy_logs()
 
@@ -280,11 +281,12 @@ class InteractionLogger:
     ) -> None:
         with self._dict_lock:
             state = self._sessions.get(session_key)
+            suppressed = session_key in self._suppressed_sessions
         if state is None:
             return
         extra = {"trace": state.trace_id, "evt": evt}
         state.logger.log(level, msg, extra=extra)
-        if to_console and level >= self._console_level:
+        if to_console and not suppressed and level >= self._console_level:
             _term(logging.getLevelName(level), state.trace_id, msg)
 
     # ── 公开日志接口 ──────────────────────────────────────────────────────────
@@ -425,6 +427,18 @@ class InteractionLogger:
             state.handler.flush()
             state.handler.close()
             state.logger.removeHandler(state.handler)
+
+    # ── 定时任务控制台静默 ────────────────────────────────────────────────────
+
+    def suppress_console(self, session_key: str) -> None:
+        """静默指定会话的终端输出（文件日志不受影响）。"""
+        with self._dict_lock:
+            self._suppressed_sessions.add(session_key)
+
+    def restore_console(self, session_key: str) -> None:
+        """恢复指定会话的终端输出。"""
+        with self._dict_lock:
+            self._suppressed_sessions.discard(session_key)
 
     # ── 装饰器 & 上下文管理器 ─────────────────────────────────────────────────
 
