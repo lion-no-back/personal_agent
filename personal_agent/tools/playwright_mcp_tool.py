@@ -2,10 +2,15 @@ import asyncio
 import threading
 import sys
 import re as _re
+import json
+import os
+import logging
 from typing import List
 from mcp.client.session import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from .types import ToolDef
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 1. 快照精简 — 只保留可交互元素，减少 token 消耗
@@ -226,60 +231,185 @@ def _should_intercept(name: str, kwargs: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 3. MCP 桥接层
+# 3. MCP 桥接层（懒加载 + 闲置自动销毁版）
 # ---------------------------------------------------------------------------
 
-def build_playwright_tools() -> List[ToolDef]:
-    loop = asyncio.new_event_loop()
-    ready = threading.Event()
-    state = {}
+# 闲置超时：20 分钟无调用后自动关闭 Node.js 进程
+_IDLE_TIMEOUT = 1200
+# Schema 缓存文件（与本文件同目录，首次拉取后持久化，后续启动秒级读取）
+_CACHE_FILE = os.path.join(os.path.dirname(__file__), "playwright_schema.json")
 
-    async def _run():
+# 模块级状态，生命周期与 Python 进程一致
+_state: dict = {
+    "loop": None,        # 当前 MCP 事件循环
+    "session": None,     # 当前 MCP ClientSession
+    "is_running": False, # Node.js 进程是否在线
+    "idle_timer": None,  # 闲置倒计时句柄
+    "stop_future": None, # asyncio.Future，取消即触发优雅关闭
+}
+_state_lock = threading.Lock()
+
+
+# --- 内部生命周期管理 ---
+
+def _cancel_idle_timer() -> None:
+    """取消当前倒计时（调用方须持有 _state_lock）。"""
+    t = _state["idle_timer"]
+    if t is not None:
+        t.cancel()
+        _state["idle_timer"] = None
+
+
+def _reset_idle_timer() -> None:
+    """重置 20 分钟倒计时（调用方须持有 _state_lock）。"""
+    _cancel_idle_timer()
+    t = threading.Timer(_IDLE_TIMEOUT, _shutdown_mcp)
+    t.daemon = True
+    t.start()
+    _state["idle_timer"] = t
+
+
+def _shutdown_mcp() -> None:
+    """闲置超时回调：优雅关闭 Node.js 进程并重置状态。"""
+    with _state_lock:
+        if not _state["is_running"]:
+            return
+        logger.info("🛑 [懒加载] Playwright MCP 闲置 20 分钟，正在自动销毁...")
+        _cancel_idle_timer()
+        stop_future = _state["stop_future"]
+        loop = _state["loop"]
+        if stop_future is not None and loop is not None and loop.is_running():
+            # 在事件循环线程内取消 Future，触发 async with 上下文退出，进而终止 Node.js
+            loop.call_soon_threadsafe(stop_future.cancel)
+        _state.update({"is_running": False, "session": None, "stop_future": None, "loop": None})
+        logger.info("✅ [懒加载] Playwright MCP 进程已销毁，内存已释放")
+
+
+def _start_mcp_server() -> None:
+    """
+    启动 MCP 服务。阻塞直到服务就绪（最多 60 秒）。
+    调用方须持有 _state_lock。
+    """
+    loop = asyncio.new_event_loop()
+    _state["loop"] = loop
+    ready = threading.Event()
+
+    async def _run() -> None:
         cmd = "npx.cmd" if sys.platform == "win32" else "npx"
         p = StdioServerParameters(command=cmd, args=["-y", "@playwright/mcp@latest"])
-
         async with stdio_client(p) as (r, w):
             async with ClientSession(r, w) as s:
                 await s.initialize()
-                state['session'] = s
-                state['mcp_tools'] = (await s.list_tools()).tools
+                _state["session"] = s
+                _state["mcp_tools"] = (await s.list_tools()).tools
+                stop = loop.create_future()
+                _state["stop_future"] = stop
+                _state["is_running"] = True
                 ready.set()
-                await asyncio.Future()  # 保持长连接
+                try:
+                    await stop  # 保持长连接，直到 _shutdown_mcp() 取消此 Future
+                except asyncio.CancelledError:
+                    pass  # 正常关闭路径
 
-    threading.Thread(target=lambda: loop.run_until_complete(_run()), daemon=True).start()
+    threading.Thread(
+        target=lambda: loop.run_until_complete(_run()),
+        daemon=True,
+        name="playwright-mcp-loop",
+    ).start()
 
     if not ready.wait(timeout=60):
-        raise RuntimeError("启动 Playwright MCP 服务超时")
+        _state["is_running"] = False
+        raise RuntimeError("启动 Playwright MCP 服务超时（60 秒）")
 
-    def _call_mcp(name: str, arguments: dict) -> str:
-        """底层 MCP 调用，返回结果文本。"""
-        f = asyncio.run_coroutine_threadsafe(
-            state['session'].call_tool(name, arguments=arguments), loop
-        )
-        res = f.result(timeout=60)
-        if getattr(res, 'isError', False):
-            err_msg = res.content[0].text if res.content else "未知错误"
-            return f"❌ 工具内部报错: {err_msg}"
-        if res.content and hasattr(res.content[0], 'text'):
-            return res.content[0].text
-        return str(res.content)
+
+def _ensure_running() -> None:
+    """
+    确保 MCP 服务在线；若已销毁则重新唤醒。
+    每次工具调用前都调用此函数，同时重置 20 分钟倒计时。
+    """
+    with _state_lock:
+        if not _state["is_running"]:
+            logger.info("🔌 [懒加载触发] 正在按需唤醒 Playwright MCP 服务...")
+            _start_mcp_server()
+            logger.info("✅ [懒加载] Playwright MCP 服务已就绪")
+        _reset_idle_timer()
+
+
+def _load_or_fetch_schema() -> list:
+    """
+    读取工具 Schema：
+    - 已有缓存 → 直接读取文件，不启动 Node.js（毫秒级）
+    - 无缓存   → 启动服务拉取 Schema，写入缓存后立即关闭进程
+    """
+    if os.path.exists(_CACHE_FILE):
+        with open(_CACHE_FILE, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        logger.debug(f"📋 [懒加载] 从缓存读取 {len(cached)} 个 Playwright 工具 Schema")
+        return cached
+
+    logger.info("🚀 [首次初始化] 正在拉取 Playwright MCP Schema 并生成缓存...")
+    with _state_lock:
+        _start_mcp_server()
+        tools_raw = _state.get("mcp_tools") or []
+
+    tools_data = []
+    for t in tools_raw:
+        schema = t.inputSchema
+        if hasattr(schema, "model_dump"):
+            schema = schema.model_dump()
+        elif not isinstance(schema, dict):
+            schema = dict(schema)
+        tools_data.append({"name": t.name, "description": t.description or "", "inputSchema": schema})
+
+    with open(_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(tools_data, f, ensure_ascii=False, indent=2)
+    logger.info(f"✅ [首次初始化] Schema 已缓存（{len(tools_data)} 个工具）→ {_CACHE_FILE}")
+
+    # Schema 获取完毕，立即关闭进程；真正的工具调用触发时再重新唤醒
+    _shutdown_mcp()
+    return tools_data
+
+
+# --- 底层 MCP 调用 ---
+
+def _call_mcp(name: str, arguments: dict) -> str:
+    """底层 MCP 调用，返回结果文本。"""
+    f = asyncio.run_coroutine_threadsafe(
+        _state["session"].call_tool(name, arguments=arguments), _state["loop"]
+    )
+    res = f.result(timeout=60)
+    if getattr(res, "isError", False):
+        err_msg = res.content[0].text if res.content else "未知错误"
+        return f"❌ 工具内部报错: {err_msg}"
+    if res.content and hasattr(res.content[0], "text"):
+        return res.content[0].text
+    return str(res.content)
+
+
+# --- 公开工厂函数 ---
+
+def build_playwright_tools() -> List[ToolDef]:
+    cached_tools = _load_or_fetch_schema()
 
     def make_call(name: str, schema: dict):
         def _call(**kwargs):
             try:
+                # 按需唤醒 Node.js（若已销毁则重启），并重置闲置倒计时
+                _ensure_running()
+
                 valid_keys = schema.get("properties", {}).keys()
                 clean_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
 
                 # 修正 LLM 常见的 ref 格式错误：
                 # 快照显示 [ref=e36]，LLM 常传 "ref=e36"，但 Playwright 期望 "e36"
-                t = clean_kwargs.get('target', '')
-                if isinstance(t, str) and t.startswith('ref='):
-                    clean_kwargs['target'] = t[4:]
-                if name == 'browser_fill_form':
-                    for f in clean_kwargs.get('fields', []):
-                        ft = f.get('target', '')
-                        if isinstance(ft, str) and ft.startswith('ref='):
-                            f['target'] = ft[4:]
+                t = clean_kwargs.get("target", "")
+                if isinstance(t, str) and t.startswith("ref="):
+                    clean_kwargs["target"] = t[4:]
+                if name == "browser_fill_form":
+                    for field in clean_kwargs.get("fields", []):
+                        ft = field.get("target", "")
+                        if isinstance(ft, str) and ft.startswith("ref="):
+                            field["target"] = ft[4:]
 
                 # CSS 选择器 → 拦截走 JS（绕过 Playwright actionability check）
                 # Playwright ref → 透传 MCP（只有 Playwright 能解析 ref）
@@ -287,14 +417,13 @@ def build_playwright_tools() -> List[ToolDef]:
                     interceptor = _JS_INTERCEPTORS[name]
                     js_fn = interceptor(clean_kwargs)
                     result = _call_mcp("browser_evaluate", {"function": js_fn})
-                    if 'ERROR' not in result:
+                    if "ERROR" not in result:
                         return result
                     # JS 执行失败 → 回退到 MCP 原生调用
                     return _call_mcp(name, clean_kwargs)
 
                 # 非拦截工具 / ref target → 透传 MCP
                 result_text = _call_mcp(name, clean_kwargs)
-
                 if name == "browser_snapshot":
                     result_text = _compress_snapshot(result_text)
                 return result_text
@@ -306,9 +435,10 @@ def build_playwright_tools() -> List[ToolDef]:
 
     return [
         ToolDef(
-            name=t.name,
-            description=t.description or "",
-            parameters=t.inputSchema,
-            call=make_call(t.name, t.inputSchema)
-        ) for t in state['mcp_tools']
+            name=t["name"],
+            description=t["description"] or "",
+            parameters=t["inputSchema"],
+            call=make_call(t["name"], t["inputSchema"]),
+        )
+        for t in cached_tools
     ]

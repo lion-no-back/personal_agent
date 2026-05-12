@@ -16,4 +16,10 @@ artifact/
 # Playwright MCP runtime snapshots (page accessibility trees + console logs)
 .playwright-mcp/
 
+# Playwright MCP tool schema cache (auto-generated on first run, machine-specific)
+personal_agent/tools/playwright_schema.json
+
 logs
+
+.claude
+CLAUDE.md
