@@ -19,6 +19,9 @@ artifact/
 # Playwright MCP tool schema cache (auto-generated on first run, machine-specific)
 personal_agent/tools/playwright_schema.json
 
+# Search provider rotation state (runtime counter, machine-specific)
+.search_rotation.json
+
 logs
 
 .claude
