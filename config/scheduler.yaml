@@ -6,11 +6,32 @@ timezone: UTC
 alert_to: "ou_df92a89ee7a6c632ec7a210a7f25e707"  # 心跳告警投递目标（飞书 open_id）
 
 # ──────────────────────────────────────────────────────────────
+# 定时任务持久化（可选）
+#
+# enabled: true 后，每次任务成功执行都会在 SQLite 中记录时间戳。
+# 程序重启时，对 misfire_catchup: true 的任务检查是否有错过的触发，
+# 若错过时间在 default_misfire_grace_time 窗口内则自动补跑一次（coalesce 语义）。
+#
+# db_path: 相对于项目根目录的 SQLite 文件路径（已加入 .gitignore）
+# default_misfire_grace_time: 全局补跑窗口（秒），259200 = 3 天（覆盖周末停机）
+# ──────────────────────────────────────────────────────────────
+persist:
+  enabled: false # 是否启用持久化
+  db_path: "data/scheduler_state.sqlite"
+  default_misfire_grace_time: 259200  # 3 天
+
+# ──────────────────────────────────────────────────────────────
 # 定时任务（Cron）
 # schedule 使用标准 5 字段 cron 表达式（分 时 日 月 周）
 # type 可选值：
 #   agent_message  — 向 ConversationAgent 发送 prompt，可选投递到飞书
 #   python_function — 导入指定模块的 async/sync 函数并执行
+#
+# misfire_catchup: true/false（默认 false）
+#   重启后检测是否有错过的触发，若有则补跑一次（无论漏了多少次只补一次）
+#
+# misfire_grace_time: 秒数（可选，覆盖全局 default_misfire_grace_time）
+#   停机多长时间以内的漏触发才值得补跑；超出此窗口则放弃补跑仅记录警告
 # ──────────────────────────────────────────────────────────────
 # 示例（取消注释以启用）：
 #
@@ -18,20 +39,23 @@ alert_to: "ou_df92a89ee7a6c632ec7a210a7f25e707"  # 心跳告警投递目标（�
 #   jobs:
 #     - id: daily_status
 #       name: "每日状态报告"
-#       schedule: "0 9 * * *"       # 每天 UTC 09:00
+#       schedule: "0 9 * * *"       # 每天 UTC 09:00（即北京时间 17:00）
 #       type: agent_message
 #       session_key: "cron_daily"   # 虚拟会话 Key，隔离 cron 上下文历史
 #       prompt: "请简要汇报当前系统运行状态"
 #       deliver_to: ""              # 留空=仅日志；填入飞书 open_id(ou_xxx) 则推送消息
-#       timeout: 120                # 秒，超时跳过，不阻塞下次执行
+#       timeout: 120                # 秒，超时跳过，不阻塞下次执行（长时任务时间要给足）
+#       misfire_catchup: true       # 重启后若错过则补跑一次
+#       # misfire_grace_time: 259200  # 可选：覆盖全局窗口（秒）
 #
 #     - id: hourly_cleanup
-#       name: "示例 Python 任务"
+#       name: "每小时清理"
 #       schedule: "0 * * * *"       # 每小时整点
 #       type: python_function
 #       module: "personal_agent.tasks.example"
 #       function: "run"
 #       timeout: 60
+#       misfire_catchup: false      # 清理任务无需补跑
 
 # ──────────────────────────────────────────────────────────────
 # 心跳检测

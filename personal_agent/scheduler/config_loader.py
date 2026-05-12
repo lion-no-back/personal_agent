@@ -51,6 +51,9 @@ class CronJobConfig:
     # python_function 专用
     module: str = ""
     function: str = "run"
+    # 持久化补跑
+    misfire_catchup: bool = False  # True=重启后检测是否有错过的触发并补跑一次
+    misfire_grace_time: Optional[int] = None  # 补跑窗口（秒）；None=使用全局默认值
 
 
 @dataclass
@@ -66,11 +69,19 @@ class CheckConfig:
 
 
 @dataclass
+class PersistConfig:
+    enabled: bool = False
+    db_path: str = "data/scheduler_state.sqlite"  # 相对于项目根目录
+    default_misfire_grace_time: int = 259200       # 默认补跑窗口：3 天（秒）
+
+
+@dataclass
 class SchedulerConfig:
     timezone: str = "UTC"
     alert_to: str = ""                  # 心跳告警投递目标（飞书 open_id 或 chat_id）
     cron_jobs: list[CronJobConfig] = field(default_factory=list)
     heartbeat_checks: list[CheckConfig] = field(default_factory=list)
+    persist: PersistConfig = field(default_factory=PersistConfig)
 
 
 def load_scheduler_config(config_path: Path) -> SchedulerConfig:
@@ -90,6 +101,15 @@ def load_scheduler_config(config_path: Path) -> SchedulerConfig:
     timezone = raw.get("timezone", "UTC")
     alert_to = raw.get("alert_to", "")
 
+    persist_raw = raw.get("persist") or {}
+    persist = PersistConfig(
+        enabled=bool(persist_raw.get("enabled", False)),
+        db_path=str(persist_raw.get("db_path", "data/scheduler_state.sqlite")),
+        default_misfire_grace_time=int(
+            persist_raw.get("default_misfire_grace_time", 259200)
+        ),
+    )
+
     cron_jobs: list[CronJobConfig] = []
     for i, job_raw in enumerate((raw.get("cron") or {}).get("jobs") or []):
         missing = [f for f in ("id", "schedule", "type") if not job_raw.get(f)]
@@ -98,6 +118,7 @@ def load_scheduler_config(config_path: Path) -> SchedulerConfig:
                 "跳过 cron 任务 #%d：缺少必填字段 %s", i, missing
             )
             continue
+        grace_raw = job_raw.get("misfire_grace_time")
         cron_jobs.append(
             CronJobConfig(
                 id=job_raw["id"],
@@ -110,6 +131,8 @@ def load_scheduler_config(config_path: Path) -> SchedulerConfig:
                 deliver_to=job_raw.get("deliver_to", ""),
                 module=job_raw.get("module", ""),
                 function=job_raw.get("function", "run"),
+                misfire_catchup=bool(job_raw.get("misfire_catchup", False)),
+                misfire_grace_time=int(grace_raw) if grace_raw is not None else None,
             )
         )
 
@@ -139,4 +162,5 @@ def load_scheduler_config(config_path: Path) -> SchedulerConfig:
         alert_to=alert_to,
         cron_jobs=cron_jobs,
         heartbeat_checks=heartbeat_checks,
+        persist=persist,
     )

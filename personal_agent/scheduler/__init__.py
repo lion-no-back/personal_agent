@@ -28,6 +28,7 @@ from typing import Callable, Optional
 from .config_loader import SchedulerConfig, load_scheduler_config
 from .cron_engine import CronEngine
 from .heartbeat_engine import AlertCallback, HeartbeatEngine
+from .persistence import JobPersistence
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,10 @@ class SchedulerDaemon:
         self._cron: Optional[CronEngine] = None
         self._heartbeat: Optional[HeartbeatEngine] = None
         self._stopped = False
+        # config_path 的父目录作为 db_path 的解析基准
+        self._project_root: Path = (
+            config_path.parent.parent if config_path else Path(".")
+        )
 
     def start(
         self,
@@ -88,11 +93,23 @@ class SchedulerDaemon:
                 status = "💚 恢复正常" if is_up else "🔴 服务异常"
                 _notify(_alert_to, f"{status} | {service_name}\n{message}")
 
+        persistence: Optional[JobPersistence] = None
+        if config.persist.enabled and config.cron_jobs:
+            db_path = self._project_root / config.persist.db_path
+            persistence = JobPersistence(db_path)
+            logger.info(
+                "[SchedulerDaemon] 任务持久化已启用 | db=%s grace=%ds",
+                db_path,
+                config.persist.default_misfire_grace_time,
+            )
+
         self._cron = CronEngine(
             jobs=config.cron_jobs,
             timezone=config.timezone,
             agent=agent,
             notify_fn=notify_fn,
+            persistence=persistence,
+            default_misfire_grace_time=config.persist.default_misfire_grace_time,
         )
         self._heartbeat = HeartbeatEngine(
             checks=config.heartbeat_checks,

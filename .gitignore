@@ -22,6 +22,9 @@ personal_agent/tools/playwright_schema.json
 # Search provider rotation state (runtime counter, machine-specific)
 .search_rotation.json
 
+# Scheduler state (local SQLite, machine-specific, auto-generated)
+data/scheduler_state.sqlite
+
 logs
 
 .claude
