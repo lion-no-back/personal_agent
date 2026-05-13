@@ -75,6 +75,14 @@ class SchedulerDaemon:
             else SchedulerConfig()
         )
 
+        try:
+            from personal_agent.workflows import WorkflowRegistry
+            workflow_jobs = WorkflowRegistry().get_scheduled_jobs()
+        except Exception:
+            logger.exception("[SchedulerDaemon] WorkflowRegistry 加载失败，跳过自动注册")
+            workflow_jobs = []
+        all_jobs = config.cron_jobs + workflow_jobs
+
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
             target=self._run_loop,
@@ -94,7 +102,7 @@ class SchedulerDaemon:
                 _notify(_alert_to, f"{status} | {service_name}\n{message}")
 
         persistence: Optional[JobPersistence] = None
-        if config.persist.enabled and config.cron_jobs:
+        if config.persist.enabled and all_jobs:
             db_path = self._project_root / config.persist.db_path
             persistence = JobPersistence(db_path)
             logger.info(
@@ -104,7 +112,7 @@ class SchedulerDaemon:
             )
 
         self._cron = CronEngine(
-            jobs=config.cron_jobs,
+            jobs=all_jobs,
             timezone=config.timezone,
             agent=agent,
             notify_fn=notify_fn,
@@ -121,8 +129,10 @@ class SchedulerDaemon:
         future.result(timeout=30)
 
         atexit.register(self.stop)
-        logger.info("[SchedulerDaemon] 已启动 | cron_jobs=%d heartbeat_checks=%d",
-                    len(config.cron_jobs), len(config.heartbeat_checks))
+        logger.info(
+            "[SchedulerDaemon] 已启动 | cron_jobs=%d (yaml=%d workflow=%d) heartbeat_checks=%d",
+            len(all_jobs), len(config.cron_jobs), len(workflow_jobs), len(config.heartbeat_checks),
+        )
 
     def stop(self) -> None:
         """优雅停止：等待正在运行的任务结束，再关闭事件循环。幂等，可多次调用。"""

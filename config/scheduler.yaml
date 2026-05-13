@@ -16,7 +16,7 @@ alert_to: "ou_df92a89ee7a6c632ec7a210a7f25e707"  # 心跳告警投递目标（�
 # default_misfire_grace_time: 全局补跑窗口（秒），259200 = 3 天（覆盖周末停机）
 # ──────────────────────────────────────────────────────────────
 persist:
-  enabled: false # 是否启用持久化
+  enabled: true # 是否启用持久化
   db_path: "data/scheduler_state.sqlite"
   default_misfire_grace_time: 259200  # 3 天
 

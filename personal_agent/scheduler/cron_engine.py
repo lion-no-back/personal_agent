@@ -380,7 +380,11 @@ class CronEngine:
         return inner
 
     def _make_python_function(self, job_cfg: CronJobConfig):
-        """构造 python_function 类型的 inner 协程函数。"""
+        """构造 python_function 类型的 inner 协程函数。
+
+        执行后若函数返回字符串且 deliver_to 已配置，则通过 notify_fn 投递飞书消息。
+        异常同样会被捕获并格式化为错误消息投递。
+        """
 
         async def inner() -> None:
             try:
@@ -399,10 +403,21 @@ class CronEngine:
                 )
                 return
 
-            if asyncio.iscoroutinefunction(fn):
-                await fn()
-            else:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, fn)
+            result: object = None
+            try:
+                if asyncio.iscoroutinefunction(fn):
+                    result = await fn()
+                else:
+                    loop = asyncio.get_running_loop()
+                    result = await loop.run_in_executor(None, fn)
+            except Exception as exc:
+                result = f"❌ {job_cfg.name} 执行失败\n{exc}"
+                logger.exception("[cron:%s] 执行异常", job_cfg.id)
+
+            if job_cfg.deliver_to and self._notify_fn and isinstance(result, str):
+                try:
+                    self._notify_fn(job_cfg.deliver_to, result)
+                except Exception:
+                    logger.exception("[cron:%s] 投递消息失败", job_cfg.id)
 
         return inner

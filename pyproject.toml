@@ -22,3 +22,21 @@ dependencies = [
 setup = [
     "qrcode>=7.0",
 ]
+
+# ──────────────────────────────────────────────────────────────
+# Workflow 专用依赖组
+# 首次运行对应 workflow 时会自动触发安装，无需手动操作。
+# 手动安装：uv sync --group costupdate-saihu
+# ──────────────────────────────────────────────────────────────
+[dependency-groups]
+costupdate-saihu = [
+    "aiohttp>=3.9",
+    "beautifulsoup4>=4.12",
+    "ddddocr>=1.5",
+    "lxml>=5.0",
+    "openpyxl>=3.1",
+    "pandas>=2.0",
+    "pycryptodome>=3.20",
+    "python-calamine>=0.2",
+    "tqdm>=4.66",
+]
