@@ -166,6 +166,15 @@ def main() -> None:
     import platform
 
     extra_prompts = []
+
+    # ── 加载外置行为规范 (prompts/system.md) ────────────────────
+    _system_md = _PROJECT_ROOT / "prompts" / "system.md"
+    if _system_md.is_file():
+        extra_prompts.append(_system_md.read_text(encoding="utf-8").strip())
+        logger.info(f"✅ 已加载外置 system prompt | {_system_md}")
+    else:
+        logger.debug("未发现 prompts/system.md，跳过外置提示词加载")
+
     # 注入运行环境信息，指导 LLM 使用正确的系统命令
     _os = platform.system()
     if _os == "Windows":
