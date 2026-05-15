@@ -4,22 +4,36 @@ import os
 from pathlib import Path
 
 import requests
+from ddgs import DDGS
 
 from .types import ToolDef
 
 logger = logging.getLogger(__name__)
 
-# 轮换状态持久化文件（项目根目录）
 _ROTATION_FILE = Path(__file__).parent.parent.parent / ".search_rotation.json"
 
-_PROVIDERS = ["tavily", "exa", "firecrawl"]
+
+# ── 付费提供商检测 ────────────────────────────────────────────────
+
+def _get_paid_providers() -> list[str]:
+    """返回已配置 API Key 的付费提供商列表（按 Tavily→Exa→Firecrawl 顺序）。"""
+    providers = []
+    if os.getenv("TAVILY_API_KEY"):
+        providers.append("tavily")
+    if os.getenv("EXA_API_KEY"):
+        providers.append("exa")
+    if os.getenv("FIRECRAWL_API_KEY"):
+        providers.append("firecrawl")
+    return providers
 
 
-def _read_index() -> int:
+# ── 轮换状态持久化 ────────────────────────────────────────────────
+
+def _read_index(total: int) -> int:
     try:
         if _ROTATION_FILE.exists():
             data = json.loads(_ROTATION_FILE.read_text(encoding="utf-8"))
-            return int(data.get("current_index", 0)) % len(_PROVIDERS)
+            return int(data.get("current_index", 0)) % total
     except Exception:
         pass
     return 0
@@ -34,110 +48,123 @@ def _write_index(index: int) -> None:
         logger.warning(f"无法写入轮换状态文件: {e}")
 
 
+# ── 付费提供商实现 ────────────────────────────────────────────────
+
 def _search_tavily(query: str, max_results: int) -> list[dict]:
-    api_key = os.getenv("TAVILY_API_KEY", "")
     response = requests.post(
         "https://api.tavily.com/search",
-        json={"api_key": api_key, "query": query, "max_results": max_results},
+        json={"api_key": os.getenv("TAVILY_API_KEY", ""), "query": query, "max_results": max_results},
         timeout=15,
     )
     response.raise_for_status()
-    data = response.json()
     return [
-        {
-            "title": r.get("title", ""),
-            "url": r.get("url", ""),
-            "snippet": r.get("content", ""),
-        }
-        for r in data.get("results", [])
+        {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content", "")}
+        for r in response.json().get("results", [])
     ]
 
 
 def _search_exa(query: str, max_results: int) -> list[dict]:
-    api_key = os.getenv("EXA_API_KEY", "")
     response = requests.post(
         "https://api.exa.ai/search",
-        headers={"x-api-key": api_key, "Content-Type": "application/json"},
-        json={
-            "query": query,
-            "numResults": max_results,
-            "contents": {"highlights": {"numSentences": 2}},
-        },
+        headers={"x-api-key": os.getenv("EXA_API_KEY", ""), "Content-Type": "application/json"},
+        json={"query": query, "numResults": max_results, "contents": {"highlights": {"numSentences": 2}}},
         timeout=15,
     )
     response.raise_for_status()
-    data = response.json()
-    results = []
-    for r in data.get("results", []):
-        highlights = r.get("highlights", [])
-        snippet = highlights[0] if highlights else ""
-        results.append(
-            {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": snippet}
-        )
-    return results
-
-
-def _search_firecrawl(query: str, max_results: int) -> list[dict]:
-    api_key = os.getenv("FIRECRAWL_API_KEY", "")
-    response = requests.post(
-        "https://api.firecrawl.dev/v1/search",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={"query": query, "limit": max_results},
-        timeout=15,
-    )
-    response.raise_for_status()
-    data = response.json()
     return [
         {
             "title": r.get("title", ""),
             "url": r.get("url", ""),
-            "snippet": r.get("description", ""),
+            "snippet": (r.get("highlights") or [""])[0],
         }
-        for r in data.get("data", [])
+        for r in response.json().get("results", [])
     ]
 
 
-_SEARCH_FUNCS = {
+def _search_firecrawl(query: str, max_results: int) -> list[dict]:
+    response = requests.post(
+        "https://api.firecrawl.dev/v1/search",
+        headers={"Authorization": f"Bearer {os.getenv('FIRECRAWL_API_KEY', '')}", "Content-Type": "application/json"},
+        json={"query": query, "limit": max_results},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return [
+        {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("description", "")}
+        for r in response.json().get("data", [])
+    ]
+
+
+_PAID_SEARCH_FUNCS = {
     "tavily": _search_tavily,
     "exa": _search_exa,
     "firecrawl": _search_firecrawl,
 }
 
 
+# ── 免费兜底：DuckDuckGo ──────────────────────────────────────────
+
+def _search_ddgs(query: str, max_results: int) -> list[dict]:
+    with DDGS() as ddgs:
+        raw = list(ddgs.text(query, max_results=max_results))
+    return [
+        {"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")}
+        for r in raw
+    ]
+
+
+# ── 统一格式化 ────────────────────────────────────────────────────
+
+def _format_results(query: str, results: list[dict], source: str) -> str:
+    lines = [f"搜索 '{query}' 的结果（来源：{source}）：\n"]
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. **{r.get('title', '')}**")
+        lines.append(f"   URL: {r.get('url', '')}")
+        if r.get("snippet"):
+            lines.append(f"   摘要: {r.get('snippet', '')[:200]}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ── 工具入口 ──────────────────────────────────────────────────────
+
 def build_web_search_tool() -> ToolDef:
-    """构建网页搜索工具（Tavily / Exa / Firecrawl 顺序轮换，用量持久化）"""
+    """
+    构建网页搜索工具。
+
+    策略：
+    - 有配置付费 API Key（Tavily / Exa / Firecrawl）→ 付费提供商轮换，用量均摊
+    - 全无配置或付费全部失败 → 回退到 DuckDuckGo（免费，无需 Key）
+    """
 
     def web_search_call(query: str, max_results: int = 5, **kwargs) -> str:
-        index = _read_index()
+        max_results = min(max(max_results, 1), 10)
+        paid = _get_paid_providers()
 
-        for attempt in range(len(_PROVIDERS)):
-            provider = _PROVIDERS[(index + attempt) % len(_PROVIDERS)]
-            try:
-                results = _SEARCH_FUNCS[provider](query, max_results)
-                # 成功后将索引推进到下一个提供商
-                _write_index((index + attempt + 1) % len(_PROVIDERS))
+        # ── 有付费 API：走轮换方案 ──────────────────────────────
+        if paid:
+            index = _read_index(len(paid))
+            for attempt in range(len(paid)):
+                provider = paid[(index + attempt) % len(paid)]
+                try:
+                    results = _PAID_SEARCH_FUNCS[provider](query, max_results)
+                    _write_index((index + attempt + 1) % len(paid))
+                    if not results:
+                        return f"搜索 '{query}' 未找到结果（使用 {provider}）"
+                    return _format_results(query, results, provider)
+                except Exception as e:
+                    logger.warning(f"搜索提供商 {provider} 失败: {e}，尝试下一个...")
+            logger.warning("所有付费搜索提供商均失败，回退到 DuckDuckGo")
 
-                if not results:
-                    return f"搜索 '{query}' 未找到结果（使用 {provider}）"
-
-                lines = [f"搜索 '{query}' 的结果（来源：{provider}）：\n"]
-                for i, r in enumerate(results, 1):
-                    lines.append(f"{i}. **{r['title']}**")
-                    lines.append(f"   URL: {r['url']}")
-                    if r["snippet"]:
-                        lines.append(f"   摘要: {r['snippet'][:200]}")
-                    lines.append("")
-
-                return "\n".join(lines)
-
-            except Exception as e:
-                logger.warning(f"搜索提供商 {provider} 失败: {e}，尝试下一个...")
-                continue
-
-        return "Error: 所有搜索提供商均失败，请稍后重试"
+        # ── 无付费 API 或付费全部失败：DuckDuckGo 兜底 ──────────
+        try:
+            results = _search_ddgs(query, max_results)
+            if not results:
+                return f"搜索 '{query}' 未找到结果"
+            return _format_results(query, results, "DuckDuckGo")
+        except Exception as e:
+            logger.warning(f"DuckDuckGo 搜索失败: {e}")
+            return f"Error: 所有搜索方式均失败 — {e}"
 
     return ToolDef(
         name="web_search",
