@@ -143,13 +143,14 @@ def main() -> None:
     logger.info("  PersonalAgent 启动中...")
     logger.info("=" * 60)
 
-    # ── Step 3: 初始化 LLM 客户端 ────────────────────────────
-    # 读取 .env 中的 LLM_MODEL_ID、LLM_API_KEY、LLM_BASE_URL
+    # ── Step 3: 初始化 LLM 路由器 ────────────────────────────
+    # 主力模型读取 LLM_MODEL_ID / LLM_API_KEY / LLM_BASE_URL（必填）
+    # 可选配置快速模型（LLM_FAST_*）和推理模型（LLM_REASONING_*）
     try:
-        from personal_agent.core.llm import PersonalAgentLLM
+        from personal_agent.core.llm_router import LLMRouter
 
-        llm = PersonalAgentLLM()
-        logger.info(f"✅ LLM 客户端就绪 | 模型: {llm.model}")
+        llm = LLMRouter()
+        logger.info(f"✅ LLM 路由器就绪 | 主力模型: {llm.model}")
     except ValueError as e:
         logger.error(f"❌ LLM 初始化失败：{e}")
         logger.error(
@@ -235,6 +236,13 @@ def main() -> None:
     # ── Step 6: 初始化对话 Agent ─────────────────────────────
     # card_update_interval 读取 .env 中的 CARD_UPDATE_INTERVAL，默认 0.5s
     from personal_agent.agents.conversation_agent import ConversationAgent
+    from personal_agent.core.request_scorer import RequestScorer
+
+    _routing_mode = os.getenv("LLM_ROUTING_MODE", "auto").strip().lower()
+    _routing_threshold = (
+        float(t) if (t := os.getenv("LLM_ROUTING_THRESHOLD", "").strip()) else None
+    )
+    scorer = RequestScorer(strategy=_routing_mode, threshold_override=_routing_threshold)
 
     agent = ConversationAgent(
         llm=llm,
@@ -243,6 +251,7 @@ def main() -> None:
         task_manager=task_manager,
         interaction_logger=interaction_logger,
         skill_bodies=skill_bodies,
+        scorer=scorer,
     )
     logger.info("✅ ConversationAgent 就绪")
 

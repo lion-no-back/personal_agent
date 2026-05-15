@@ -68,6 +68,7 @@ class MessageEvent:
     thread_id: Optional[str] = field(default=None)
     parent_id: Optional[str] = field(default=None)
     attached_files: list = field(default_factory=list)
+    images: list = field(default_factory=list)  # base64 编码的图片字符串列表
     is_scheduled: bool = field(default=False)
 
 
@@ -1078,6 +1079,37 @@ class FeishuGateway:
                         self._file_stash.stash_file(session_key, chat_id, downloaded)
                 return "file_stashed"
 
+            elif msg_type == "image":
+                # ── 图片消息：下载后附带到事件，交由视觉模型处理 ──
+                message_id_img: str = getattr(msg, "message_id", "") or ""
+                chat_id_img: str = getattr(msg, "chat_id", "") or ""
+                thread_id_img: Optional[str] = getattr(msg, "thread_id", None) or None
+                sender_id_obj_img = getattr(sender, "sender_id", None)
+                sender_open_id_img: str = (
+                    (getattr(sender_id_obj_img, "open_id", None) or "")
+                    if sender_id_obj_img is not None else ""
+                )
+                raw_content_img: str = getattr(msg, "content", "") or ""
+                try:
+                    image_key = json.loads(raw_content_img).get("image_key", "")
+                except Exception:
+                    image_key = ""
+                if not image_key:
+                    logger.warning("图片消息缺少 image_key，跳过")
+                    return None
+                b64 = self._download_image_b64(message_id_img, image_key)
+                if not b64:
+                    return None
+                return MessageEvent(
+                    message_id=message_id_img,
+                    chat_id=chat_id_img,
+                    chat_type=chat_type,
+                    content="",
+                    sender_open_id=sender_open_id_img,
+                    thread_id=thread_id_img,
+                    images=[b64],
+                )
+
             elif msg_type != "text":
                 logger.debug(f"非文本/文件消息，跳过 | type={msg_type}")
                 return None
@@ -1168,6 +1200,28 @@ class FeishuGateway:
 
         except Exception as e:
             logger.error(f"解析消息事件失败 | error={e}", exc_info=True)
+            return None
+
+    def _download_image_b64(self, message_id: str, image_key: str) -> Optional[str]:
+        """从飞书下载图片并返回 base64 字符串，失败返回 None。"""
+        import base64
+        try:
+            from lark_oapi.api.im.v1 import GetMessageResourceRequest
+            req = (
+                GetMessageResourceRequest.builder()
+                .message_id(message_id)
+                .file_key(image_key)
+                .type("image")
+                .build()
+            )
+            resp = self._api_client.im.v1.message_resource.get(req)
+            if not resp.success():
+                logger.warning("下载图片失败 | code=%s msg=%s", resp.code, resp.msg)
+                return None
+            raw: bytes = resp.data.file.read()
+            return base64.b64encode(raw).decode("utf-8") if raw else None
+        except Exception as e:
+            logger.error("下载图片异常 | image_key=%s error=%s", image_key, e)
             return None
 
     def _strip_mentions(self, text: str, mentions) -> str:

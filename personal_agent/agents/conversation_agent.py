@@ -12,7 +12,8 @@ from openai import APIStatusError, AuthenticationError
 from ..agents.base_agent import BaseAgent
 from ..context.conversation_context import ConversationContext
 from ..core.interaction_logger import InteractionLogger
-from ..core.llm import PersonalAgentLLM
+from ..core.llm_router import LLMRouter
+from ..core.request_scorer import RequestScorer
 from ..core.task_manager import TaskManager
 from ..tools import get_all_tools, get_tools_openai_schema
 
@@ -37,6 +38,9 @@ _HELP_TEXT = (
     + "\n".join(f"- `{cmd}`：{desc}" for cmd, desc in _BUILTIN_COMMANDS.items())
     + "\n\n> 直接发送消息即可与 AI 对话，无需任何指令。"
 )
+
+# 触发"强制使用推理模型"的自然语言短语（须明确表达切换意图，避免误触发）
+_FORCE_REASONING_PATTERNS = ("换推理模型", "用推理模型", "切换推理模型", "重新推理", "深度思考")
 
 _LLM_AUTH_USER_MESSAGE = (
     "⚠️ **无法调用 AI 服务**：接口密钥未通过验证。\n\n"
@@ -75,12 +79,13 @@ class ConversationAgent(BaseAgent):
 
     def __init__(
         self,
-        llm: PersonalAgentLLM,
+        llm: LLMRouter,
         context: ConversationContext,
         card_update_interval: Optional[float] = None,
         task_manager: Optional[TaskManager] = None,
         interaction_logger: Optional[InteractionLogger] = None,
         skill_bodies: Optional[dict] = None,
+        scorer: Optional[RequestScorer] = None,
     ):
         """
         Args:
@@ -97,6 +102,7 @@ class ConversationAgent(BaseAgent):
         self._task_manager = task_manager
         self._interaction_logger = interaction_logger
         self._skill_bodies: dict = skill_bodies or {}
+        self._scorer = scorer
         self._card_update_interval = card_update_interval or float(
             os.getenv("CARD_UPDATE_INTERVAL", "0.3")
         )
@@ -169,7 +175,12 @@ class ConversationAgent(BaseAgent):
 
         final_response = ""
         ui_text_buffer = ""  # UI历史累计区，确保多轮迭代输出不会覆写先前的文字
-        
+
+        # 路由状态（在循环外初始化，首轮决策后保持不变）
+        _force_reasoning = any(p in event.content for p in _FORCE_REASONING_PATTERNS)
+        _score_result = None
+        task_type = "default"
+
         turns_base = int(os.getenv("AGENT_MAX_TURNS_BASE", "5"))
         turns_per_tool = int(os.getenv("AGENT_TURNS_PER_TOOL", "2"))
         turns_hard = int(os.getenv("AGENT_MAX_TURNS_HARD", "30"))
@@ -198,6 +209,21 @@ class ConversationAgent(BaseAgent):
                 last_msg["content"] = f"【当前技能完整文档】\n{skill_body}\n\n{last_msg['content']}"
                 messages[-1] = last_msg
 
+            # ── 4.7. 瞬态注入图片（首轮有图时转为多模态消息格式）─────
+            # 图片不写入上下文历史，仅在当前轮携带，避免 token 膨胀
+            event_images = getattr(event, "images", None)
+            if i == 1 and event_images and messages and messages[-1]["role"] == "user":
+                last_msg = dict(messages[-1])
+                text = last_msg.get("content") or "请描述这张图片"
+                last_msg["content"] = [
+                    {"type": "text", "text": text},
+                    *[
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                        for b64 in event_images
+                    ],
+                ]
+                messages[-1] = last_msg
+
             i += 1
             remaining -= 1
             logger.debug(f"LLM 输入 | session={session_key} 轮次={i} 剩余={remaining} messages_count={len(messages)}")
@@ -209,11 +235,25 @@ class ConversationAgent(BaseAgent):
                     on_update(combined.strip(), status)
 
             # ── 5. 流式 LLM 调用 + 卡片更新 ─────────────────────
+            # 首轮决定 task_type，后续轮复用（工具调用中间轮不重新评分）
+            if i == 1:
+                if event_images:
+                    task_type = "vision"
+                elif _force_reasoning:
+                    task_type = "reasoning"
+                elif self._scorer:
+                    _score_result = self._scorer.score(
+                        messages,
+                        tools=self._tools_schema,
+                        user_text=event.content,  # 用原始消息评分，避免瞬态注入干扰
+                    )
+                    task_type = _score_result.task_type
             if self._interaction_logger:
                 self._interaction_logger.log_llm_call(session_key, i, messages)
             full_response, tool_calls = self._stream_and_update(
                 messages, custom_on_update, stream_updates_sync_with_llm,
-                tools=self._tools_schema
+                tools=self._tools_schema,
+                task_type=task_type,
             )
             if self._interaction_logger:
                 self._interaction_logger.log_llm_response(session_key, i, full_response, tool_calls)
@@ -286,6 +326,13 @@ class ConversationAgent(BaseAgent):
             else:
                 logger.info(f"✅ 回复完成 | session={session_key} response_len={len(final_response)}")
                 ui_text_buffer += final_response
+                # 边界区且用了主力模型 → 附加"换推理模型"提示
+                suggestion = self._routing_suggestion(
+                    _score_result,
+                    is_scheduled=getattr(event, "is_scheduled", False),
+                )
+                if suggestion:
+                    ui_text_buffer += suggestion
                 if self._interaction_logger:
                     self._interaction_logger.log_final(session_key, ui_text_buffer)
                 if on_update:
@@ -333,7 +380,7 @@ class ConversationAgent(BaseAgent):
             {"role": "user", "content": user_text},
         ]
         try:
-            result = (self._llm.think(messages, temperature=0) or "").strip()
+            result = (self._llm.think(messages, temperature=0, task_type="fast") or "").strip()
             for name, data in self._skill_bodies.items():
                 if name.lower() in result.lower():
                     return data.get("body", "")
@@ -544,6 +591,24 @@ class ConversationAgent(BaseAgent):
         return "\n".join(lines)
 
     # ──────────────────────────────────────────────────────────
+    #   路由提示（边界区时附加在回复末尾）
+    # ──────────────────────────────────────────────────────────
+
+    def _routing_suggestion(self, score_result, is_scheduled: bool = False) -> str:
+        """评分处于边界区且 reasoning 已配置时，在回复末尾追加切换提示。"""
+        if is_scheduled or score_result is None:
+            return ""
+        if not score_result.is_borderline or score_result.task_type != "default":
+            return ""
+        model_name = self._llm.get_model_name("reasoning")
+        if not model_name:
+            return ""
+        return (
+            f"\n\n---\n"
+            f"> 💡 如果回答不够深入，回复「换推理模型」可切换至 **{model_name}** 重新分析。"
+        )
+
+    # ──────────────────────────────────────────────────────────
     #   流式 LLM 调用 + 节流卡片更新
     # ──────────────────────────────────────────────────────────
 
@@ -553,6 +618,7 @@ class ConversationAgent(BaseAgent):
         on_update: Optional[Callable[[str, str], None]],
         stream_updates_sync_with_llm: bool = False,
         tools: Optional[list] = None,
+        task_type: str = "default",
     ) -> tuple[str, Optional[list]]:
         """
         调用 LLM 流式接口，通过后台 flusher 线程解耦 token 消费与卡片刷新。
@@ -594,7 +660,7 @@ class ConversationAgent(BaseAgent):
             try:
                 full_response = ""
                 final_tool_calls = None
-                for _delta, accumulated, tcs in self._llm.think_stream(messages, tools=tools):
+                for _delta, accumulated, tcs in self._llm.think_stream(messages, tools=tools, task_type=task_type):
                     full_response = accumulated
                     final_tool_calls = tcs
                     if accumulated:
@@ -689,7 +755,7 @@ class ConversationAgent(BaseAgent):
         try:
             full_response = ""
             final_tool_calls = None
-            for _delta, accumulated, tcs in self._llm.think_stream(messages, tools=tools):
+            for _delta, accumulated, tcs in self._llm.think_stream(messages, tools=tools, task_type=task_type):
                 full_response = accumulated
                 final_tool_calls = tcs
                 if tcs:
