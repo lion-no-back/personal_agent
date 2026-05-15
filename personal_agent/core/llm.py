@@ -84,6 +84,7 @@ class PersonalAgentLLM:
             "messages": messages,  # type: ignore[arg-type]
             "temperature": temperature,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if tools:
             kwargs["tools"] = tools
@@ -93,8 +94,11 @@ class PersonalAgentLLM:
 
         accumulated = ""
         tool_calls: List[Dict[str, Any]] = []
+        last_usage = None
 
         for chunk in response:
+            if chunk.usage:
+                last_usage = chunk.usage
             if not chunk.choices:
                 continue
 
@@ -131,7 +135,13 @@ class PersonalAgentLLM:
             if delta is not None or tool_calls:
                 yield delta or "", accumulated, tool_calls if tool_calls else None
 
-        logger.info(f"✅ 流式响应完成 | 共 {len(accumulated)} 字符")
+        if last_usage:
+            logger.info(
+                f"✅ 流式响应完成 | 共 {len(accumulated)} 字符 "
+                f"| tokens in={last_usage.prompt_tokens} out={last_usage.completion_tokens}"
+            )
+        else:
+            logger.info(f"✅ 流式响应完成 | 共 {len(accumulated)} 字符")
 
     def think(
         self,
