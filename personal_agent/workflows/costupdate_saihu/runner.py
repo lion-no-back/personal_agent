@@ -11,6 +11,7 @@
 
 import importlib.util
 import logging
+import os
 import shutil
 import subprocess
 from datetime import datetime
@@ -44,6 +45,11 @@ def _ensure_deps() -> None:
 
 
 def run() -> str:
+    _REQUIRED = ("MABANG_USERNAME", "MABANG_PASSWORD", "SELLFOX_USERNAME", "SELLFOX_PASSWORD")
+    missing = [k for k in _REQUIRED if not os.environ.get(k)]
+    if missing:
+        return f"❌ 缺少必要凭证，请在设置中配置后重启 Agent：{', '.join(missing)}"
+
     _ensure_deps()
 
     from . import mian_controller

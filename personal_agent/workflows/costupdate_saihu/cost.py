@@ -1,6 +1,5 @@
 import os
 import sys
-from pathlib import Path
 import asyncio
 import aiohttp
 import requests
@@ -8,18 +7,23 @@ import json
 import logging
 import re
 import html
+import time
+import warnings
 import pandas as pd
+from urllib.parse import unquote
 from tqdm.asyncio import tqdm
 
 # ==========================================
-# 🚨 强制依赖检测
+# 🚨 强制依赖与警告控制
 # ==========================================
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
 try:
     import lxml
     from bs4 import BeautifulSoup
     import openpyxl 
 except ImportError:
-    print("\n❌ 严重错误：未安装必备的高速解析器 lxml, bs4 或 openpyxl！")
+    print("\n❌ 严重错误：未安装必备的 lxml, bs4 或 openpyxl！")
     sys.exit(1)
 
 # ==========================================
@@ -32,73 +36,102 @@ class FlushFileHandler(logging.FileHandler):
 
 logger = logging.getLogger("MaBangSpider")
 logger.setLevel(logging.INFO)
-
-# 禁止日志冒泡污染全局控制台
 logger.propagate = False
 
 BASE_URL = "https://private.mabangerp.com"
 AMZ_BASE_URL = "https://private-amz.mabangerp.com"
+
 CHECK_TYPE_API = f"{AMZ_BASE_URL}/index.php?mod=fbanew.listsearch"
-COMBO_API_URL = f"{AMZ_BASE_URL}/index.php?mod=combosku.getCombosSkuList"
 STOCK_API_URL = f"{AMZ_BASE_URL}/index.php?mod=stock.getStockList"
+EXPORT_URL = f"{BASE_URL}/index.php?mod=combosku.doExportFileNew"
 
 file_lock = asyncio.Lock()
 
-# 提速参数
 CONCURRENCY_LIMIT = 40           
 MAX_RETRIES = 3                  
 BATCH_SIZE_TYPE = 300            
-BATCH_SIZE_STOCK = 100            
+BATCH_SIZE_STOCK = 200
 TIMEOUT_SETTING = aiohttp.ClientTimeout(total=120, sock_connect=10, sock_read=90)
 WRITE_FLUSH_EVERY = 50           
 
 
 # ==========================================
-# 🔑 2. 获取跨域全域鉴权
+# 🔑 2. 鉴权中心
 # ==========================================
-def get_cookie(output_dir: str):
-    print("  ⏳ 正在获取马帮跨域授权...")
+def get_global_auth():
+    print("  ⏳ 正在获取马帮跨域全局授权...")
     logger.info("=== 启动程序，开始获取鉴权 ===")
-    session = requests.Session()
+    
+    main_session = requests.Session()
     base_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Connection": "keep-alive"
     }
     
-    try:
-        session.get(f"{BASE_URL}/", headers=base_headers, timeout=10)
-        login_url = f"{BASE_URL}/index.php?mod=main.doLogin&lang=undefined"
-        login_headers = base_headers.copy()
-        login_headers.update({
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "X-Requested-With": "XMLHttpRequest"
-        })
-        data = {"username": "15525692520", "password": "Tg15525692520&", "verifyType": "1"}
-        resp = session.post(login_url, headers=login_headers, data=data, timeout=10)
-        if not resp.json().get("success"):
-            logger.error("主站登录失败，请检查密码")
-            return None, None
-    except Exception as e:
-        logger.error(f"登录发生异常: {e}")
-        return None, None
+    try: main_session.get(f"{BASE_URL}/", headers=base_headers, timeout=10)
+    except Exception: pass
+        
+    login_url = f"{BASE_URL}/index.php?mod=main.doLogin&lang=undefined"
+    login_headers = base_headers.copy()
+    login_headers.update({
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Origin": BASE_URL,
+    })
+    
+    data = {"username": os.environ.get("MABANG_USERNAME", ""), "password": os.environ.get("MABANG_PASSWORD", ""), "verifyType": "1"}
+    resp = main_session.post(login_url, headers=login_headers, data=data, timeout=10)
+    if not resp.json().get("success"):
+        logger.error("主站登录失败，请检查密码")
+        return None, None, None
 
-    cookies_dict = requests.utils.dict_from_cookiejar(session.cookies)
+    for label, url, method, payload in [
+        ("GET /", f"{BASE_URL}/", "GET", None),
+        ("POST main.index", f"{BASE_URL}/index.php?mod=main.index", "POST", {}),
+        ("POST main.getUserInfo", f"{BASE_URL}/index.php?mod=main.getUserInfo", "POST", {}),
+    ]:
+        if method == "GET": main_session.get(url, headers=base_headers, timeout=10)
+        else: main_session.post(url, headers=login_headers, data=payload, timeout=10)
+        if any(c.name == "memberInfo" for c in main_session.cookies): break
+
+    cookies_dict = requests.utils.dict_from_cookiejar(main_session.cookies)
     memcache_key = cookies_dict.get("MABANG_ERP_PRO_MEMBERINFO_LOGIN_COOKIE")
+    if not memcache_key:
+        logger.error("未找到 memcache_key，登录可能未完全成功")
+        return None, None, None
 
-    transition_url = (f"{AMZ_BASE_URL}/index.php?mod=fbanew.list&platform=amazon&version=1"
-                      f"&cMKey={memcache_key}&fromTest=111&lang=cn&tz=UTC+8&DOMAIN=private.mabangerp.com")
+    main_session.cookies.set("exportv2", "2", domain="private.mabangerp.com")
+    main_session.cookies.set("login_js_cookie_phone_cookie", "", domain="private.mabangerp.com")
+
+    amz_session = requests.Session()
+    for c in main_session.cookies:
+        amz_session.cookies.set(c.name, c.value, domain="private-amz.mabangerp.com")
+        
+    transition_url = f"{AMZ_BASE_URL}/index.php?mod=fbanew.list&platform=amazon&version=1&cMKey={memcache_key}&fromTest=111&lang=cn&tz=UTC+8&DOMAIN=private.mabangerp.com"
     try:
-        session.get(transition_url, headers=base_headers, timeout=10)
-        final_cookies = requests.utils.dict_from_cookiejar(session.cookies)
-        print("  ✅ 授权成功，引擎已就绪！\n")
-        return "; ".join([f"{k}={v}" for k, v in final_cookies.items()]), memcache_key
+        amz_session.get(transition_url, headers=base_headers, timeout=15)
+        amz_post_url = f"{AMZ_BASE_URL}/index.php?mod=combosku.getCombosSkuList"
+        amz_post_headers = {
+            **base_headers,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": AMZ_BASE_URL,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        amz_session.post(amz_post_url, headers=amz_post_headers, data="searchLike=comboSku&operate=Like", timeout=15)
+        
+        final_amz_cookies = requests.utils.dict_from_cookiejar(amz_session.cookies)
+        amz_cookie_str = "; ".join([f"{k}={v}" for k, v in final_amz_cookies.items()])
+        print("  ✅ 全局跨域授权成功，引擎已就绪！\n")
+        return main_session, amz_cookie_str, memcache_key
     except Exception as e:
-        logger.error(f"跨域请求失败: {e}")
-        return None, None
+        logger.error(f"激活子站失败: {e}")
+        return None, None, None
 
 
 # ==========================================
-# ⚡ 3. 后台解析器与网络请求
+# ⚡ 3. 核心流水线各阶段业务逻辑
 # ==========================================
 def _parse_type_html_fast(html_content, msku_batch):
     html_content = html.unescape(html_content)
@@ -109,8 +142,7 @@ def _parse_type_html_fast(html_content, msku_batch):
     rows = html_content.split('<tr ')
     for row in rows[1:]:
         msku_match = re.search(r'data-msku="([^"]+)"', row)
-        if not msku_match:
-            msku_match = re.search(r'msku="([^"]+)"', row)
+        if not msku_match: msku_match = re.search(r'msku="([^"]+)"', row)
             
         if msku_match:
             row_msku = msku_match.group(1).strip()
@@ -127,33 +159,11 @@ def _parse_type_html_fast(html_content, msku_batch):
             result[m] = "无此SKU"
     return result
 
-def _parse_combo_html_sync(html_content, local_sku):
-    soup = BeautifulSoup(html_content, 'lxml')
-    target_data_id = None
-    for tag in soup.select('a.comboskuCopy'):
-        if tag.text.strip().upper() == local_sku.upper():
-            parent_tr = tag.find_parent('tr')
-            if parent_tr and parent_tr.has_attr('data-id'):
-                target_data_id = parent_tr['data-id']
-            break
-
-    if not target_data_id: return None
-
-    children_skus = []
-    child_links = soup.select(f'tr[data-id="{target_data_id}"] a.small-edit-sku')
-    for link in child_links:
-        sku_text = link.get_text(strip=True)
-        if sku_text: 
-            clean_sku = sku_text.split('*')[0].split('×')[0].strip()
-            children_skus.append(clean_sku)
-    return children_skus
-
 async def batch_check_sku_types(session, msku_batch):
     platform_sku_data = "\r\n".join(msku_batch)
     form_data = aiohttp.FormData()
     form_data.add_field('shopId', '')
     form_data.add_field('status', '1')
-    form_data.add_field('ispair', '')
     form_data.add_field('isChange', '1')
     form_data.add_field('searchtexttype', 'platformSkuLike')
     form_data.add_field('atn', 'list')
@@ -173,11 +183,168 @@ async def batch_check_sku_types(session, msku_batch):
                 html_content = data.get('html', '')
                 if not html_content.strip() or '暂无数据' in html_content:
                     return {m: "无此SKU" for m in msku_batch}
-                result = await asyncio.to_thread(_parse_type_html_fast, html_content, msku_batch)
-                return result
+                return await asyncio.to_thread(_parse_type_html_fast, html_content, msku_batch)
         except Exception:
             if attempt < MAX_RETRIES: await asyncio.sleep(2 * attempt)
     return result
+
+
+# 【阶段 C1】增强版：防御网络崩溃 + 分批导出机制 + 超时放宽
+def sync_export_combo_and_parse(main_session, memcache_key, combo_local_skus_unique, output_dir):
+    if not combo_local_skus_unique: return {}
+    
+    export_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": BASE_URL,
+    }
+    
+    # 核心修复 1：将庞大的 SKU 列表按 3000 一批进行切割
+    BATCH_SIZE = 3000
+    sku_batches = [combo_local_skus_unique[i:i + BATCH_SIZE] for i in range(0, len(combo_local_skus_unique), BATCH_SIZE)]
+    
+    final_combo_dict = {}
+
+    for batch_idx, current_batch in enumerate(sku_batches):
+        print(f"\n     ↳ 正在处理组合导出批次 {batch_idx + 1}/{len(sku_batches)} (本批 {len(current_batch)} 条)...")
+        
+        step1_data = [
+            ("backUrl", ""),
+            ("orderIds", "\r\n".join(current_batch)),
+            ("fieldlabel", "uq101"),
+            ("fieldlabel", "uq136"),
+            ("fieldlabel", "uq138"),
+            ("map-name[]", "组合sku编码"),
+            ("map-uq[]", "uq101"),
+            ("map-text[]", ""),
+            ("map-name[]", "关联sku个数"),
+            ("map-uq[]", "uq136"),
+            ("map-text[]", ""),
+            ("map-name[]", "关联sku信息"),
+            ("map-uq[]", "uq138"),
+            ("map-text[]", ""),
+            ("templateName", ""),
+            ("templateId", "0"),
+            ("datasOpen", "1"),
+            ("memcacheKey", memcache_key),
+            ("showRmbColumn", "2"),
+            ("pageSave", "1"),
+            ("operateType", "19"),
+            ("params", ""),
+            ("InterfaceUrl", ""),
+            ("mainMenu", ""),
+            ("hiddenPage", "1"),
+            ("hiddenPageSize", ""),
+            ("tableBase", ""),
+            ("isMerage", "1"),
+            ("version", "v2"),
+            ("step", "1"),
+        ]
+        
+        try:
+            # 核心修复 2：将所有相关的 timeout 统一放宽到 150 秒
+            r1 = main_session.post(EXPORT_URL, headers=export_headers, data=step1_data, timeout=150)
+            j1 = r1.json()
+            if not j1.get("success"): 
+                print(f"     ❌ [警告] 批次 {batch_idx + 1} 首步被拒: {j1.get('message', j1)}")
+                continue # 失败则跳过本批次，不让程序彻底崩溃
+                
+            sn, subtask_num = j1["sn"], j1.get("subtask_num", 1)
+
+            for sub_no in range(1, subtask_num + 1):
+                step2_data = [("tableBase", ""), ("isMerage", "1"), ("version", "v2"), ("sn", sn), ("sub_no", str(sub_no)), ("step", "2"), ("1", "1")]
+                main_session.post(EXPORT_URL, headers=export_headers, data=step2_data, timeout=150)
+
+            step3_data = [("tableBase", ""), ("isMerage", "1"), ("sn", sn), ("version", "v2"), ("step", "3"), ("1", "1")]
+            r3 = main_session.post(EXPORT_URL, headers=export_headers, data=step3_data, timeout=150)
+            task_id = r3.json().get("taskId")
+
+            file_url = None
+            # 增加轮询次数，确保大文件有足够时间生成 (30次 * 4秒 = 120秒轮询容忍度)
+            for _ in range(30):
+                step4_data = [("tableBase", ""), ("isMerage", "1"), ("sn", sn), ("version", "v2"), ("step", "4"), ("taskId", str(task_id)), ("1", "1")]
+                j4 = main_session.post(EXPORT_URL, headers=export_headers, data=step4_data, timeout=150).json()
+                if j4.get("success") and j4.get("file_url"):
+                    file_url = j4["file_url"]
+                    break
+                time.sleep(4)
+                
+            if not file_url: 
+                print(f"     ❌ [警告] 批次 {batch_idx + 1} 导出轮询超时！")
+                continue
+
+            # 核心修复 3：为保存的文件名增加批次前缀，防止同名覆盖
+            original_filename = unquote(file_url.split("/")[-1])
+            save_path = os.path.join(output_dir, f"batch_{batch_idx + 1}_{original_filename}")
+            
+            with open(save_path, "wb") as f:
+                f.write(main_session.get(file_url, timeout=150).content)
+                
+            try:
+                df = pd.read_csv(save_path, encoding='utf-8-sig') if save_path.endswith('.csv') else pd.read_excel(save_path, header=0)
+                logger.info(f"批次 {batch_idx + 1} 文件列数={df.shape[1]}，行数={df.shape[0]}，列名={list(df.columns)}")
+
+                # 导出文件为宽表格式：col0=组合sku编码, col1=关联sku个数,
+                # 之后每 2 列一对 (关联sku编码N, 关联sku数量N)，最多 14 对
+                parsed_count = 0
+                if df.shape[1] >= 4:
+                    for row_idx, row in df.iterrows():
+                        parent_sku = str(row.iloc[0]).strip()
+                        if not parent_sku or parent_sku == 'nan':
+                            continue
+                        try:
+                            total_count = int(float(str(row.iloc[1]).strip()))
+                        except (ValueError, TypeError):
+                            total_count = 0
+                        children = {}
+                        for col_i in range(2, df.shape[1] - 1, 2):
+                            child_sku = str(row.iloc[col_i]).strip()
+                            if not child_sku or child_sku == 'nan':
+                                break
+                            try:
+                                qty = int(float(str(row.iloc[col_i + 1]).strip()))
+                            except (ValueError, TypeError):
+                                qty = 1
+                            children[child_sku] = children.get(child_sku, 0) + qty
+                        if children:
+                            # 存 (子件dict, 关联sku个数)，件数以 col1 为准
+                            final_combo_dict[parent_sku] = (children, total_count)
+                            parsed_count += 1
+                else:
+                    # 兼容旧版单列 "关联sku信息" 格式
+                    combo_col = [c for c in df.columns if '组合sku编码' in str(c)]
+                    child_col = [c for c in df.columns if '关联sku信息' in str(c)]
+                    if combo_col and child_col:
+                        for _, row in df.iterrows():
+                            parent_sku = str(row[combo_col[0]]).strip()
+                            child_info_str = str(row[child_col[0]]).strip()
+                            if parent_sku and parent_sku != 'nan' and child_info_str and child_info_str != 'nan':
+                                children = {}
+                                for item in re.split(r'[,;\n\r]+', child_info_str):
+                                    item = item.strip()
+                                    if not item: continue
+                                    match = re.search(r'^(.+?)[\*xX]\s*(\d+)$', item)
+                                    if match: child_sku, qty = match.group(1).strip(), int(match.group(2))
+                                    else: child_sku, qty = item.strip(), 1
+                                    children[child_sku] = children.get(child_sku, 0) + qty
+                                if children:
+                                    total_count = sum(children.values())
+                                    final_combo_dict[parent_sku] = (children, total_count)
+                                    parsed_count += 1
+                    else:
+                        logger.warning(f"批次 {batch_idx + 1} 未找到有效列：combo_col={combo_col}, child_col={child_col}")
+
+                logger.info(f"批次 {batch_idx + 1} 解析完成，本批提取组合结构 {parsed_count} 条")
+            except Exception as e:
+                logger.error(f"Pandas 解析批次 {batch_idx + 1} 组合文件失败: {e}", exc_info=True)
+                
+        except requests.exceptions.RequestException as re_err:
+            print(f"     ❌ [网络超时] 批次 {batch_idx + 1} 请求过于庞大导致无响应: {re_err}")
+        except Exception as e:
+            print(f"     ❌ [未知崩溃] 批次 {batch_idx + 1} 导出解析阶段发生异常: {e}")
+
+    return final_combo_dict
 
 def _resolve_price(item, sku_label):
     try: purchase_price = float(item.get("purchasePrice", 0.0) or 0.0)
@@ -185,85 +352,64 @@ def _resolve_price(item, sku_label):
     try: default_cost = float(item.get("defaultCost", 0.0) or 0.0)
     except: default_cost = 0.0
     if purchase_price > 0: return purchase_price, ""
-    if default_cost > 0: return default_cost, "无采购价已取默认成本兜底"
-    return 0.0, "采购价与默认成本均为0"
+    if default_cost > 0: return default_cost, "兜底"
+    return 0.0, "均为0"
 
 async def batch_fetch_stock_prices(session, sku_batch):
-    stock_data_str = "\r\n".join([s.strip() for s in sku_batch if s.strip()])
-    form_data = aiohttp.FormData()
-    form_data.add_field("searchKey", "Stock_stockSku")
-    form_data.add_field("operate", "=")
-    form_data.add_field("search-content", "库存SKU")
-    form_data.add_field("isBatchSearch", "1")
-    form_data.add_field("selecttype", "stockSku")
-    form_data.add_field("stockData", stock_data_str)
+    sku_data = "\r\n".join([s.strip() for s in sku_batch if s.strip()])
 
-    result = {s: None for s in sku_batch} 
+    result = {s: None for s in sku_batch}
     upper_index = {s.strip().upper(): s for s in sku_batch}
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            # FormData 必须在每次请求前重建，否则流已消费无法重用
+            form_data = aiohttp.FormData()
+            form_data.add_field("searchKey", "Stock_stockSku")
+            form_data.add_field("operate", "=")
+            form_data.add_field("isBatchSearch", "1")
+            form_data.add_field("selecttype", "stockSku")
+            form_data.add_field("stockData", sku_data)
+            form_data.add_field("page", "1")
+            form_data.add_field("rowsPerPage", "200")
             async with session.post(STOCK_API_URL, data=form_data, timeout=TIMEOUT_SETTING) as resp:
-                if resp.status != 200: continue
+                if resp.status != 200:
+                    logger.warning(f"库存取价批次 HTTP {resp.status}，第{attempt}次重试")
+                    continue
                 text = await resp.text()
-                clean_text = text[text.find('{'):text.rfind('}') + 1]
-                res_json = json.loads(clean_text)
-                if not res_json.get("success") or not res_json.get("hasData"): return result
-                stock_data = res_json.get("stockData", []) or []
-                for item in stock_data:
+                res_json = json.loads(text[text.find('{'):text.rfind('}') + 1])
+                if not res_json.get("success") or not res_json.get("hasData"):
+                    return result
+                stock_items = res_json.get("stockData", [])
+                for item in stock_items:
                     sku_key = str(item.get("stockSku", "")).strip().upper()
                     if sku_key in upper_index:
-                        original_sku = upper_index[sku_key]
-                        if result[original_sku] is None:
-                            price, reason = _resolve_price(item, original_sku)
-                            result[original_sku] = (price, reason)
+                        orig_sku = upper_index[sku_key]
+                        if result[orig_sku] is None:
+                            result[orig_sku] = _resolve_price(item, orig_sku)
+                logger.info(f"库存取价批次: 发送{len(sku_batch)}条，API返回{len(stock_items)}行，命中{sum(1 for v in result.values() if v is not None)}条")
                 return result
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"库存取价批次异常(第{attempt}次): {exc}", exc_info=(attempt == MAX_RETRIES))
             if attempt < MAX_RETRIES: await asyncio.sleep(2 * attempt)
     return result
 
-async def fetch_combo_children_skus(session, local_sku):
-    form_data = aiohttp.FormData()
-    form_data.add_field("searchLike", "comboSku")
-    form_data.add_field("operate", "Like")
-    form_data.add_field("searchKeywords", local_sku)
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            async with session.post(COMBO_API_URL, data=form_data, timeout=TIMEOUT_SETTING) as resp:
-                if resp.status != 200: continue
-                text = await resp.text()
-                clean_text = text[text.find('{'):text.rfind('}') + 1]
-                res_json = json.loads(clean_text)
-                html_content = res_json.get("message", "")
-                if html_content:
-                    children = await asyncio.to_thread(_parse_combo_html_sync, html_content, local_sku)
-                    if children is not None: 
-                        logger.info(f"[阶段C1] 成功提取组合SKU {local_sku} 的子件: {children}")
-                        return children
-        except Exception: pass
-        if attempt < MAX_RETRIES: await asyncio.sleep(2)
-    logger.error(f"[阶段C1] 组合SKU {local_sku} 彻底提取失败")
-    return None
 
 # ==========================================
 # 💾 4. 双流缓存写入器
 # ==========================================
 class CacheWriter:
-    def __init__(self, data_path, error_path, flush_every=WRITE_FLUSH_EVERY):
+    def __init__(self, data_path, error_path):
         self.data_path = data_path
         self.error_path = error_path
         self.data_buffer = []
         self.error_buffer = []
-        self.flush_every = flush_every
 
     async def add(self, msku, result):
         async with file_lock:
-            if isinstance(result, (int, float)):
-                self.data_buffer.append((msku, result))
-            else:
-                self.error_buffer.append((msku, result))
-                
-            if max(len(self.data_buffer), len(self.error_buffer)) >= self.flush_every:
+            if isinstance(result, (int, float)): self.data_buffer.append((msku, result))
+            else: self.error_buffer.append((msku, result))
+            if max(len(self.data_buffer), len(self.error_buffer)) >= WRITE_FLUSH_EVERY:
                 self._flush_locked()
 
     def _flush_locked(self):
@@ -271,7 +417,6 @@ class CacheWriter:
             with open(self.data_path, 'a', encoding='utf-8-sig', newline='') as f:
                 for msku, cost in self.data_buffer: f.write(f"{msku},{cost}\n")
             self.data_buffer.clear()
-            
         if self.error_buffer:
             with open(self.error_path, 'a', encoding='utf-8-sig', newline='') as f:
                 for msku, reason in self.error_buffer: f.write(f"{msku},{reason}\n")
@@ -280,25 +425,21 @@ class CacheWriter:
     async def flush(self):
         async with file_lock: self._flush_locked()
 
+
 # ==========================================
-# 🚀 5. 主流水线 
+# 🚀 5. 主流水线集成引擎
 # ==========================================
-async def run_pipeline(task_list, cookie_string, memcache_key, already_done, cache_file, error_cache_file):
-    headers = {
+async def run_pipeline(task_list, main_session, amz_cookie_str, memcache_key, cache_file, error_cache_file, output_dir):
+    amz_headers = {
         "Accept": "application/json, text/javascript, */*; q=0.01",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0",
         "X-Requested-With": "XMLHttpRequest",
         "Origin": AMZ_BASE_URL, 
-        "Cookie": cookie_string
+        "Cookie": amz_cookie_str
     }
-    connector = aiohttp.TCPConnector(limit=CONCURRENCY_LIMIT, limit_per_host=CONCURRENCY_LIMIT)
+    connector = aiohttp.TCPConnector(limit=CONCURRENCY_LIMIT)
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
     writer = CacheWriter(cache_file, error_cache_file)
-
-    if not os.path.exists(cache_file):
-        with open(cache_file, 'w', encoding='utf-8-sig', newline='') as f: f.write("MSKU,最终采购成本\n")
-    if not os.path.exists(error_cache_file):
-        with open(error_cache_file, 'w', encoding='utf-8-sig', newline='') as f: f.write("MSKU,原因\n")
 
     cleaned = [(m.strip(), l.strip()) for m, l in task_list]
     msku_to_local = {m: l for m, l in cleaned}
@@ -306,204 +447,188 @@ async def run_pipeline(task_list, cookie_string, memcache_key, already_done, cac
     final_results = {}
     
     try:
-        async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
+        async with aiohttp.ClientSession(headers=amz_headers, connector=connector) as amz_sess:
 
             # ---------- 阶段 A ----------
             print(f"  🔎 阶段 A: 批量判别 SKU 类型 (每批 {BATCH_SIZE_TYPE} 条)...")
             type_map = {}
             async def _do_type_batch(batch):
-                async with semaphore: return await batch_check_sku_types(session, batch)
-            type_batches = [all_mskus[i:i + BATCH_SIZE_TYPE] for i in range(0, len(all_mskus), BATCH_SIZE_TYPE)]
-            if type_batches:
-                for fut in tqdm(asyncio.as_completed([_do_type_batch(b) for b in type_batches]), total=len(type_batches), desc="A.类型判定"):
-                    type_map.update(await fut)
+                async with semaphore: return await batch_check_sku_types(amz_sess, batch)
+                
+            batches = [all_mskus[i:i + BATCH_SIZE_TYPE] for i in range(0, len(all_mskus), BATCH_SIZE_TYPE)]
+            for fut in tqdm(asyncio.as_completed([_do_type_batch(b) for b in batches]), total=len(batches), desc="A.类型判定"):
+                type_map.update(await fut)
 
             normal_mskus = [m for m, t in type_map.items() if t == "普通SKU"]
             combo_mskus = [m for m, t in type_map.items() if t == "组合SKU"]
-            
-            abnormal_count = 0
             for m, t in type_map.items():
-                if t in ["无此SKU", "判断超时"]: 
-                    final_results[m] = "库存SKU获取不到采购价"
-                    abnormal_count += 1
-            print(f"     ↳ 普通 {len(normal_mskus)} | 组合 {len(combo_mskus)} | 异常 {abnormal_count}")
+                if t in ["无此SKU", "判断超时"]: final_results[m] = "库存SKU获取不到采购价"
+
+            # 导出组合明细表
+            if combo_mskus:
+                combo_export_data = [{"MSKU": m, "组合SKU": msku_to_local[m]} for m in combo_mskus]
+                combo_export_path = os.path.join(output_dir, "阶段A_组合SKU清单.xlsx")
+                try:
+                    df_combo = pd.DataFrame(combo_export_data).drop_duplicates(subset=["MSKU", "组合SKU"])
+                    df_combo.to_excel(combo_export_path, index=False)
+                    print(f"     ↳ [导出] 组合SKU明细已导出，共 {len(df_combo)} 行双列数据，保存至: {combo_export_path}")
+                except Exception as e:
+                    logger.error(f"导出阶段A组合SKU清单失败: {e}")
 
             # ---------- 阶段 C1 ----------
-            print(f"  🧩 阶段 C1: 极速解析组合 SKU 子件清单...")
-            combo_local_skus = {msku_to_local[m] for m in combo_mskus}
+            combo_local_skus_unique = list(set([msku_to_local[m] for m in combo_mskus]))
             combo_local_to_children = {}
-            tasks_to_fetch = list(combo_local_skus)
-
-            print(f"     ↳ 需连网查询: {len(tasks_to_fetch)} 条")
-
-            if tasks_to_fetch:
-                async def _do_fetch_children(ls):
-                    async with semaphore: return ls, await fetch_combo_children_skus(session, ls)
-                
-                children_tasks = [_do_fetch_children(ls) for ls in tasks_to_fetch]
-                for fut in tqdm(asyncio.as_completed(children_tasks), total=len(children_tasks), desc="C1.网络请求提取子件"):
-                    ls, children = await fut
-                    if children is not None:
-                        combo_local_to_children[ls] = children
+            
+            if combo_local_skus_unique:
+                print(f"  🧩 阶段 C1: 发起 {len(combo_local_skus_unique)} 个独立组合SKU的导出解析任务...")
+                combo_local_to_children = await asyncio.to_thread(
+                    sync_export_combo_and_parse, 
+                    main_session, 
+                    memcache_key, 
+                    combo_local_skus_unique, 
+                    output_dir
+                )
+                print(f"     ↳ 成功提取底层子件结构 {len(combo_local_to_children)} 个")
 
             # ---------- 阶段 B ----------
             print(f"  💰 阶段 B: 批量获取底层库存采购价 (每批 {BATCH_SIZE_STOCK} 条)...")
             normal_local_skus = {msku_to_local[m] for m in normal_mskus}
             all_child_skus = set()
-            for children in combo_local_to_children.values():
-                if children: all_child_skus.update(children)
+            for entry in combo_local_to_children.values():
+                all_child_skus.update(entry[0].keys())
 
             all_query_skus = sorted(normal_local_skus | all_child_skus)
             price_cache = {}
 
-            async def _do_stock_batch(batch):
-                async with semaphore: return await batch_fetch_stock_prices(session, batch)
+            if all_query_skus:
+                async def _do_stock_batch(batch):
+                    async with semaphore: return await batch_fetch_stock_prices(amz_sess, batch)
 
-            stock_batches = [all_query_skus[i:i + BATCH_SIZE_STOCK] for i in range(0, len(all_query_skus), BATCH_SIZE_STOCK)]
-            if stock_batches:
-                stock_tasks = [_do_stock_batch(b) for b in stock_batches]
-                for fut in tqdm(asyncio.as_completed(stock_tasks), total=len(stock_tasks), desc="B.批量库存取价"):
+                stock_batches = [all_query_skus[i:i + BATCH_SIZE_STOCK] for i in range(0, len(all_query_skus), BATCH_SIZE_STOCK)]
+                for fut in tqdm(asyncio.as_completed([_do_stock_batch(b) for b in stock_batches]), total=len(stock_batches), desc="B.批量库存取价"):
                     price_cache.update(await fut)
 
-            # ---------- 阶段 C2 结算 ----------
+                # 二次补查：对主批次仍为 None 的 SKU 缩小批次重试（20条/批）
+                retry_skus = [s for s in all_query_skus if price_cache.get(s) is None]
+                if retry_skus:
+                    RETRY_BATCH = 20
+                    print(f"     ↳ 二次补查 {len(retry_skus)} 个未命中SKU (每批 {RETRY_BATCH} 条)...")
+                    retry_batches = [retry_skus[i:i + RETRY_BATCH] for i in range(0, len(retry_skus), RETRY_BATCH)]
+                    for fut in tqdm(asyncio.as_completed([_do_stock_batch(b) for b in retry_batches]), total=len(retry_batches), desc="B.补查"):
+                        for sku, val in (await fut).items():
+                            if val is not None and price_cache.get(sku) is None:
+                                price_cache[sku] = val
+                    recovered = sum(1 for s in retry_skus if price_cache.get(s) is not None)
+                    print(f"     ↳ 补查回收 {recovered}/{len(retry_skus)} 条")
+
+            # ---------- 阶段 C2 ----------
             logger.info("========== 开始执行最后结算与异常排查 ==========")
-            
+
             normal_success = normal_fail = 0
             for m in normal_mskus:
-                ls = msku_to_local[m]
-                p_data = price_cache.get(ls)
-                if p_data is None:
+                local_sku = msku_to_local[m]
+                p_data = price_cache.get(local_sku)
+                if p_data and p_data[0] > 0.0:
+                    final_results[m] = round(p_data[0] + 1.0, 2)
+                    normal_success += 1
+                else:
+                    reason = f"采购价={p_data[0]}" if p_data is not None else "库存系统未找到(可能库存为0)"
+                    logger.warning(f"普通件取价失败: MSKU={m}, 本地SKU={local_sku}, {reason}")
                     final_results[m] = "库存SKU获取不到采购价"
                     normal_fail += 1
-                else:
-                    price, reason = p_data
-                    if price is None or price == 0.0:
-                        final_results[m] = "库存SKU获取不到采购价"
-                        normal_fail += 1
-                    else:
-                        final_price = price + 1.0
-                        final_results[m] = round(final_price, 2)
-                        normal_success += 1
-                        logger.info(f"[普通成功] {m} -> 原始: {price} | 最终(加价后): {final_results[m]}")
-                        
-            print(f"     ↳ 普通件：成功 {normal_success} | 失败 {normal_fail}")
+
+            missing_local_skus = set(combo_local_skus_unique) - set(combo_local_to_children.keys())
+            if missing_local_skus:
+                logger.warning(f"C1 导出解析后，以下 {len(missing_local_skus)} 个本地SKU未提取到子件结构: {sorted(missing_local_skus)}")
 
             combo_success = combo_fail = 0
             for m in combo_mskus:
                 ls = msku_to_local[m]
-                children = combo_local_to_children.get(ls)
-                
-                if not children:
+                entry = combo_local_to_children.get(ls)
+
+                if not entry:
+                    logger.warning(f"组合解析失败: MSKU={m}, 本地SKU={ls} 未在C1导出结果中找到子件 (C1共提取{len(combo_local_to_children)}条，缺失{len(missing_local_skus)}条)")
                     final_results[m] = "组合解析失败(未提取到子件)"
                     combo_fail += 1
                     continue
 
-                total = 0.0
-                blocked = False
-                
-                for child_sku in children:
+                children_dict, total_items_count = entry
+                total_material_cost = 0.0
+                missing_child_skus = []
+
+                for child_sku, qty in children_dict.items():
                     p_data = price_cache.get(child_sku)
                     if p_data is None:
-                        blocked = True
-                        break
-                    price, reason = p_data
-                    if price is None:
-                        blocked = True
-                        break
-                    total += price
+                        # 库存系统完全找不到该子件 → 真正失败
+                        missing_child_skus.append(child_sku)
+                    else:
+                        # price=0.0 合法（包装件等），以 0 成本参与汇总
+                        total_material_cost += p_data[0] * qty
 
-                if blocked:
+                if missing_child_skus:
+                    logger.warning(f"MSKU={m} 本地SKU={ls} 子件在库存系统中未找到: {missing_child_skus}")
                     final_results[m] = "库存SKU获取不到采购价"
                     combo_fail += 1
                 else:
-                    if total == 0.0:
-                        final_results[m] = "库存SKU获取不到采购价"
-                        combo_fail += 1
-                    else:
-                        child_count = len(children)
-                        final_combo_price = total + 1.0 + 1 * (child_count - 1)
-                        final_results[m] = round(final_combo_price, 2)
-                        combo_success += 1
-                        logger.info(f"[组合成功] {m} -> 纯材料: {total} | 件数: {child_count} | 最终(加处理费后): {final_results[m]}")
-                        
+                    final_combo_price = total_material_cost + 1.0 + 1.0 * (total_items_count - 1)
+                    final_results[m] = round(final_combo_price, 2)
+                    combo_success += 1
+
+            print(f"  📊 结算汇总:")
+            print(f"     ↳ 普通件：成功 {normal_success} | 失败 {normal_fail}")
             print(f"     ↳ 组合件：成功 {combo_success} | 失败 {combo_fail}")
 
     finally:
-        logger.info("======= 正在执行收尾刷盘操作，请勿关闭窗口！ =======")
+        logger.info("======= 正在执行收尾刷盘操作 =======")
         for m, _ in cleaned: 
-            if m not in already_done and m in final_results:
+            if m in final_results:
                 await writer.add(m, final_results[m])
         await writer.flush()
 
 # ==========================================
-# ✂️ 6. 拆分逻辑 (已升级为：原生模板克隆法)
+# ✂️ 6. 拆分逻辑
 # ==========================================
 def auto_split_to_excel(csv_path, chunk_size=9900):
-    if not os.path.exists(csv_path):
-        print(f"  ⚠️ 找不到总表 {csv_path}，跳过拆分。")
-        return
-
+    if not os.path.exists(csv_path): return
     output_dir = os.path.dirname(csv_path)
-    template_path = str(Path(__file__).parent / "成本导入模板.xlsx")
+    template_path = "成本导入模板.xlsx"
     
-    print(f"\n  ✂️ 开始将报表拆分为直接可上传的 Excel 格式 (每份不超过 {chunk_size} 条)...")
-    
+    print(f"\n  ✂️ 开始拆分为直接可上传的 Excel (每份 {chunk_size} 条)...")
     if not os.path.exists(template_path):
-         print(f"  ❌ 找不到模板文件 {template_path}，无法同步表头格式，跳过拆分。")
+         print("  ❌ 找不到模板文件，跳过拆分。")
          return
 
     try:
-        # 1. 读取我们生成的完整CSV数据 (Pandas仅作纯数据读取，不参与生成Excel)
-        try:
-            full_df = pd.read_csv(csv_path, encoding='utf-8-sig')
-        except UnicodeDecodeError:
-            full_df = pd.read_csv(csv_path, encoding='gbk')
-            
-        if len(full_df.columns) < 2:
-             print(f"  ❌ CSV文件 {csv_path} 数据异常，不足两列。")
-             return
-             
-        # 2. 提取前两列数据转换为 Python 原生列表，大幅提升后续逐行写入速度
-        data_records = full_df.iloc[:, :2].values.tolist()
-        total_rows = len(data_records)
+        try: full_df = pd.read_csv(csv_path, encoding='utf-8-sig')
+        except: full_df = pd.read_csv(csv_path, encoding='gbk')
         
-        # 3. 按 chunk_size 分块处理
-        chunks = [data_records[i:i + chunk_size] for i in range(0, total_rows, chunk_size)]
+        if full_df.empty:
+            print("  ℹ️ 报表内无有效数据，无需拆分。")
+            return
+            
+        data_records = full_df.iloc[:, :2].values.tolist()
+        chunks = [data_records[i:i + chunk_size] for i in range(0, len(data_records), chunk_size)]
         
         for i, chunk in enumerate(chunks):
             target_file = os.path.join(output_dir, f"上传文件_第{i+1}部分.xlsx")
-            
-            # 💡 核心改变：每次分块都用 openpyxl 直接加载原始模板，保留 100% 的格式/公式/样式
             wb = openpyxl.load_workbook(template_path)
             ws = wb.active
-            
-            # 4. 从第 2 行开始逐行灌入数据 (假设第 1 行是表头)
             start_row = 2
             for row_idx, row_data in enumerate(chunk):
-                # 写入第一列 (MSKU) 到 Column A
                 ws.cell(row=start_row + row_idx, column=1, value=row_data[0])
-                # 写入第二列 (最终采购成本) 到 Column B
                 ws.cell(row=start_row + row_idx, column=2, value=row_data[1])
-                
-            # 5. “另存为”分块文件
             wb.save(target_file)
-            wb.close() # 释放内存
-            
-            print(f"    -> 已生成分片: {os.path.basename(target_file)} (包含 {len(chunk)} 条)，格式已完美克隆模板！")
-            
+            wb.close()
+            print(f"    -> 已生成分片: {os.path.basename(target_file)}")
     except Exception as e:
-        print(f"  ❌ Excel 拆分与模板克隆失败: {e}")
+        print(f"  ❌ Excel 拆分失败: {e}")
 
 # ==========================================
-# 🏁 7. 供主控调用的入口函数
+# 🏁 7. 入口函数 
 # ==========================================
 def run_cost(input_csv: str, output_dir: str):
-    """暴露给主控调用的主函数"""
-    
-    # 动态配置日志路径
     log_file = os.path.join(output_dir, "spider_debug.log")
-    if logger.hasHandlers():
-        logger.handlers.clear()
+    if logger.hasHandlers(): logger.handlers.clear()
     file_handler = FlushFileHandler(log_file, encoding="utf-8")
     file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
     logger.addHandler(file_handler)
@@ -513,57 +638,52 @@ def run_cost(input_csv: str, output_dir: str):
     cache_file = os.path.join(output_dir, "task_cache.csv")
     error_cache_file = os.path.join(output_dir, "error_cache.csv")  
 
-    print(f"  📦 正在加载输入表 {input_csv}...")
+    # 【核心修复1】每次运行强制覆盖重写双流缓存文件，放弃断点续传逻辑，保证全量重跑
+    with open(cache_file, 'w', encoding='utf-8-sig', newline='') as f: 
+        f.write("MSKU,最终采购成本\n")
+    with open(error_cache_file, 'w', encoding='utf-8-sig', newline='') as f: 
+        f.write("MSKU,原因\n")
+
+    print(f"  📦 加载输入表 {input_csv}...")
     try: df = pd.read_csv(input_csv, encoding='utf-8')
-    except UnicodeDecodeError: df = pd.read_csv(input_csv, encoding='gb18030')
+    except: df = pd.read_csv(input_csv, encoding='gb18030')
 
-    col_msku, col_status, col_local = df.columns[0], df.columns[1], df.columns[2]
-    out_of_stock_df = df[df[col_status] == '断货'].copy()
-    valid_df = df[(df[col_status] != '断货')].dropna(subset=[col_msku, col_local]).copy()
-    task_tuples = list(zip(valid_df[col_msku].astype(str), valid_df[col_local].astype(str)))
+    df.columns = df.columns.str.strip()
+    col_m, col_s, col_l = df.columns[0], df.columns[1], df.columns[2]
+    
+    df[col_m] = df[col_m].astype(str).str.strip()
+    df[col_s] = df[col_s].astype(str).str.strip()
+    df[col_l] = df[col_l].astype(str).str.strip()
+    df = df.replace({'nan': None, '': None})
 
-    already_done = set()
-    if os.path.exists(cache_file):
-        try:
-            cache_df = pd.read_csv(cache_file, header=0, dtype={'MSKU': str})
-            already_done = set(cache_df['MSKU'].tolist())
-        except Exception: pass
-        
-    if os.path.exists(error_cache_file):
-        try:
-            error_df = pd.read_csv(error_cache_file, header=0, dtype={'MSKU': str})
-            already_done.update(error_df['MSKU'].tolist())
-        except Exception: pass
+    out_of_stock_df = df[df[col_s] == '断货'].copy()
+    valid_df = df[(df[col_s] != '断货')].dropna(subset=[col_m, col_l]).copy()
+    
+    # 彻底清理掉 old_cache 判断机制，直接转换为待处理任务
+    pending_tasks = list(zip(valid_df[col_m], valid_df[col_l]))
 
     if not out_of_stock_df.empty:
-        if not os.path.exists(error_cache_file):
-            with open(error_cache_file, 'w', encoding='utf-8-sig', newline='') as f: f.write("MSKU,原因\n")
         with open(error_cache_file, 'a', encoding='utf-8-sig', newline='') as f:
-            for m in out_of_stock_df[col_msku].astype(str).tolist():
-                if m not in already_done:
-                    f.write(f"{m},断货\n")
-                    already_done.add(m)
+            for m in out_of_stock_df[col_m].tolist():
+                f.write(f"{m},断货\n")
 
-    pending_tasks = [(m, l) for m, l in task_tuples if m.strip() not in already_done]
-    print(f"  📊 待处理在售 SKU 数量: {len(pending_tasks)} 条\n")
+    print(f"  📊 待处理在售 SKU: {len(pending_tasks)} 条\n")
 
     if pending_tasks:
-        cookie_str, cMKey = get_cookie(output_dir)
-        if not cookie_str: return
-        try: 
-            asyncio.run(run_pipeline(pending_tasks, cookie_str, cMKey, already_done, cache_file, error_cache_file))
-        except KeyboardInterrupt: 
-            print("\n  ⚠️ 任务被手动中断，所有进度已安全刷入缓存！")
-        except Exception as e: 
-            logger.error(f"全局异常: {e}", exc_info=True)
+        main_session, amz_cookie_str, memcache_key = get_global_auth()
+        if main_session and amz_cookie_str:
+            try: 
+                asyncio.run(run_pipeline(pending_tasks, main_session, amz_cookie_str, memcache_key, cache_file, error_cache_file, output_dir))
+            except KeyboardInterrupt: 
+                print("\n  ⚠️ 任务手动中断，进度已安全保存！")
+            except Exception as e: 
+                # 【核心修复2】如果内部再发生阻断性崩溃，将其显式打印在控制台
+                print(f"\n  ❌ 流水线运行发生严重崩溃，任务已终止: {e} (详情见 spider_debug.log)")
+                logger.error(f"全局异常: {e}", exc_info=True)
 
-    print("\n  📝 正在生成最终报表...")
-    if os.path.exists(cache_file):
-        pd.read_csv(cache_file, header=0).to_csv(output_csv, index=False, encoding='utf-8-sig')
-    if os.path.exists(error_cache_file):
-        pd.read_csv(error_cache_file, header=0).to_csv(error_csv, index=False, encoding='utf-8-sig')
-        
-    print(f"  🎉 成本计算任务完毕！")
+    print("\n  📝 生成最终报表...")
+    if os.path.exists(cache_file): pd.read_csv(cache_file, header=0).to_csv(output_csv, index=False, encoding='utf-8-sig')
+    if os.path.exists(error_cache_file): pd.read_csv(error_cache_file, header=0).to_csv(error_csv, index=False, encoding='utf-8-sig')
+    print("  🎉 成本计算完毕！")
     
-    # 🎯 触发模板克隆拆分逻辑
     auto_split_to_excel(output_csv, chunk_size=5100)

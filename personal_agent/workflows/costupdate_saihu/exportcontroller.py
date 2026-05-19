@@ -5,11 +5,8 @@ from .msku_export import run_export
 from .cost import run_cost
 from .upload import run_upload
 
-# ==========================================
-# ⚙️ 账号配置 (后续也可移入 config.py 或 .env)
-# ==========================================
-SELLFOX_USERNAME = "18379067507"
-SELLFOX_PASSWORD = "Leixiuer@20260418"
+SELLFOX_USERNAME = os.environ.get("SELLFOX_USERNAME", "")
+SELLFOX_PASSWORD = os.environ.get("SELLFOX_PASSWORD", "")
 
 def main():
     # 【改造点】不再自己生成目录，直接使用总控分配的统一目录

@@ -10,8 +10,8 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
 # ================= 核心配置区 =================
-ACCOUNT = "18379067507"
-PASSWORD = "Leixiuer@20260418"
+ACCOUNT = os.environ.get("SELLFOX_USERNAME", "")
+PASSWORD = os.environ.get("SELLFOX_PASSWORD", "")
 
 # ================= 极简双轨制日志体系 =================
 class ConsoleFilter(logging.Filter):
