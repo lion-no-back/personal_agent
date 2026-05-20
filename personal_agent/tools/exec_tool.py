@@ -7,6 +7,8 @@ import time
 from typing import Callable, Optional
 
 from .types import ToolDef
+from ..guardrails.patterns import get_exec_denylist
+from ..guardrails.audit_logger import get_audit_logger
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +214,17 @@ def build_exec_tool() -> ToolDef:
         if not _is_allowed(command, allowlist):
             allowed_str = "、".join(f"`{p}`" for p in (allowlist or []))
             return f"Error: 命令被 Allowlist 拒绝，当前仅允许: {allowed_str}"
+
+        # ── L2 ExecPreGuard Denylist（subprocess 执行前拦截）──
+        for _dp, _dr in get_exec_denylist():
+            if _dp.search(command):
+                get_audit_logger().emit_blocked(
+                    layer="L2_ExecPreGuard",
+                    rule=_dr,
+                    raw_text=command,
+                    sanitized_preview=command[:80],
+                )
+                return f"Error: 命令被安全策略拦截（规则: {_dr}）。此操作不被允许。"
 
         # ── 环境变量净化 ──────────────────────────────────────
         sanitized_env = _sanitize_env(env)

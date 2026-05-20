@@ -15,6 +15,7 @@ from ..core.interaction_logger import InteractionLogger
 from ..core.llm_router import LLMRouter
 from ..core.request_scorer import RequestScorer
 from ..core.task_manager import TaskManager
+from ..guardrails import sanitize_output, sanitize_tool_result
 from ..tools import get_all_tools, get_tools_openai_schema
 
 logger = logging.getLogger(__name__)
@@ -212,7 +213,7 @@ class ConversationAgent(BaseAgent):
             # ── 4.7. 瞬态注入图片（首轮有图时转为多模态消息格式）─────
             # 图片不写入上下文历史，仅在当前轮携带，避免 token 膨胀
             event_images = getattr(event, "images", None)
-            if i == 1 and event_images and messages and messages[-1]["role"] == "user":
+            if i == 0 and event_images and messages and messages[-1]["role"] == "user":
                 last_msg = dict(messages[-1])
                 text = last_msg.get("content") or "请描述这张图片"
                 last_msg["content"] = [
@@ -296,6 +297,8 @@ class ConversationAgent(BaseAgent):
                             res = c_tool.call(**kwargs_dict)
                         except Exception as e:
                             res = f"Error: 执行工具 '{c_func_name}' 失败: {str(e)}"
+                    # ── L4 Tool Output Guard（写入 LLM context 前脱敏）─────
+                    res = sanitize_tool_result(c_func_name, res, session_key=session_key)
                     return {"name": c_func_name, "id": c_tc_id, "result": res, "args": log_args}
 
                 # 拼接并发提示
@@ -335,18 +338,21 @@ class ConversationAgent(BaseAgent):
                     ui_text_buffer += suggestion
                 if self._interaction_logger:
                     self._interaction_logger.log_final(session_key, ui_text_buffer)
+                # ── L5 Output Guard（推送给用户前脱敏）──────────
+                sanitized = sanitize_output(ui_text_buffer.strip(), session_key=session_key)
                 if on_update:
-                    on_update(ui_text_buffer.strip(), "done")
-                return ui_text_buffer
+                    on_update(sanitized, "done")
+                return sanitized
 
         timeout_msg = "\n\n> ⏰ 抱歉，经过多次尝试未能完成请求，请尝试重组您的问题。"
         ui_text_buffer += final_response + timeout_msg
         if self._interaction_logger:
             self._interaction_logger.log_final(session_key, ui_text_buffer)
+        sanitized = sanitize_output(ui_text_buffer.strip(), session_key=session_key)
         if on_update:
-            on_update(ui_text_buffer.strip(), "done")
+            on_update(sanitized, "done")
         self._context.add_message(session_key, "assistant", content=timeout_msg)
-        return ui_text_buffer
+        return sanitized
 
     # ──────────────────────────────────────────────────────────
     #   技能正文按需匹配

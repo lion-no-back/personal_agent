@@ -226,12 +226,16 @@ def main() -> None:
     task_manager = TaskManager()
     logger.info("✅ TaskManager 就绪")
 
-    # ── Step 5.5: 初始化交互日志记录器 ───────────────────────
+    # ── Step 5.5: 初始化日志记录器 ───────────────────────────
     from personal_agent.core.interaction_logger import InteractionLogger
+    from personal_agent.guardrails.audit_logger import GuardrailAuditLogger, set_audit_logger
 
     logs_dir = _PROJECT_ROOT / "logs"
     interaction_logger = InteractionLogger(log_dir=logs_dir)
     logger.info(f"✅ InteractionLogger 就绪 | 日志目录: {logs_dir}")
+
+    set_audit_logger(GuardrailAuditLogger(log_dir=logs_dir))
+    logger.info("✅ GuardrailAuditLogger 就绪 | path=%s", logs_dir / "guardrail_audit.jsonl")
 
     # ── Step 6: 初始化对话 Agent ─────────────────────────────
     # card_update_interval 读取 .env 中的 CARD_UPDATE_INTERVAL，默认 0.5s

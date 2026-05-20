@@ -37,6 +37,7 @@ from lark_oapi.api.im.v1 import (
 )
 
 from ..core.task_manager import TaskManager
+from ..guardrails import check_input
 
 logger = logging.getLogger(__name__)
 
@@ -907,6 +908,12 @@ class FeishuGateway:
 
     def _handle_async_body(self, event: "MessageEvent", session_key: str) -> None:
         """_handle_async 的实际执行体，在会话串行锁保护下运行。"""
+        # ── L1 Input Guard（LLM 调用前拦截）─────────────────────
+        _guard = check_input(event.content, session_key=session_key)
+        if not _guard.passed:
+            self._send_text_message(event.chat_id, _guard.user_message)
+            return
+
         stream_session: Optional[_StreamingCardSession] = None
         stream_sink: Optional[_CardStreamAsyncSink] = None
 

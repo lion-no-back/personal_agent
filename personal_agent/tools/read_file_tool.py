@@ -1,5 +1,8 @@
 import os
+
 from .types import ToolDef
+from ..guardrails.audit_logger import get_audit_logger
+from ..guardrails.patterns import is_blocked_path
 
 
 def build_read_file_tool() -> ToolDef:
@@ -8,8 +11,18 @@ def build_read_file_tool() -> ToolDef:
     def read_file_call(file_path: str, **kwargs) -> str:
         try:
             if not os.path.isabs(file_path):
-                # 假设基于当前工作目录，这里你也可以从环境中读取固定项目路径
                 file_path = os.path.abspath(file_path)
+
+            # ── L3 ReadFilePreGuard（open 前拦截敏感路径）────────
+            blocked_rule = is_blocked_path(file_path)
+            if blocked_rule:
+                get_audit_logger().emit_blocked(
+                    layer="L3_ReadFilePreGuard",
+                    rule=blocked_rule,
+                    raw_text=file_path,
+                    sanitized_preview=os.path.basename(file_path),
+                )
+                return "Error: 安全策略禁止读取此文件，请联系管理员。"
 
             if not os.path.exists(file_path):
                 return f"Error: 文件未找到，路径不存在 '{file_path}'"
