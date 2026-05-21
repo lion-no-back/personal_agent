@@ -77,12 +77,13 @@ class MessageEvent:
 #   卡片配置常量
 # ──────────────────────────────────────────────────────────────
 
-# 卡片标题与颜色主题：创建=思考中，首次输出前切到生成中，收尾=完成/出错
+# 卡片标题与颜色主题：创建=思考中，首次输出前切到生成中，收尾=完成/出错/取消
 _CARD_CONFIG = {
     "thinking": {"title": "🤔 思考中...", "color": "blue"},
     "generating": {"title": "⚡ 生成中...", "color": "turquoise"},
     "done": {"title": "✅ 完成", "color": "green"},
     "error": {"title": "❌ 出错了", "color": "red"},
+    "cancelled": {"title": "⛔ 已取消", "color": "grey"},
 }
 
 # 流式正文的 markdown 组件 element_id（需与创建卡片实体时的 JSON 一致）
@@ -96,6 +97,8 @@ class _StreamingCardSession:
     """一次回复对应的 CardKit 卡片实体与流式序号。"""
 
     card_id: str
+    task_id: str = ""
+    sender_open_id: str = ""
     sequence: int = 0
     last_pushed_markdown: str = ""
     header_is_generating: bool = False
@@ -147,6 +150,13 @@ class _CardStreamAsyncSink:
         if status in ("done", "error"):
             self._finished.wait(timeout=180)
 
+    def cancel(self) -> None:
+        """用户点击取消按钮时调用，将卡片更新为已取消状态。非阻塞返回。"""
+        with self._cv:
+            if self._end is None:
+                self._end = "cancelled"
+                self._cv.notify_all()
+
     def _loop(self) -> None:
         try:
             while True:
@@ -155,6 +165,12 @@ class _CardStreamAsyncSink:
                     et = self._end_text
                     latest = self._latest
                 if end is not None:
+                    if end == "cancelled":
+                        body_out = self._sess.last_pushed_markdown
+                        self._gw._card_stream_finalize_card(
+                            self._sess, "cancelled", body_out, last_content_delta_chars=0
+                        )
+                        return
                     final = et or latest
                     prev = self._sess.last_pushed_markdown
                     delta_chars = max(0, len(final) - len(prev)) if final else 0
@@ -233,6 +249,10 @@ class FeishuGateway:
         self._session_run_locks: dict[str, threading.Lock] = {}
         self._session_run_locks_guard = threading.Lock()
 
+        # 活跃任务的 sink 注册表，用于接收卡片取消信号（task_id → sink）
+        self._active_sinks: dict[str, "_CardStreamAsyncSink"] = {}
+        self._active_sinks_lock = threading.Lock()
+
         # ── API Client（主动调用）────────────────────────────
         self._api_client = (
             lark.Client.builder()
@@ -253,6 +273,8 @@ class FeishuGateway:
             # 已读回执：开放平台/应用若订阅了 im.message.message_read_v1，长连接会推送；
             # 未注册对应 processor 时 SDK 报 processor not found（与业务无关但必须接住）。
             .register_p2_im_message_message_read_v1(self._on_im_message_read_v1)
+            # 卡片取消按钮回调：需在飞书开发者后台订阅 card.action.trigger 事件
+            .register_p2_card_action_trigger(self._on_card_action_trigger)
             .build()
         )
 
@@ -377,9 +399,38 @@ class FeishuGateway:
         v = os.getenv("FEISHU_STREAM_ASYNC_FLUSH", "1").strip().lower()
         return v not in ("0", "false", "no", "off")
 
-    def _build_streaming_card_v2(self, status: str, body_markdown: str) -> dict:
+    def _build_streaming_card_v2(
+        self,
+        status: str,
+        body_markdown: str,
+        *,
+        task_id: str = "",
+        sender_open_id: str = "",
+    ) -> dict:
         cfg = _CARD_CONFIG.get(status, _CARD_CONFIG["done"])
         freq, step, strategy = self._read_streaming_render_params()
+        body_elements: list = [
+            {
+                "tag": "markdown",
+                "content": body_markdown,
+                "element_id": _STREAM_BODY_ELEMENT_ID,
+            }
+        ]
+        # 仅在流式进行中的状态显示取消按钮
+        if task_id and status in ("thinking", "generating"):
+            body_elements.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "⛔ 取消"},
+                "type": "danger",
+                "size": "small",
+                "behaviors": [{
+                    "type": "callback",
+                    "value": {
+                        "task_id": task_id,
+                        "sender_open_id": sender_open_id,
+                    },
+                }],
+            })
         return {
             "schema": "2.0",
             "config": {
@@ -410,13 +461,7 @@ class FeishuGateway:
                 "template": cfg["color"],
             },
             "body": {
-                "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": body_markdown,
-                        "element_id": _STREAM_BODY_ELEMENT_ID,
-                    }
-                ]
+                "elements": body_elements,
             },
         }
 
@@ -433,7 +478,12 @@ class FeishuGateway:
         if self._api_client.cardkit is None:
             return False
         inner = json.dumps(
-            self._build_streaming_card_v2(status_key, body_markdown),
+            self._build_streaming_card_v2(
+                status_key,
+                body_markdown,
+                task_id=session.task_id,
+                sender_open_id=session.sender_open_id,
+            ),
             ensure_ascii=False,
         )
         session.sequence += 1
@@ -482,11 +532,20 @@ class FeishuGateway:
         session.header_is_generating = True
         session.last_pushed_markdown = _STREAM_PLACEHOLDER_BODY
 
-    def _cardkit_create_entity(self, status: str, body_markdown: str) -> Optional[str]:
+    def _cardkit_create_entity(
+        self,
+        status: str,
+        body_markdown: str,
+        *,
+        task_id: str = "",
+        sender_open_id: str = "",
+    ) -> Optional[str]:
         if self._api_client.cardkit is None:
             logger.error("CardKit 服务不可用")
             return None
-        payload = self._build_streaming_card_v2(status, body_markdown)
+        payload = self._build_streaming_card_v2(
+            status, body_markdown, task_id=task_id, sender_open_id=sender_open_id
+        )
         inner = json.dumps(payload, ensure_ascii=False)
         try:
             req = (
@@ -712,11 +771,22 @@ class FeishuGateway:
                 last_content_delta_chars=delta,
             )
 
-    def _send_streaming_card_session(self, event: MessageEvent) -> Optional[_StreamingCardSession]:
+    def _send_streaming_card_session(
+        self,
+        event: MessageEvent,
+        *,
+        task_id: str = "",
+        sender_open_id: str = "",
+    ) -> Optional[_StreamingCardSession]:
         """
         创建流式卡片实体，并以回复消息方式发送 card_id（保持在原话题线程内）。
         """
-        card_id = self._cardkit_create_entity("thinking", _STREAM_PLACEHOLDER_BODY)
+        card_id = self._cardkit_create_entity(
+            "thinking",
+            _STREAM_PLACEHOLDER_BODY,
+            task_id=task_id,
+            sender_open_id=sender_open_id,
+        )
         if not card_id:
             return None
         reply_content = json.dumps(
@@ -745,7 +815,9 @@ class FeishuGateway:
                 )
                 return None
             logger.info("✉️ 流式卡片已发送 | card_id=%s", card_id)
-            return _StreamingCardSession(card_id=card_id)
+            return _StreamingCardSession(
+                card_id=card_id, task_id=task_id, sender_open_id=sender_open_id
+            )
         except Exception as e:
             logger.error("发送流式卡片消息异常 | error=%s", e, exc_info=True)
             return None
@@ -847,6 +919,65 @@ class FeishuGateway:
                 mids[:5] if mids else None,
             )
 
+    def _on_card_action_trigger(self, data):
+        """
+        卡片按钮点击回调（card.action.trigger）。
+        收到取消按钮点击后，立即设置取消信号，并异步更新卡片为已取消状态。
+        必须在 3 秒内返回，所以只做信号设置，卡片更新交给 sink 后台线程。
+        """
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+            CallBackToast,
+        )
+        try:
+            event = data.event if data else None
+            if not event or not event.action or not event.action.value:
+                return None
+
+            value = event.action.value
+            task_id: str = value.get("task_id", "")
+            expected_sender: str = value.get("sender_open_id", "")
+
+            clicker_open_id = ""
+            if event.operator:
+                clicker_open_id = event.operator.open_id or ""
+
+            # 仅允许发消息的人取消
+            if expected_sender and clicker_open_id != expected_sender:
+                resp = P2CardActionTriggerResponse()
+                resp.toast = CallBackToast()
+                resp.toast.type = "warning"
+                resp.toast.content = "只有发消息的人才能取消"
+                return resp
+
+            if not task_id:
+                return None
+
+            logger.info("⛔ 收到取消请求 | task_id=%s clicker=%s", task_id, clicker_open_id)
+
+            # 设置取消事件（通知 agent 循环退出）
+            if self._task_manager:
+                cancel_event = self._task_manager.get_cancel_event(task_id)
+                if cancel_event:
+                    cancel_event.set()
+
+            # 异步触发 sink 更新卡片为已取消（不阻塞回调）
+            with self._active_sinks_lock:
+                sink = self._active_sinks.get(task_id)
+            if sink:
+                t = threading.Thread(target=sink.cancel, daemon=True, name="cancel-sink")
+                t.start()
+
+            resp = P2CardActionTriggerResponse()
+            resp.toast = CallBackToast()
+            resp.toast.type = "info"
+            resp.toast.content = "已取消，请重新发送"
+            return resp
+
+        except Exception as e:
+            logger.error("处理卡片取消回调异常 | error=%s", e, exc_info=True)
+            return None
+
     def _on_message_receive(self, data: P2ImMessageReceiveV1) -> None:
         """
         飞书消息接收事件回调。
@@ -908,6 +1039,8 @@ class FeishuGateway:
 
     def _handle_async_body(self, event: "MessageEvent", session_key: str) -> None:
         """_handle_async 的实际执行体，在会话串行锁保护下运行。"""
+        from ..core.task_manager import TaskCancelledError
+
         # ── L1 Input Guard（LLM 调用前拦截）─────────────────────
         _guard = check_input(event.content, session_key=session_key)
         if not _guard.passed:
@@ -919,11 +1052,16 @@ class FeishuGateway:
 
         # ── 注册后台任务 ──────────────────────────────────────
         task_id: Optional[str] = None
+        cancel_event = None
         if self._task_manager is not None:
             task_id = self._task_manager.create(
                 session_key=session_key,
                 description=event.content[:50],
             )
+            cancel_event = self._task_manager.get_cancel_event(task_id)
+
+        # 保存上下文快照长度，取消时用于回滚
+        snapshot_len = self._context.get_history_length(session_key)
 
         try:
             # ── Step 0: 文件挂载/合并处理 ───────────────────────
@@ -962,7 +1100,11 @@ class FeishuGateway:
                     event.file_context = self._file_stash.build_file_context(event.attached_files)
 
             # ── Step 1: CardKit 创建流式卡片实体并回复 card_id ──
-            stream_session = self._send_streaming_card_session(event)
+            stream_session = self._send_streaming_card_session(
+                event,
+                task_id=task_id or "",
+                sender_open_id=event.sender_open_id,
+            )
             if not stream_session:
                 logger.error(
                     f"发送流式卡片失败，终止处理 | message_id={event.message_id}"
@@ -974,6 +1116,10 @@ class FeishuGateway:
             # ── Step 2: CardKit 刷新：默认异步，避免 LLM 被每次 HTTP 阻塞 ──
             if self._stream_async_flush_enabled():
                 stream_sink = _CardStreamAsyncSink(self, stream_session)
+                # 注册 sink 以便取消回调可找到它
+                if task_id:
+                    with self._active_sinks_lock:
+                        self._active_sinks[task_id] = stream_sink
 
                 def on_update(content: str, status: str) -> None:
                     stream_sink.feed(content, status)
@@ -990,11 +1136,18 @@ class FeishuGateway:
                 on_update=on_update,
                 stream_updates_sync_with_llm=True,
                 push_fn=push_fn,
+                cancel_event=cancel_event,
             )
 
             # ── Step 4: 标记任务完成 ──────────────────────────
             if task_id and self._task_manager:
                 self._task_manager.complete(task_id)
+
+        except TaskCancelledError:
+            logger.info("⛔ 任务已取消，回滚上下文 | task_id=%s session=%s", task_id, session_key)
+            self._context.rollback_to_length(session_key, snapshot_len)
+            if task_id and self._task_manager:
+                self._task_manager.cancel(task_id)
 
         except Exception as e:
             logger.error(
@@ -1014,6 +1167,12 @@ class FeishuGateway:
                 )
             if task_id and self._task_manager:
                 self._task_manager.fail(task_id, str(e))
+
+        finally:
+            # 无论结果如何，清除 sink 注册
+            if task_id:
+                with self._active_sinks_lock:
+                    self._active_sinks.pop(task_id, None)
 
     # ──────────────────────────────────────────────────────────
     #   事件解析与过滤

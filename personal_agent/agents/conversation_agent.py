@@ -14,7 +14,7 @@ from ..context.conversation_context import ConversationContext
 from ..core.interaction_logger import InteractionLogger
 from ..core.llm_router import LLMRouter
 from ..core.request_scorer import RequestScorer
-from ..core.task_manager import TaskManager
+from ..core.task_manager import TaskCancelledError, TaskManager
 from ..guardrails import sanitize_output, sanitize_tool_result
 from ..tools import get_all_tools, get_tools_openai_schema
 
@@ -134,6 +134,7 @@ class ConversationAgent(BaseAgent):
         *,
         stream_updates_sync_with_llm: bool = False,
         push_fn: Optional[Callable[[str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> str:
         """
         处理一条消息事件的完整链路：
@@ -255,7 +256,10 @@ class ConversationAgent(BaseAgent):
                 messages, custom_on_update, stream_updates_sync_with_llm,
                 tools=self._tools_schema,
                 task_type=task_type,
+                cancel_event=cancel_event,
             )
+            if cancel_event and cancel_event.is_set():
+                raise TaskCancelledError("任务已被用户取消")
             if self._interaction_logger:
                 self._interaction_logger.log_llm_response(session_key, i, full_response, tool_calls)
 
@@ -311,6 +315,9 @@ class ConversationAgent(BaseAgent):
                     futures = [executor.submit(execute_single_tool, tc) for tc in tool_calls]
                     for fut in concurrent.futures.as_completed(futures):
                         results_collected.append(fut.result())
+
+                if cancel_event and cancel_event.is_set():
+                    raise TaskCancelledError("任务已被用户取消")
 
                 for res in results_collected:
                     self._context.add_message(session_key, "tool", content=res["result"], tool_call_id=res["id"], name=res["name"])
@@ -625,6 +632,7 @@ class ConversationAgent(BaseAgent):
         stream_updates_sync_with_llm: bool = False,
         tools: Optional[list] = None,
         task_type: str = "default",
+        cancel_event: Optional[threading.Event] = None,
     ) -> tuple[str, Optional[list]]:
         """
         调用 LLM 流式接口，通过后台 flusher 线程解耦 token 消费与卡片刷新。
@@ -666,7 +674,11 @@ class ConversationAgent(BaseAgent):
             try:
                 full_response = ""
                 final_tool_calls = None
-                for _delta, accumulated, tcs in self._llm.think_stream(messages, tools=tools, task_type=task_type):
+                gen = self._llm.think_stream(messages, tools=tools, task_type=task_type)
+                for _delta, accumulated, tcs in gen:
+                    if cancel_event and cancel_event.is_set():
+                        gen.close()
+                        return full_response, None
                     full_response = accumulated
                     final_tool_calls = tcs
                     if accumulated:

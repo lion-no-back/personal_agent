@@ -17,10 +17,15 @@ from typing import Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+class TaskCancelledError(Exception):
+    """任务被用户主动取消时抛出，用于在 Agent 和 Gateway 之间传递取消信号。"""
+
+
 class TaskStatus(str, Enum):
     RUNNING = "running"
     DONE = "done"
     ERROR = "error"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -32,6 +37,7 @@ class Task:
     created_at: float = field(default_factory=time.monotonic)
     finished_at: Optional[float] = None
     error: Optional[str] = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
     @property
     def elapsed(self) -> float:
@@ -104,6 +110,22 @@ class TaskManager:
                 task.finished_at = time.monotonic()
                 logger.debug(f"❌ 任务失败 | {task_id} error={error[:50]}")
             self._trim()
+
+    def cancel(self, task_id: str) -> None:
+        """将任务标记为已取消。"""
+        with self._lock:
+            if task_id in self._tasks:
+                task = self._tasks[task_id]
+                task.status = TaskStatus.CANCELLED
+                task.finished_at = time.monotonic()
+                logger.debug("⛔ 任务已取消 | %s", task_id)
+            self._trim()
+
+    def get_cancel_event(self, task_id: str) -> Optional[threading.Event]:
+        """返回指定任务的取消事件对象，任务不存在时返回 None。"""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            return task.cancel_event if task else None
 
     # ──────────────────────────────────────────────
     #   读操作

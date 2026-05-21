@@ -165,6 +165,15 @@ class ConversationContext:
         session = self._get_session(session_key)
         return len(session)
 
+    def rollback_to_length(self, session_key: str, target_len: int) -> None:
+        """删除本轮追加的消息，将历史回滚到 target_len 条。用于取消时清理脏数据。"""
+        lock = self._get_session_lock(session_key)
+        session = self._get_session(session_key)
+        with lock:
+            while len(session) > target_len:
+                session.pop()
+        logger.info("🔙 上下文已回滚 | session=%s target_len=%d", session_key, target_len)
+
     def list_sessions(self) -> List[str]:
         """返回所有活跃会话的 session_key 列表。"""
         with self._global_lock:
