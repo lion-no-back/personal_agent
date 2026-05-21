@@ -4,6 +4,7 @@ import platform
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .types import ToolDef
@@ -29,6 +30,15 @@ _UNIX_DANGEROUS_ENV = frozenset({
 _DEFAULT_YIELD_MS: int = int(os.getenv("EXEC_YIELD_MS", "5000"))
 _DEFAULT_TIMEOUT: int = int(os.getenv("EXEC_TIMEOUT", "30"))
 _MAX_OUTPUT_CHARS: int = 8000
+
+
+@dataclass
+class CommandResult:
+    """后台命令执行结果，由 exec_tool 产出，由调用方负责格式化展示。"""
+    rc: int
+    stdout: str
+    stderr: str
+    command: str
 
 
 def _get_allowlist() -> Optional[list]:
@@ -116,15 +126,15 @@ def _extract_feishu_summary(stdout: str) -> Optional[str]:
     return None
 
 
-def _notify_complete(push_fn: Optional[Callable], result: str) -> None:
-    """发送后台命令完成通知，无 push_fn 时仅记录日志。"""
-    if push_fn:
-        try:
-            push_fn(f"🔔 **后台命令已完成**\n\n{result}")
-        except Exception as e:
-            logger.error("后台命令通知失败: %s", e)
-    else:
+def _push_safe(push_fn: Optional[Callable], result) -> None:
+    """安全调用 push_fn，result 可以是字符串或 CommandResult。"""
+    if not push_fn:
         logger.info("后台命令完成（无 push_fn，跳过飞书通知）")
+        return
+    try:
+        push_fn(result)
+    except Exception as e:
+        logger.error("后台命令通知失败: %s", e)
 
 
 def _spawn_background_watcher(
@@ -148,7 +158,6 @@ def _spawn_background_watcher(
         enc = _detect_encoding()
 
         if proc is None:
-            # 全新启动
             try:
                 _proc = subprocess.Popen(
                     command,
@@ -162,7 +171,7 @@ def _spawn_background_watcher(
                     errors="replace",
                 )
             except Exception as e:
-                _notify_complete(push_fn, f"**$ {command}**\n\nError: 启动进程失败 - {e}")
+                _push_safe(push_fn, CommandResult(rc=-1, stdout="", stderr=f"启动进程失败: {e}", command=command))
                 return
             wait_proc = _proc
         else:
@@ -177,15 +186,14 @@ def _spawn_background_watcher(
             rc = -1
             stderr = f"[后台超时: 总执行时间超过 {timeout:.0f}s]\n{stderr or ''}"
 
-        elapsed = time.monotonic() - t0
         stdout_str = stdout or ""
-        summary = _extract_feishu_summary(stdout_str)
-        if summary:
+        stderr_str = stderr or ""
+        feishu_line = _extract_feishu_summary(stdout_str)
+        if feishu_line:
             icon = "✅" if rc == 0 else "❌"
-            _notify_complete(push_fn, f"{icon} {summary}")
+            _push_safe(push_fn, f"{icon} {feishu_line}")
         else:
-            result = _format_result(command, rc, stdout_str, stderr or "", elapsed)
-            _notify_complete(push_fn, result)
+            _push_safe(push_fn, CommandResult(rc=rc, stdout=stdout_str, stderr=stderr_str, command=command))
 
     threading.Thread(target=_target, daemon=True, name="exec-bg").start()
 

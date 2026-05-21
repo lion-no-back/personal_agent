@@ -17,6 +17,7 @@ from ..core.request_scorer import RequestScorer
 from ..core.task_manager import TaskCancelledError, TaskManager
 from ..guardrails import sanitize_output, sanitize_tool_result
 from ..tools import get_all_tools, get_tools_openai_schema
+from ..tools.exec_tool import CommandResult
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +298,9 @@ class ConversationAgent(BaseAgent):
                             log_args = kwargs_dict.copy()
                             # 注入上下文供支持后台通知的工具（如 exec）使用
                             if push_fn is not None:
-                                kwargs_dict["_tool_ctx"] = {"push_fn": push_fn}
+                                kwargs_dict["_tool_ctx"] = {
+                                    "push_fn": self._make_exec_push_fn(push_fn),
+                                }
                             res = c_tool.call(**kwargs_dict)
                         except Exception as e:
                             res = f"Error: 执行工具 '{c_func_name}' 失败: {str(e)}"
@@ -602,6 +605,38 @@ class ConversationAgent(BaseAgent):
             )
 
         return "\n".join(lines)
+
+    # ──────────────────────────────────────────────────────────
+    #   后台命令结果格式化（agent 层统一负责，exec_tool 只产出数据）
+    # ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _format_command_result(result: CommandResult) -> str:
+        cmd_short = result.command.strip()[:40] + ("..." if len(result.command.strip()) > 40 else "")
+        if result.rc == 0:
+            last_line = next(
+                (l.strip() for l in reversed(result.stdout.splitlines()) if l.strip()), ""
+            )
+            detail = (last_line[:50] + ("..." if len(last_line) > 50 else "")) if last_line else ""
+            return f"🔔 ✅ `{cmd_short}` 执行成功" + (f"：{detail}" if detail else "")
+        raw_err = result.stderr.strip() or result.stdout.strip()
+        snippet = raw_err[:50] + ("..." if len(raw_err) > 50 else "")
+        return f"🔔 ❌ `{cmd_short}` 执行失败" + (f"，{snippet}" if snippet else "")
+
+    @staticmethod
+    def _make_exec_push_fn(push_fn: "Callable") -> "Callable":
+        """包装 push_fn：CommandResult 在 agent 层格式化为字符串，字符串直接透传。"""
+        def _push(result) -> None:
+            if isinstance(result, CommandResult):
+                try:
+                    msg = ConversationAgent._format_command_result(result)
+                except Exception as e:
+                    logger.warning("命令结果格式化失败: %s", e)
+                    msg = f"🔔 后台命令完成（rc={result.rc}）"
+                push_fn(msg)
+            else:
+                push_fn(result)
+        return _push
 
     # ──────────────────────────────────────────────────────────
     #   路由提示（边界区时附加在回复末尾）
