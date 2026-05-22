@@ -259,7 +259,16 @@ def main() -> None:
     )
     logger.info("✅ ConversationAgent 就绪")
 
-    # ── Step 6.5: 初始化文件暂存管理器 ───────────────────────
+    # ── Step 6.5: 初始化记忆模块 ─────────────────────────────
+    from personal_agent.memory import MemoryModule
+
+    memory_store_dir = _PROJECT_ROOT / os.getenv("MEMORY_STORE_DIR", "memory_store")
+    memory_module = MemoryModule(store_dir=memory_store_dir, llm=llm)
+    memory_module.start()
+    agent.set_memory(memory_module)
+    logger.info("✅ MemoryModule 就绪 | 存储目录: %s", memory_store_dir)
+
+    # ── Step 6.6: 初始化文件暂存管理器 ───────────────────────
     from personal_agent.core.file_stash import FileStash
 
     file_stash = FileStash(artifact_dir=_PROJECT_ROOT / "artifact")

@@ -16,6 +16,7 @@ from ..core.llm_router import LLMRouter
 from ..core.request_scorer import RequestScorer
 from ..core.task_manager import TaskCancelledError, TaskManager
 from ..guardrails import sanitize_output, sanitize_tool_result
+from ..memory import MemoryModule
 from ..tools import get_all_tools, get_tools_openai_schema
 from ..tools.exec_tool import CommandResult
 
@@ -33,6 +34,8 @@ _BUILTIN_COMMANDS = {
     "/resume": "列出所有历史会话；/resume <序号> 恢复指定会话上下文",
     "/export": "导出当前会话的完整对话记录",
     "/tasks": "查看后台任务处理状态",
+    "/remember": "主动记住某件事：/remember <内容>（默认写入经验记忆）",
+    "/memories": "查看当前用户的记忆内容",
 }
 
 _HELP_TEXT = (
@@ -105,6 +108,7 @@ class ConversationAgent(BaseAgent):
         self._interaction_logger = interaction_logger
         self._skill_bodies: dict = skill_bodies or {}
         self._scorer = scorer
+        self._memory: Optional[MemoryModule] = None
         self._card_update_interval = card_update_interval or float(
             os.getenv("CARD_UPDATE_INTERVAL", "0.3")
         )
@@ -123,6 +127,11 @@ class ConversationAgent(BaseAgent):
             f"已加载 {len(self._tool_list)} 个外挂工具 | "
             f"已注册 {len(self._skill_bodies)} 个技能文档（按需注入）"
         )
+
+    def set_memory(self, memory: MemoryModule) -> None:
+        """注入记忆模块（main.py 初始化完成后调用）。"""
+        self._memory = memory
+        logger.info("✅ MemoryModule 已接入 ConversationAgent")
 
     # ──────────────────────────────────────────────────────────
     #   BaseAgent 实现
@@ -166,7 +175,7 @@ class ConversationAgent(BaseAgent):
             self._interaction_logger.log_session_start(session_key, event.content)
 
         # ── 2. 内置指令拦截 ──────────────────────────────────
-        command_response = self._handle_command(event.content, session_key)
+        command_response = self._handle_command(event.content, session_key, event.sender_open_id)
         if command_response is not None:
             # 指令直接返回，不走 LLM，也不写入上下文历史
             if on_update:
@@ -175,6 +184,12 @@ class ConversationAgent(BaseAgent):
 
         # ── 3. 写入用户消息到上下文 ──────────────────────────
         self._context.add_message(session_key, "user", event.content)
+
+        # ── 3.5. 预取记忆块（仅读文件，不阻塞） ─────────────
+        user_id = event.sender_open_id
+        memory_block = ""
+        if self._memory:
+            memory_block = self._memory.retriever.build_memory_block(user_id)
 
         final_response = ""
         ui_text_buffer = ""  # UI历史累计区，确保多轮迭代输出不会覆写先前的文字
@@ -193,14 +208,21 @@ class ConversationAgent(BaseAgent):
             # ── 4. 组装完整 messages（含历史） ───────────────────
             messages = self._context.get_messages(session_key)
             
-            # ── 4.5. 瞬态注入文件上下文 ─────
+            # ── 4.5. 瞬态注入记忆块到 system message ────────────
+            if memory_block and messages:
+                messages[0] = {
+                    "role": "system",
+                    "content": messages[0]["content"] + "\n\n" + memory_block,
+                }
+
+            # ── 4.6. 瞬态注入文件上下文 ─────
             file_ctx = getattr(event, "file_context", None)
             if file_ctx and messages and messages[-1]["role"] == "user":
                 last_msg = dict(messages[-1])
                 last_msg["content"] = f"{file_ctx}\n\n[用户请求]\n{last_msg['content']}"
                 messages[-1] = last_msg
 
-            # ── 4.6. 瞬态注入技能完整文档（仅首轮、非定时任务时触发一次）─────
+            # ── 4.7. 瞬态注入技能完整文档（仅首轮、非定时任务时触发一次）─────
             # i==0：工具调用后续轮不重复识别；is_scheduled：定时任务 prompt 已知，跳过
             skill_body = (
                 self._resolve_skill_body(event.content)
@@ -212,7 +234,7 @@ class ConversationAgent(BaseAgent):
                 last_msg["content"] = f"【当前技能完整文档】\n{skill_body}\n\n{last_msg['content']}"
                 messages[-1] = last_msg
 
-            # ── 4.7. 瞬态注入图片（首轮有图时转为多模态消息格式）─────
+            # ── 4.8. 瞬态注入图片（首轮有图时转为多模态消息格式）─────
             # 图片不写入上下文历史，仅在当前轮携带，避免 token 膨胀
             event_images = getattr(event, "images", None)
             if i == 0 and event_images and messages and messages[-1]["role"] == "user":
@@ -352,6 +374,11 @@ class ConversationAgent(BaseAgent):
                 sanitized = sanitize_output(ui_text_buffer.strip(), session_key=session_key)
                 if on_update:
                     on_update(sanitized, "done")
+                # ── 记忆异步抽取（后台，不阻塞回复） ────────────
+                if self._memory:
+                    self._memory.extractor.extract_async(
+                        user_id, self._context.get_messages(session_key)
+                    )
                 return sanitized
 
         timeout_msg = "\n\n> ⏰ 抱歉，经过多次尝试未能完成请求，请尝试重组您的问题。"
@@ -408,7 +435,7 @@ class ConversationAgent(BaseAgent):
     #   内置指令处理
     # ──────────────────────────────────────────────────────────
 
-    def _handle_command(self, text: str, session_key: str) -> Optional[str]:
+    def _handle_command(self, text: str, session_key: str, sender_open_id: Optional[str] = None) -> Optional[str]:
         """
         识别并执行内置指令，支持带参数的指令（如 /resume 2）。
 
@@ -463,6 +490,14 @@ class ConversationAgent(BaseAgent):
         # ── /tasks ────────────────────────────────────────────
         if cmd == "/tasks":
             return self._cmd_tasks()
+
+        # ── /remember ─────────────────────────────────────────
+        if cmd == "/remember":
+            return self._cmd_remember(sender_open_id, args)
+
+        # ── /memories ─────────────────────────────────────────
+        if cmd == "/memories":
+            return self._cmd_memories(sender_open_id)
 
         return None  # 不是内置指令，正常走 LLM
 
@@ -605,6 +640,45 @@ class ConversationAgent(BaseAgent):
             )
 
         return "\n".join(lines)
+
+    # ──────────────────────────────────────────────────────────
+    #   /remember 实现
+    # ──────────────────────────────────────────────────────────
+
+    def _cmd_remember(self, user_id: Optional[str], content: str) -> str:
+        if not content:
+            return (
+                "⚠️ 请告诉我要记住什么内容。\n\n"
+                "用法：`/remember <内容>`\n"
+                "例如：`/remember exec 马帮脚本必须先 cd 到 scripts/ 目录`"
+            )
+        if not self._memory:
+            return "⚠️ 记忆模块未启用，无法保存。"
+        if not user_id:
+            return "⚠️ 无法识别用户身份，无法保存记忆。"
+
+        self._memory.extractor.save_direct(user_id, content)
+        return f"✅ **已记住**\n\n> {content}\n\n（已写入经验记忆，下次对话时自动带入）"
+
+    # ──────────────────────────────────────────────────────────
+    #   /memories 实现
+    # ──────────────────────────────────────────────────────────
+
+    def _cmd_memories(self, user_id: Optional[str]) -> str:
+        if not self._memory:
+            return "⚠️ 记忆模块未启用。"
+        if not user_id:
+            return "⚠️ 无法识别用户身份，无法读取记忆。"
+
+        block = self._memory.retriever.build_memory_block(user_id)
+        if not block:
+            return "📭 当前没有任何记忆内容，继续对话后会自动积累。"
+
+        content = re.sub(r"</?user_memory>\n?", "", block).strip()
+        MAX_LEN = 3500
+        if len(content) > MAX_LEN:
+            content = content[:MAX_LEN] + f"\n\n> ⚠️ 内容过长，已截断（共 {len(content)} 字符）"
+        return f"**🧠 当前记忆内容**\n\n{content}"
 
     # ──────────────────────────────────────────────────────────
     #   后台命令结果格式化（agent 层统一负责，exec_tool 只产出数据）
