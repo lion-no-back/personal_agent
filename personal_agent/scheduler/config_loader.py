@@ -54,6 +54,8 @@ class CronJobConfig:
     # 持久化补跑
     misfire_catchup: bool = False  # True=重启后检测是否有错过的触发并补跑一次
     misfire_grace_time: Optional[int] = None  # 补跑窗口（秒）；None=使用全局默认值
+    max_retries: int = 0           # 失败后最多重试几次（仅 Exception，超时不重试）
+    retry_delay: float = 60.0      # 每次重试前等待秒数
 
 
 @dataclass

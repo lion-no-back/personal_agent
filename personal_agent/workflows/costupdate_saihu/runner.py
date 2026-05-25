@@ -18,18 +18,22 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-_DEPS_SENTINEL = "ddddocr"   # 该包不在主项目依赖中，用作安装状态哨兵
 _DEP_GROUP = "costupdate-saihu"
+# 多包检查：任一缺失都触发 uv sync，防止单哨兵在部分安装时误判
+_CHECK_PACKAGES = ["ddddocr", "pandas", "openpyxl"]
 
 
 def _ensure_deps() -> None:
-    """检查 workflow 依赖是否已安装，未安装时自动执行 uv sync --group。"""
-    if importlib.util.find_spec(_DEPS_SENTINEL) is not None:
+    """检查 workflow 依赖是否齐全，有缺失时自动执行 uv sync --group。"""
+    missing = [p for p in _CHECK_PACKAGES if importlib.util.find_spec(p) is None]
+    if not missing:
         return
 
     uv = shutil.which("uv") or "uv"
     logger.info(
-        "[costupdate_saihu] 首次运行，正在安装依赖组 %s，请稍候...", _DEP_GROUP
+        "[costupdate_saihu] 缺少依赖 %s，正在安装依赖组 %s，请稍候...",
+        missing,
+        _DEP_GROUP,
     )
     try:
         subprocess.run(
@@ -48,24 +52,17 @@ def run() -> str:
     _REQUIRED = ("MABANG_USERNAME", "MABANG_PASSWORD", "SELLFOX_USERNAME", "SELLFOX_PASSWORD")
     missing = [k for k in _REQUIRED if not os.environ.get(k)]
     if missing:
-        return f"❌ 缺少必要凭证，请在设置中配置后重启 Agent：{', '.join(missing)}"
+        raise RuntimeError(f"缺少必要凭证，请在设置中配置后重启 Agent：{', '.join(missing)}")
 
     _ensure_deps()
 
     from . import mian_controller
 
     start = datetime.now()
-    try:
-        mian_controller.main()
-        elapsed = int((datetime.now() - start).total_seconds())
-        return (
-            f"✅ 赛狐成本每周更新完成\n"
-            f"耗时: {elapsed}s\n"
-            f"时间: {start.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-    except Exception as exc:
-        return (
-            f"❌ 赛狐成本每周更新失败\n"
-            f"错误: {exc}\n"
-            f"时间: {start.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
+    mian_controller.main()
+    elapsed = int((datetime.now() - start).total_seconds())
+    return (
+        f"✅ 赛狐成本每周更新完成\n"
+        f"耗时: {elapsed}s\n"
+        f"时间: {start.strftime('%Y-%m-%d %H:%M:%S')}"
+    )

@@ -63,6 +63,8 @@ class WorkflowRegistry:
                     timeout=float(meta.timeout),
                     deliver_to=meta.deliver_to,
                     misfire_catchup=meta.misfire_catchup,
+                    max_retries=meta.max_retries,
+                    retry_delay=meta.retry_delay,
                 )
             )
         logger.info("[WorkflowRegistry] 发现 %d 个定时 workflow", len(jobs))

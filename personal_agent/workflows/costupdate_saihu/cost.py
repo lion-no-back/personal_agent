@@ -591,8 +591,8 @@ async def run_pipeline(task_list, main_session, amz_cookie_str, memcache_key, ca
 def auto_split_to_excel(csv_path, chunk_size=9900):
     if not os.path.exists(csv_path): return
     output_dir = os.path.dirname(csv_path)
-    template_path = "成本导入模板.xlsx"
-    
+    template_path = os.path.join(os.path.dirname(__file__), "成本导入模板.xlsx")
+
     print(f"\n  ✂️ 开始拆分为直接可上传的 Excel (每份 {chunk_size} 条)...")
     if not os.path.exists(template_path):
          print("  ❌ 找不到模板文件，跳过拆分。")

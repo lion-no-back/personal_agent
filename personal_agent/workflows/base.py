@@ -21,5 +21,7 @@ class WorkflowMeta:
     timeout: int = 1800             # 单次执行超时（秒）
     deliver_to: str = ""            # 飞书 ID（ou_xxx / oc_xxx），空 = 仅写日志
     misfire_catchup: bool = False   # 重启后是否补跑错过的触发
+    max_retries: int = 0            # 失败后最多重试几次（仅 Exception，超时不重试）
+    retry_delay: float = 60.0       # 每次重试前等待秒数
     # 按需执行（预留，定时类型无需填写）
     intent_triggers: list[str] = field(default_factory=list)

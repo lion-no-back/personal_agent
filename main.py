@@ -12,6 +12,7 @@ PersonalAgent 启动入口
 """
 
 import logging
+import logging.handlers
 import os
 import sys
 from pathlib import Path
@@ -31,12 +32,27 @@ def setup_logging() -> None:
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
 
+    _fmt = "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+    _datefmt = "%Y-%m-%d %H:%M:%S"
+
     logging.basicConfig(
         level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        format=_fmt,
+        datefmt=_datefmt,
         stream=sys.stdout,
     )
+
+    _log_dir = _PROJECT_ROOT / "logs" / "app"
+    _log_dir.mkdir(parents=True, exist_ok=True)
+    _file_handler = logging.handlers.RotatingFileHandler(
+        _log_dir / "agent.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=10,
+        encoding="utf-8",
+    )
+    _file_handler.setLevel(level)
+    _file_handler.setFormatter(logging.Formatter(_fmt, datefmt=_datefmt))
+    logging.getLogger().addHandler(_file_handler)
 
     # 降低第三方库的日志噪音
     logging.getLogger("httpx").setLevel(logging.WARNING)

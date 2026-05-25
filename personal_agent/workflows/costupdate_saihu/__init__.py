@@ -8,5 +8,7 @@ WORKFLOW_META = WorkflowMeta(
     timeout=1800,
     deliver_to="ou_df92a89ee7a6c632ec7a210a7f25e707",
     misfire_catchup=True,
+    max_retries=2,
+    retry_delay=300,
     # intent_triggers 不填，此为纯定时 workflow
 )

@@ -45,6 +45,7 @@ def _wrap_job(
     inner: Callable[[], "asyncio.Coroutine"],
     lock: asyncio.Lock,
     persistence: "Optional[JobPersistence]" = None,
+    notify_fn: Optional[Callable[[str, str], None]] = None,
 ) -> Callable[[], "asyncio.Coroutine"]:
     """
     统一执行器包装：
@@ -70,37 +71,117 @@ def _wrap_job(
                 job_config.name,
                 job_config.schedule,
             )
-            t0 = time.monotonic()
-            try:
-                await asyncio.wait_for(inner(), timeout=job_config.timeout)
-                logger.info(
-                    "[cron:%s] 执行完成 | elapsed=%.1fs",
-                    job_config.id,
-                    time.monotonic() - t0,
-                )
+            max_attempts = job_config.max_retries + 1
+            for attempt_num in range(1, max_attempts + 1):
+                if attempt_num > 1:
+                    logger.info(
+                        "[cron:%s] 第 %d/%d 次重试 | delay=%.0fs",
+                        job_config.id,
+                        attempt_num,
+                        max_attempts,
+                        job_config.retry_delay,
+                    )
+                    await asyncio.sleep(job_config.retry_delay)
+
+                _ts = datetime.now().strftime("%H:%M:%S")
+                if attempt_num == 1:
+                    print(f"\n[{_ts}] ▶ 定时任务启动: {job_config.name} (id={job_config.id})", flush=True)
+                else:
+                    print(f"\n[{_ts}] ↩ 定时任务重试: {job_config.name} ({attempt_num}/{max_attempts})", flush=True)
+
+                attempt_id: int | None = None
                 if persistence is not None:
-                    persistence.record_run(job_config.id)
-            except asyncio.TimeoutError:
-                logger.error(
-                    "[cron:%s] 执行超时 | timeout=%.0fs",
-                    job_config.id,
-                    job_config.timeout,
-                )
-            except Exception:
-                logger.exception(
-                    "[cron:%s] 执行异常 | name=%s",
-                    job_config.id,
-                    job_config.name,
-                )
+                    attempt_id = persistence.record_attempt_start(job_config.id, attempt_num)
+
+                t0 = time.monotonic()
+                is_final = attempt_num == max_attempts
+
+                try:
+                    await asyncio.wait_for(inner(), timeout=job_config.timeout)
+                    elapsed = time.monotonic() - t0
+                    logger.info(
+                        "[cron:%s] 执行完成 | attempt=%d elapsed=%.1fs",
+                        job_config.id,
+                        attempt_num,
+                        elapsed,
+                    )
+                    if persistence is not None:
+                        persistence.record_run(job_config.id)
+                        if attempt_id is not None:
+                            persistence.record_attempt_end(attempt_id, "success", elapsed)
+                    return
+
+                except asyncio.TimeoutError:
+                    elapsed = time.monotonic() - t0
+                    logger.error(
+                        "[cron:%s] 执行超时 | timeout=%.0fs attempt=%d",
+                        job_config.id,
+                        job_config.timeout,
+                        attempt_num,
+                    )
+                    if persistence is not None and attempt_id is not None:
+                        persistence.record_attempt_end(attempt_id, "timeout", elapsed)
+                    # 超时不重试：线程仍在运行，重试会并发冲突
+                    if notify_fn and _is_valid_receive_id(job_config.deliver_to):
+                        try:
+                            notify_fn(
+                                job_config.deliver_to,
+                                f"⏰ {job_config.name} 执行超时（>{job_config.timeout:.0f}s）",
+                            )
+                        except Exception:
+                            logger.exception("[cron:%s] 超时通知投递失败", job_config.id)
+                    return
+
+                except Exception:
+                    elapsed = time.monotonic() - t0
+                    logger.exception(
+                        "[cron:%s] 执行异常 | name=%s attempt=%d/%d",
+                        job_config.id,
+                        job_config.name,
+                        attempt_num,
+                        max_attempts,
+                    )
+                    if persistence is not None and attempt_id is not None:
+                        persistence.record_attempt_end(attempt_id, "error", elapsed)
+                    if is_final:
+                        if notify_fn and _is_valid_receive_id(job_config.deliver_to):
+                            try:
+                                retry_info = (
+                                    f"，已重试 {job_config.max_retries} 次"
+                                    if job_config.max_retries > 0
+                                    else ""
+                                )
+                                notify_fn(
+                                    job_config.deliver_to,
+                                    f"❌ {job_config.name} 执行失败{retry_info}",
+                                )
+                            except Exception:
+                                logger.exception("[cron:%s] 失败通知投递失败", job_config.id)
 
     return wrapped
+
+
+def _convert_dow(dow: str) -> str:
+    """
+    将标准 cron 的 day_of_week 值转换为 APScheduler 约定。
+
+    标准 cron: 0/7=Sun  1=Mon  2=Tue  3=Wed  4=Thu  5=Fri  6=Sat
+    APScheduler: 0=Mon  1=Tue  2=Wed  3=Thu  4=Fri  5=Sat  6=Sun
+
+    转换公式（数字）: apscheduler_dow = (standard_dow - 1) % 7
+    非数字值（*, mon, tue, ... 或范围表达式）直接透传。
+    """
+    if dow in ("*", "?") or not dow.isdigit():
+        return dow
+    return str((int(dow) - 1) % 7)
 
 
 def _parse_cron(schedule: str) -> dict:
     """
     将标准 5 字段 cron 表达式解析为 APScheduler CronTrigger 关键字参数。
 
-    例：'0 9 * * *' → {'minute': '0', 'hour': '9', 'day': '*', 'month': '*', 'day_of_week': '*'}
+    例：'0 9 * * 1' → {'minute': '0', 'hour': '9', 'day': '*', 'month': '*', 'day_of_week': '0'}
+    注意：day_of_week 经过标准 cron → APScheduler 约定转换（见 _convert_dow）。
     """
     parts = schedule.strip().split()
     if len(parts) != 5:
@@ -113,7 +194,7 @@ def _parse_cron(schedule: str) -> dict:
         hour=hour,
         day=day,
         month=month,
-        day_of_week=day_of_week,
+        day_of_week=_convert_dow(day_of_week),
     )
 
 
@@ -166,7 +247,7 @@ class CronEngine:
             self._locks[job_cfg.id] = lock
 
             inner = self._make_inner(job_cfg)
-            wrapped = _wrap_job(job_cfg, inner, lock, self._persistence)
+            wrapped = _wrap_job(job_cfg, inner, lock, self._persistence, self._notify_fn)
 
             try:
                 cron_kwargs = _parse_cron(job_cfg.schedule)
@@ -233,24 +314,13 @@ class CronEngine:
 
     def _check_catchup_for_job(self, job_cfg: CronJobConfig, now: datetime) -> None:
         """
-        检查 job_cfg 是否在上次执行后漏过了至少一次触发。
-        若是，且漏过时间在补跑窗口内，则立即创建一次补跑任务。
+        检查 job_cfg 是否漏过了触发，若是则立即补跑一次。
 
-        逻辑：
-          1. 从 persistence 读取 last_run；若无记录则跳过（无历史基准）。
-          2. 用 CronTrigger 计算 last_run 之后的下一个预期触发时间 next_expected。
-          3. 若 next_expected < now，说明至少漏过一次触发。
-          4. 检查漏过时间是否在 misfire_grace_time 内；超出则仅记录警告，不补跑。
-          5. 在 grace 内则 asyncio.create_task 立即执行一次（coalesce 语义：只补一次）。
+        两种路径：
+          - last_run 存在：计算 last_run 之后的下一个触发点，在 grace 窗口内则补跑。
+          - last_run 为 None（首次运行）：在 grace 窗口内查找最近触发点，找到则补跑。
         """
         assert self._persistence is not None
-
-        last_run = self._persistence.get_last_run(job_cfg.id)
-        if last_run is None:
-            logger.debug(
-                "[cron:%s] 无历史执行记录，跳过补跑检测", job_cfg.id
-            )
-            return
 
         try:
             cron_kwargs = _parse_cron(job_cfg.schedule)
@@ -258,47 +328,54 @@ class CronEngine:
             return
 
         trigger = CronTrigger(**cron_kwargs, timezone=self._timezone)
-
-        # get_next_fire_time(previous, now) 返回 >= now 的下一个触发时间。
-        # 传入 now=last_run + 1μs 让它返回"last_run 之后的第一个触发时间"。
-        probe = last_run + timedelta(microseconds=1)
-        next_expected = trigger.get_next_fire_time(last_run, probe)
-
-        if next_expected is None or next_expected >= now:
-            logger.debug(
-                "[cron:%s] 无需补跑 | next_expected=%s",
-                job_cfg.id,
-                next_expected,
-            )
-            return
-
-        missed_seconds = (now - next_expected).total_seconds()
         grace = (
             job_cfg.misfire_grace_time
             if job_cfg.misfire_grace_time is not None
             else self._default_grace
         )
 
-        if missed_seconds > grace:
-            logger.warning(
-                "[cron:%s] 错过触发超出补跑窗口，放弃补跑 | missed_at=%s age=%.0fs grace=%ds",
-                job_cfg.id,
-                next_expected.isoformat(),
-                missed_seconds,
-                grace,
-            )
-            return
+        last_run = self._persistence.get_last_run(job_cfg.id)
 
-        logger.info(
-            "[cron:%s] 检测到重启补跑 | missed_at=%s age=%.0fs，立即补跑一次",
-            job_cfg.id,
-            next_expected.isoformat(),
-            missed_seconds,
-        )
+        if last_run is None:
+            # 首次运行：向前推 grace 秒，看窗口内有没有应触发的点
+            probe = now - timedelta(seconds=grace)
+            missed_at = trigger.get_next_fire_time(None, probe)
+            if missed_at is None or missed_at >= now:
+                logger.debug("[cron:%s] 首次运行，grace 窗口内无触发点，跳过", job_cfg.id)
+                return
+            logger.info(
+                "[cron:%s] 首次运行补跑 | missed_at=%s age=%.0fs",
+                job_cfg.id,
+                missed_at.isoformat(),
+                (now - missed_at).total_seconds(),
+            )
+        else:
+            # 常规补跑：last_run 之后有没有漏触发
+            probe = last_run + timedelta(microseconds=1)
+            missed_at = trigger.get_next_fire_time(last_run, probe)
+            if missed_at is None or missed_at >= now:
+                logger.debug("[cron:%s] 无需补跑 | next_expected=%s", job_cfg.id, missed_at)
+                return
+            missed_seconds = (now - missed_at).total_seconds()
+            if missed_seconds > grace:
+                logger.warning(
+                    "[cron:%s] 错过触发超出补跑窗口，放弃补跑 | missed_at=%s age=%.0fs grace=%ds",
+                    job_cfg.id,
+                    missed_at.isoformat(),
+                    missed_seconds,
+                    grace,
+                )
+                return
+            logger.info(
+                "[cron:%s] 检测到重启补跑 | missed_at=%s age=%.0fs，立即补跑一次",
+                job_cfg.id,
+                missed_at.isoformat(),
+                missed_seconds,
+            )
 
         lock = self._locks[job_cfg.id]
         inner = self._make_inner(job_cfg)
-        wrapped = _wrap_job(job_cfg, inner, lock, self._persistence)
+        wrapped = _wrap_job(job_cfg, inner, lock, self._persistence, self._notify_fn)
         asyncio.create_task(wrapped(), name=f"catchup-{job_cfg.id}")
 
     # ──────────────────────────────────────────────────────────
@@ -382,8 +459,8 @@ class CronEngine:
     def _make_python_function(self, job_cfg: CronJobConfig):
         """构造 python_function 类型的 inner 协程函数。
 
-        执行后若函数返回字符串且 deliver_to 已配置，则通过 notify_fn 投递飞书消息。
-        异常同样会被捕获并格式化为错误消息投递。
+        成功时若返回字符串且 deliver_to 已配置，则通过 notify_fn 投递飞书消息。
+        异常向外传播，由 _wrap_job 负责重试和最终失败通知。
         """
 
         async def inner() -> None:
@@ -403,16 +480,11 @@ class CronEngine:
                 )
                 return
 
-            result: object = None
-            try:
-                if asyncio.iscoroutinefunction(fn):
-                    result = await fn()
-                else:
-                    loop = asyncio.get_running_loop()
-                    result = await loop.run_in_executor(None, fn)
-            except Exception as exc:
-                result = f"❌ {job_cfg.name} 执行失败\n{exc}"
-                logger.exception("[cron:%s] 执行异常", job_cfg.id)
+            if asyncio.iscoroutinefunction(fn):
+                result = await fn()
+            else:
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(None, fn)
 
             if job_cfg.deliver_to and self._notify_fn and isinstance(result, str):
                 try:
