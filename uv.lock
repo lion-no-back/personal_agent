@@ -1200,6 +1200,11 @@ costupdate-saihu = [
     { name = "python-calamine" },
     { name = "tqdm" },
 ]
+zxwarn-mabang = [
+    { name = "openpyxl" },
+    { name = "pandas" },
+    { name = "python-calamine" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1230,6 +1235,11 @@ costupdate-saihu = [
     { name = "pycryptodome", specifier = ">=3.20" },
     { name = "python-calamine", specifier = ">=0.2" },
     { name = "tqdm", specifier = ">=4.66" },
+]
+zxwarn-mabang = [
+    { name = "openpyxl", specifier = ">=3.1" },
+    { name = "pandas", specifier = ">=2.0" },
+    { name = "python-calamine", specifier = ">=0.2" },
 ]
 
 [[package]]

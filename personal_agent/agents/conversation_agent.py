@@ -91,6 +91,8 @@ class ConversationAgent(BaseAgent):
         interaction_logger: Optional[InteractionLogger] = None,
         skill_bodies: Optional[dict] = None,
         scorer: Optional[RequestScorer] = None,
+        notify_fn: Optional[Callable[[str, str], None]] = None,
+        send_file_fn: Optional[Callable[[str, str, str], None]] = None,
     ):
         """
         Args:
@@ -109,6 +111,9 @@ class ConversationAgent(BaseAgent):
         self._skill_bodies: dict = skill_bodies or {}
         self._scorer = scorer
         self._memory: Optional[MemoryModule] = None
+        self._notify_fn = notify_fn
+        self._send_file_fn = send_file_fn
+        self._ondemand_workflows: Optional[list] = None  # lazy-loaded
         self._card_update_interval = card_update_interval or float(
             os.getenv("CARD_UPDATE_INTERVAL", "0.3")
         )
@@ -181,6 +186,11 @@ class ConversationAgent(BaseAgent):
             if on_update:
                 on_update(command_response, "done")
             return command_response
+
+        # ── 2.5. 按需 Workflow 意图匹配 ──────────────────────
+        ondemand_ack = self._check_ondemand_workflow(event, session_key, on_update)
+        if ondemand_ack is not None:
+            return ondemand_ack
 
         # ── 3. 写入用户消息到上下文 ──────────────────────────
         self._context.add_message(session_key, "user", event.content)
@@ -390,6 +400,89 @@ class ConversationAgent(BaseAgent):
             on_update(sanitized, "done")
         self._context.add_message(session_key, "assistant", content=timeout_msg)
         return sanitized
+
+    # ──────────────────────────────────────────────────────────
+    #   按需 Workflow 意图触发
+    # ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _derive_delivery_key(event) -> str:
+        """从任意平台的 event 推导 gateway-compatible 投递 key。"""
+        chat_id = getattr(event, "chat_id", "")
+        sender_id = getattr(event, "sender_open_id", "")
+        chat_type = getattr(event, "chat_type", "p2p")
+
+        if chat_id.startswith("dingtalk_"):
+            if chat_type == "group":
+                return f"dingtalk:group:{chat_id[len('dingtalk_'):]}"
+            else:
+                return f"dingtalk:user:{sender_id[len('dingtalk_'):]}"
+        else:
+            # 飞书：raw ID 兼容 send_text
+            return chat_id if chat_type == "group" else sender_id
+
+    def _get_ondemand_workflows(self) -> list:
+        """懒加载按需 workflow 列表（首次调用时扫描注册表）。"""
+        if self._ondemand_workflows is None:
+            try:
+                from ..workflows import WorkflowRegistry
+                self._ondemand_workflows = WorkflowRegistry().get_ondemand_workflows()
+                logger.info("已加载 %d 个按需 workflow", len(self._ondemand_workflows))
+            except Exception:
+                logger.exception("按需 workflow 加载失败")
+                self._ondemand_workflows = []
+        return self._ondemand_workflows
+
+    def _check_ondemand_workflow(self, event, session_key: str, on_update) -> Optional[str]:
+        """
+        检查消息是否命中某个按需 workflow 的 intent_triggers。
+        命中则启动后台线程执行，立即返回 ACK 字符串；未命中返回 None。
+        """
+        content = event.content
+        for meta in self._get_ondemand_workflows():
+            if not any(trigger in content for trigger in meta.intent_triggers):
+                continue
+
+            delivery_key = self._derive_delivery_key(event)
+            ack = f"⏳ 正在执行【{meta.name}】，请稍候..."
+            if on_update:
+                on_update(ack, "done")
+
+            self._run_ondemand_workflow_async(meta, delivery_key)
+            return ack
+
+        return None
+
+    def _run_ondemand_workflow_async(self, meta, delivery_key: str) -> None:
+        """在后台 daemon 线程中执行按需 workflow，完成后通过 notify_fn/send_file_fn 投递结果。"""
+        import importlib
+
+        def _run():
+            try:
+                mod = importlib.import_module(f"personal_agent.workflows.{meta.id}.runner")
+                result: dict = mod.run()
+                message = result.get("message", "✅ 完成")
+                files = result.get("files", [])
+            except Exception as exc:
+                logger.exception("[ondemand:%s] 执行失败", meta.id)
+                message = f"❌ 【{meta.name}】执行失败：{exc}"
+                files = []
+
+            if self._notify_fn:
+                try:
+                    self._notify_fn(delivery_key, message)
+                except Exception:
+                    logger.exception("[ondemand:%s] 文字结果投递失败", meta.id)
+
+            if self._send_file_fn and files:
+                for fp in files:
+                    try:
+                        self._send_file_fn(delivery_key, str(fp), fp.name)
+                    except Exception:
+                        logger.exception("[ondemand:%s] 文件发送失败: %s", meta.id, fp)
+
+        t = threading.Thread(target=_run, name=f"ondemand-{meta.id}", daemon=True)
+        t.start()
 
     # ──────────────────────────────────────────────────────────
     #   技能正文按需匹配

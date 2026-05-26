@@ -32,6 +32,12 @@ setup = [
 # 手动安装：uv sync --group costupdate-saihu
 # ──────────────────────────────────────────────────────────────
 [dependency-groups]
+zxwarn-mabang = [
+    "openpyxl>=3.1",
+    "pandas>=2.0",
+    "python-calamine>=0.2",
+]
+
 costupdate-saihu = [
     "aiohttp>=3.9",
     "beautifulsoup4>=4.12",

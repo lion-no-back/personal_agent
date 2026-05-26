@@ -394,6 +394,19 @@ def main() -> None:
             except Exception as exc:
                 logger.error("%s.send_text 失败: %s", gw.platform, exc)
 
+    def _broadcast_send_file(session_key: str, file_path: str, filename: str) -> None:
+        for gw in gateways:
+            try:
+                gw.send_file(session_key, file_path, filename)
+            except NotImplementedError:
+                logger.debug("%s.send_file 未实现，跳过", gw.platform)
+            except Exception as exc:
+                logger.error("%s.send_file 失败: %s", gw.platform, exc)
+
+    agent._notify_fn = _broadcast_notify
+    agent._send_file_fn = _broadcast_send_file
+    logger.info("✅ 按需 workflow 投递回调已注入 Agent")
+
     scheduler = SchedulerDaemon(
         config_path=_PROJECT_ROOT / "config" / "scheduler.yaml"
     )
