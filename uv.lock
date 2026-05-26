@@ -417,6 +417,19 @@ wheels = [
 ]
 
 [[package]]
+name = "dingtalk-stream"
+version = "0.24.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "requests" },
+    { name = "websockets" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4c/44/102dede3f371277598df6aa9725b82e3add068c729333c7a5dbc12764579/dingtalk_stream-0.24.3-py3-none-any.whl", hash = "sha256:2160403656985962878bf60cdf5adf41619f21067348e06f07a7c7eebf5943ad", size = 27813, upload-time = "2025-10-24T09:36:57.497Z" },
+]
+
+[[package]]
 name = "distro"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1158,6 +1171,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "apscheduler" },
     { name = "ddgs" },
+    { name = "dingtalk-stream" },
     { name = "lark-oapi" },
     { name = "markdownify" },
     { name = "mcp" },
@@ -1191,6 +1205,7 @@ costupdate-saihu = [
 requires-dist = [
     { name = "apscheduler", specifier = ">=3.10" },
     { name = "ddgs", specifier = ">=9.14.3" },
+    { name = "dingtalk-stream", specifier = ">=0.24.3" },
     { name = "lark-oapi", specifier = ">=1.5.3" },
     { name = "markdownify", specifier = ">=1.2.2" },
     { name = "mcp", specifier = ">=1.27.0" },

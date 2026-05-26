@@ -333,7 +333,7 @@ class ConversationAgent(BaseAgent):
                 # 拼接并发提示
                 func_names = [tc.get("function", {}).get("name", "") for tc in tool_calls]
                 status_text = f"{additional_ui_text}> 🛠️ 正在执行工具：`{', '.join(func_names)}`..."
-                custom_on_update(status_text, "generating")
+                custom_on_update(status_text, "tool")
                 
                 results_collected = []
                 with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tool_calls), 5)) as executor:

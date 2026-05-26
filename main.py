@@ -8,13 +8,15 @@ PersonalAgent 启动入口
   4. ConversationContext     —— 上下文层：多会话历史 + 消息去重
   5. TaskManager             —— 任务层：后台任务状态追踪
   6. ConversationAgent       —— Agent 层：业务逻辑
-  7. FeishuGateway           —— 接入层：飞书 WebSocket 长连接（阻塞启动）
+  7. 多网关启动              —— 读 config/channels.yaml，每个 gateway 独立 daemon 线程
 """
 
 import logging
 import logging.handlers
 import os
+import queue
 import sys
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -141,6 +143,76 @@ def _load_skills(project_root: Path) -> tuple[str, dict]:
         + "\n\n".join(meta_sections)
     )
     return meta_prompt, skill_bodies
+
+
+def _load_channels_config(project_root: Path) -> dict:
+    """读取 config/channels.yaml，返回 channels 字典。找不到文件时回退为只启用飞书。"""
+    channels_yaml = project_root / "config" / "channels.yaml"
+    if not channels_yaml.is_file():
+        logger.warning("未找到 config/channels.yaml，回退为仅启用飞书")
+        return {"feishu": {"enabled": True}}
+    try:
+        import yaml  # PyYAML，已被 scheduler 依赖
+        with open(channels_yaml, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return cfg.get("channels", {})
+    except Exception as e:
+        logger.error("解析 channels.yaml 失败: %s，回退为仅启用飞书", e)
+        return {"feishu": {"enabled": True}}
+
+
+def _build_gateways(project_root, agent, context, task_manager, file_stash) -> list:
+    """
+    按 channels.yaml 的启用配置，逐个实例化 gateway。
+    初始化失败时记录错误并跳过（不中断其他 gateway 的启动）。
+    """
+    from personal_agent.gateway.base_gateway import BaseGateway
+
+    channels = _load_channels_config(project_root)
+    gateways: list[BaseGateway] = []
+
+    if channels.get("feishu", {}).get("enabled", False):
+        # 飞书首次配置向导
+        from personal_agent.core.setup_wizard import needs_setup, run_feishu_setup_wizard
+        if needs_setup():
+            logger.info("未检测到飞书凭证，启动首次配置向导...")
+            if not run_feishu_setup_wizard():
+                logger.error("❌ 飞书配置未完成，跳过飞书 gateway")
+            else:
+                _try_add_feishu(gateways, agent, context, task_manager, file_stash)
+        else:
+            _try_add_feishu(gateways, agent, context, task_manager, file_stash)
+
+    if channels.get("dingtalk", {}).get("enabled", False):
+        try:
+            from personal_agent.gateway.dingtalk_gateway import DingTalkGateway
+            gw = DingTalkGateway(
+                agent=agent,
+                context=context,
+                task_manager=task_manager,
+                file_stash=file_stash,
+            )
+            gateways.append(gw)
+            logger.info("✅ DingTalkGateway 就绪")
+        except Exception as e:
+            logger.error("❌ 钉钉网关初始化失败: %s", e)
+
+    return gateways
+
+
+def _try_add_feishu(gateways, agent, context, task_manager, file_stash) -> None:
+    try:
+        from personal_agent.gateway.feishu_gateway import FeishuGateway
+        gw = FeishuGateway(
+            agent=agent,
+            context=context,
+            task_manager=task_manager,
+            file_stash=file_stash,
+        )
+        gateways.append(gw)
+        logger.info("✅ FeishuGateway 就绪")
+    except Exception as e:
+        logger.error("❌ 飞书网关初始化失败: %s", e)
 
 
 def main() -> None:
@@ -293,54 +365,86 @@ def main() -> None:
     )
     logger.info("✅ FileStash 就绪")
 
-    # ── Step 7: 初始化飞书网关并启动（阻塞） ─────────────────
-    # 若飞书凭证缺失，先运行首次配置向导；向导通过 os.environ 直接同步，无需重载 .env
-    from personal_agent.core.setup_wizard import needs_setup, run_feishu_setup_wizard
+    # ── Step 7: 初始化所有 Gateway ────────────────────────────
+    # 启用列表读 config/channels.yaml，凭证只读 .env
+    from personal_agent.gateway.base_gateway import BaseGateway
 
-    if needs_setup():
-        logger.info("未检测到飞书凭证，启动首次配置向导...")
-        if not run_feishu_setup_wizard():
-            logger.error("❌ 飞书配置未完成，退出")
-            sys.exit(1)
-
-    try:
-        from personal_agent.gateway.feishu_gateway import FeishuGateway
-
-        gateway = FeishuGateway(
-            agent=agent, 
-            context=context, 
-            task_manager=task_manager,
-            file_stash=file_stash
-        )
-        file_stash.set_remind_callback(gateway.send_stash_remind_card)
-        logger.info("✅ FeishuGateway 就绪")
-    except ValueError as e:
-        logger.error(f"❌ 飞书网关初始化失败：{e}")
-        logger.error("请检查 .env 文件中的 FEISHU_APP_ID、FEISHU_APP_SECRET 配置")
+    gateways: list[BaseGateway] = _build_gateways(
+        _PROJECT_ROOT, agent, context, task_manager, file_stash
+    )
+    if not gateways:
+        logger.error("❌ 没有任何 gateway 启用，请检查 config/channels.yaml")
         sys.exit(1)
+
+    # file_stash remind 回调：只注册有 send_stash_remind_card 的 gateway（飞书）
+    for gw in gateways:
+        if hasattr(gw, "send_stash_remind_card"):
+            file_stash.set_remind_callback(gw.send_stash_remind_card)
 
     # ── Step 7.5: 启动调度器（定时任务 + 心跳引擎） ──────────
     from personal_agent.scheduler import SchedulerDaemon
+
+    # 广播 notify_fn：尝试所有 gateway，各自按 session_key 前缀决定是否发送
+    def _broadcast_notify(session_key: str, text: str) -> None:
+        for gw in gateways:
+            try:
+                gw.send_text(session_key, text)
+            except NotImplementedError:
+                logger.debug("%s.send_text 未实现，跳过", gw.platform)
+            except Exception as exc:
+                logger.error("%s.send_text 失败: %s", gw.platform, exc)
 
     scheduler = SchedulerDaemon(
         config_path=_PROJECT_ROOT / "config" / "scheduler.yaml"
     )
     scheduler.start(
         agent=agent,
-        notify_fn=gateway.send_text,
-        alert_callback=None,  # 仅日志；传入回调即可接入飞书告警
+        notify_fn=_broadcast_notify,
+        alert_callback=None,
     )
     logger.info("✅ SchedulerDaemon 就绪")
 
+    # ── Step 8: 多 Gateway 并行启动 ──────────────────────────
+    # 每个 gateway 独立 daemon 线程：daemon=True 保证 sys.exit() 可即时终止进程
+    # exception queue：监控线程生命周期，任一线程退出则主线程感知并退出
+    _exc_q: queue.Queue = queue.Queue()
+
+    def _run_gateway(gw: BaseGateway) -> None:
+        try:
+            gw.start()
+            # start() 正常返回仅在 Ctrl+C 后（SDK 处理 KeyboardInterrupt 并 return）
+            _exc_q.put(None)
+        except Exception as exc:
+            _exc_q.put(exc)
+
+    gw_threads = [
+        threading.Thread(
+            target=_run_gateway,
+            args=(gw,),
+            name=f"{gw.platform}-gw",
+            daemon=True,
+        )
+        for gw in gateways
+    ]
+
+    platform_names = ", ".join(gw.platform for gw in gateways)
     logger.info("=" * 60)
-    logger.info("  所有组件初始化完成，正在连接飞书...")
+    logger.info("  所有组件初始化完成，启动网关: %s", platform_names)
     logger.info("  发送 /help 给机器人查看可用指令（含 /resume /export /tasks）")
     logger.info("  按 Ctrl+C 退出")
     logger.info("=" * 60)
 
-    # start() 内部调用 lark.ws.Client.start()，会阻塞当前线程
-    # 通过 WebSocket 长连接持续接收飞书推送的消息事件
-    gateway.start()
+    for t in gw_threads:
+        t.start()
+
+    # 主线程阻塞：任一 gateway 线程退出（正常或异常）即解除阻塞
+    result = _exc_q.get()
+    if result is None:
+        logger.info("Gateway 正常退出")
+        sys.exit(0)
+    else:
+        logger.critical("Gateway 异常退出: %s", result, exc_info=result)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

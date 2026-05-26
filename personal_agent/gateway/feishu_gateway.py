@@ -38,6 +38,7 @@ from lark_oapi.api.im.v1 import (
 
 from ..core.task_manager import TaskManager
 from ..guardrails import check_input
+from .base_gateway import BaseGateway
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,7 @@ class _CardStreamAsyncSink:
     def feed(self, content: str, status: str) -> None:
         text = _strip_stream_cursor(content)
         with self._cv:
-            if status == "generating":
+            if status in ("generating", "tool"):
                 if text:
                     self._latest = text
             elif status == "done":
@@ -199,7 +200,7 @@ class _CardStreamAsyncSink:
 # ──────────────────────────────────────────────────────────────
 
 
-class FeishuGateway:
+class FeishuGateway(BaseGateway):
     """
     飞书机器人网关 —— 平台接入层。
 
@@ -334,11 +335,12 @@ class FeishuGateway:
     #   公共接口
     # ──────────────────────────────────────────────────────────
 
+    @property
+    def platform(self) -> str:
+        return "feishu"
+
     def start(self) -> None:
-        """
-        启动 WebSocket 长连接，阻塞当前线程持续监听飞书消息推送。
-        通常作为 main.py 的最后一行调用。
-        """
+        """阻塞当前线程，维持飞书 WebSocket 长连接。"""
         logger.info("🚀 PersonalAgent 飞书网关已启动，等待消息...")
         print("🚀 PersonalAgent 飞书网关已启动，等待消息...", flush=True)
         self._ws_client.start()
@@ -745,7 +747,7 @@ class FeishuGateway:
         status: str,
     ) -> None:
         text = _strip_stream_cursor(content)
-        if status == "generating":
+        if status in ("generating", "tool"):
             if text and text != session.last_pushed_markdown:
                 self._card_stream_push_markdown(session, text)
             return
@@ -863,12 +865,25 @@ class FeishuGateway:
             if attempt < _retries:
                 time.sleep(2)
 
-    def send_text(self, receive_id: str, text: str) -> None:
+    def send_text(self, session_key: str, text: str) -> None:
         """发送普通文本消息（供外部调用，如定时任务结果投递）。
-        自动识别 receive_id 类型：ou_ 前缀用 open_id，其余用 chat_id。
+
+        session_key 支持两种格式：
+          - BaseGateway 标准格式：feishu:user:ou_xxx / feishu:group:oc_xxx
+          - 原始 ID（向后兼容）：ou_xxx / oc_xxx
+        非 feishu: 前缀的 session_key 直接跳过（多网关广播时其他平台的 key）。
         """
-        receive_id_type = "open_id" if receive_id.startswith("ou_") else "chat_id"
-        self._send_text_message(receive_id, text, receive_id_type=receive_id_type)
+        if session_key.startswith("dingtalk:") or (
+            ":" in session_key and not session_key.startswith("feishu:")
+        ):
+            return
+        # 剥离 feishu:{id_type}: 前缀，还原原始 ID
+        raw_id = session_key.split(":")[-1] if session_key.startswith("feishu:") else session_key
+        receive_id_type = "open_id" if raw_id.startswith("ou_") else "chat_id"
+        self._send_text_message(raw_id, text, receive_id_type=receive_id_type)
+
+    def send_file(self, session_key: str, file_path: str, filename: str) -> None:
+        raise NotImplementedError("FeishuGateway.send_file 尚未实现，计划 Phase 2 支持")
 
     def send_stash_remind_card(self, chat_id: str, file_name: str) -> None:
         """发送超时卡片提醒"""

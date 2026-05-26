@@ -1,0 +1,8 @@
+# 启用的接入渠道配置
+# 凭证（AppID / Secret 等）统一在 .env 中定义，此处只做开关控制。
+channels:
+  feishu:
+    enabled: true
+
+  dingtalk:
+    enabled: true   # 配置好 DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET 后改为 true
