@@ -65,6 +65,9 @@ class DingTalkMessageEvent:
 
 logger = logging.getLogger(__name__)
 
+# 指数退避重连延迟序列（秒）：2→5→10→30→60
+_RECONNECT_DELAYS = [2, 5, 10, 30, 60]
+
 
 # ──────────────────────────────────────────────────────────────
 #   Markdown → 钉钉 markdown 子集转换器
@@ -270,6 +273,18 @@ class DingTalkGateway(BaseGateway):
         self._task_manager = task_manager
         self._file_stash = file_stash
 
+        # 用户白名单：DINGTALK_ALLOWED_USERS 逗号分隔的 staffId 列表
+        # 未配置时允许所有人（兼容现有部署），但打印警告
+        raw_allowlist = os.getenv("DINGTALK_ALLOWED_USERS", "")
+        self._allowed_users: frozenset[str] = frozenset(
+            uid.strip() for uid in raw_allowlist.split(",") if uid.strip()
+        )
+        if not self._allowed_users:
+            logger.warning(
+                "DINGTALK_ALLOWED_USERS 未配置，任何人均可触发机器人。"
+                "建议在 .env 中设置白名单。"
+            )
+
         max_workers = int(os.getenv("DINGTALK_MAX_WORKERS", "10"))
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
@@ -309,11 +324,28 @@ class DingTalkGateway(BaseGateway):
     def start(self) -> None:
         """
         阻塞当前线程，启动 Stream SDK 长连接。
-        SDK 内部使用 asyncio，此处封装为同步阻塞，对 main.py 完全透明。
+        连接断开后按指数退避（2→5→10→30→60s）自动重连，连接稳定超过 60s 则重置计数。
         """
         logger.info("🚀 PersonalAgent 钉钉网关已启动，等待消息...")
         print("🚀 PersonalAgent 钉钉网关已启动，等待消息...", flush=True)
-        self._stream_client.start_forever()
+        attempt = 0
+        while True:
+            connect_start = time.monotonic()
+            try:
+                self._stream_client.start_forever()
+                logger.warning("钉钉 start_forever() 意外返回，将自动重连")
+            except Exception as exc:
+                logger.error("钉钉连接断开: %s", exc)
+
+            # 连接稳定超过 60s，视为正常断线，重置退避计数
+            if time.monotonic() - connect_start > 60:
+                attempt = 0
+
+            delay = _RECONNECT_DELAYS[min(attempt, len(_RECONNECT_DELAYS) - 1)]
+            attempt += 1
+            logger.info("第 %d 次重连，%ds 后重试...", attempt, delay)
+            time.sleep(delay)
+            self._recreate_stream_client()
 
     def send_text(self, session_key: str, text: str) -> None:
         """
@@ -364,13 +396,21 @@ class DingTalkGateway(BaseGateway):
 
     def dispatch(self, incoming: "ChatbotMessage") -> None:
         """
-        在 3s 回调窗口内完成：去重 + 创建 v2 AI 卡片 + 提交线程池。
+        在 3s 回调窗口内完成：去重 + 白名单检查 + 创建 v2 AI 卡片 + 提交线程池。
         卡片创建（POST createAndDeliver）在回调里同步完成，用户立即看到占位卡片。
         """
         if self._context.is_processed(incoming.message_id):
             logger.debug("重复消息，跳过 | message_id=%s", incoming.message_id)
             return
         self._context.mark_processed(incoming.message_id)
+
+        # 白名单检查：配置了 DINGTALK_ALLOWED_USERS 时，不在列表中的用户静默拒绝
+        if self._allowed_users and incoming.sender_staff_id not in self._allowed_users:
+            logger.warning(
+                "拒绝未授权用户 | staffId=%s nick=%s",
+                incoming.sender_staff_id, incoming.sender_nick,
+            )
+            return
 
         event = self._build_event(incoming)
         if not event.content:
@@ -640,6 +680,16 @@ class DingTalkGateway(BaseGateway):
             if session_key not in self._session_run_locks:
                 self._session_run_locks[session_key] = threading.Lock()
             return self._session_run_locks[session_key]
+
+    def _recreate_stream_client(self) -> None:
+        """重连前重建 SDK 客户端（旧客户端状态不可复用）。"""
+        self._stream_client = dingtalk_stream.DingTalkStreamClient(
+            credential=dingtalk_stream.Credential(self._client_id, self._client_secret)
+        )
+        handler = _MessageHandler(self)
+        self._stream_client.register_callback_handler(
+            dingtalk_stream.chatbot.ChatbotMessage.TOPIC, handler
+        )
 
 
 # ──────────────────────────────────────────────────────────────
