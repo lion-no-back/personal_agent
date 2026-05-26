@@ -102,6 +102,16 @@ def _dt_code_blocks(text: str) -> str:
     return re.sub(r"```(\w*)\n(.*?)```", replacer, text, flags=re.DOTALL)
 
 
+def _stream_safe_text(text: str) -> str:
+    """
+    返回可安全流式推送的文本：截取到最近换行边界，
+    避免推送半截 Markdown（表格行、粗体/斜体标记等）时光标插入 token 内部产生黑色占位乱码。
+    无换行时返回原文（单行响应不含多行 Markdown 结构，直接推送即可）。
+    """
+    idx = text.rfind('\n')
+    return text[:idx + 1] if idx >= 0 else text
+
+
 def _dt_tables(text: str) -> str:
     """GFM 表格 → 加粗表头 + 竖线分隔文本行。"""
     def replacer(m: re.Match) -> str:
@@ -149,11 +159,12 @@ class DingTalkCardRenderer:
         try:
             if status == "generating":
                 self._on_generating(text)
+            elif status == "tool":
+                self._on_tool(text)
             elif status == "done":
                 self._on_done(text)
             elif status == "error":
                 self.fail()
-            # "tool"：静默忽略
         except Exception as exc:
             logger.error("AI 卡片更新失败 | status=%s error=%s", status, exc)
 
@@ -172,9 +183,9 @@ class DingTalkCardRenderer:
             "Content-Type": "application/json",
         }
 
-    def _push(self, text: str) -> None:
-        """全量推送到 streaming 端点（isFull=True）。"""
-        if text == self._last_text:
+    def _push(self, text: str, *, finalize: bool = False) -> None:
+        """全量推送到 streaming 端点（isFull=True）。finalize=True 正式关闭流式会话。"""
+        if text == self._last_text and not finalize:
             return
         payload = {
             "outTrackId": self._out_track_id,
@@ -182,21 +193,29 @@ class DingTalkCardRenderer:
             "key": "content",
             "content": text,
             "isFull": True,
-            "isFinalize": False,
+            "isFinalize": finalize,
             "isError": False,
         }
-        httpx.put(_CARD_STREAM_URL, headers=self._mk_headers(), json=payload, timeout=10)
+        httpx.put(_CARD_STREAM_URL, headers=self._mk_headers(), json=payload, timeout=10).raise_for_status()
         self._last_text = text
+
+    def _on_tool(self, text: str) -> None:
+        """工具执行期间立即推送状态，告知用户正在处理（不走节流）。"""
+        self._push(text)
+        self._last_push_at = time.monotonic()  # 重置节流，工具完成后首帧 generating 立即可见
 
     def _on_generating(self, text: str) -> None:
         now = time.monotonic()
         if now - self._last_push_at < self.THROTTLE_S:
             return
-        self._push(text)
-        self._last_push_at = now
+        # 截取到最近换行边界再推送，避免半截 Markdown 触发黑色占位符
+        safe = _stream_safe_text(text)
+        if safe:
+            self._push(safe)
+            self._last_push_at = now
 
     def _on_done(self, text: str) -> None:
-        self._push(text)
+        self._push(text, finalize=True)  # 发送完整内容并正式关闭 streaming 会话
         self._finalize(text)
 
     def _finalize(self, text: str) -> None:
@@ -213,7 +232,7 @@ class DingTalkCardRenderer:
                 }
             },
         }
-        httpx.put(_CARD_UPDATE_URL, headers=self._mk_headers(), json=payload, timeout=10)
+        httpx.put(_CARD_UPDATE_URL, headers=self._mk_headers(), json=payload, timeout=10).raise_for_status()
 
 
 _API_BASE = "https://api.dingtalk.com"
