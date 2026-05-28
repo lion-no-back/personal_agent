@@ -439,10 +439,6 @@ class DingTalkGateway(BaseGateway):
 
         session_key = self._compute_session_key(event)
         lock = self._get_session_lock(session_key)
-        logger.info(
-            "收到消息 | session_key=%s sender=%s content_len=%d",
-            session_key, incoming.sender_nick, len(event.content),
-        )
         self._executor.submit(self._handle, event, incoming, session_key, lock, renderer)
 
     def _try_create_renderer(self, incoming: "ChatbotMessage") -> "DingTalkCardRenderer | None":
@@ -616,7 +612,8 @@ class DingTalkGateway(BaseGateway):
     ) -> None:
         """通过 OpenAPI 发文件消息（media_id 已上传）。"""
         token = self._get_api_token()
-        msg_param = json.dumps({"mediaId": media_id, "fileName": filename, "fileType": "file"}, ensure_ascii=False)
+        file_type = filename.rsplit(".", 1)[-1].lower() if "." in filename else "file"
+        msg_param = json.dumps({"mediaId": media_id, "fileName": filename, "fileType": file_type}, ensure_ascii=False)
         payload = {
             "msgKey": "sampleFile",
             "msgParam": msg_param,

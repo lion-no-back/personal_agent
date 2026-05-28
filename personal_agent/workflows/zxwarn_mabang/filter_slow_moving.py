@@ -19,7 +19,8 @@ STOCK_COLS   = ["可售", "待入库", "预留", "计划入库", "在途"]
 FILTER_DAYS  = 270
 FILTER_STOCK = 20
 OUTPUT_COLS  = [
-    "店铺名称", "图片链接", "本地SKU名称", "父ASIN", "ASIN",
+    "店铺名称", "图片链接", "本地SKU名称", "父ASIN",
+    "日均销量", "ASIN",
     "库存总数",
     "181-330天库存数", "331-365天库存数", "365天以上库存数",
     "售价",
@@ -45,7 +46,7 @@ def run(artifact_dir: Path, xls_files: list) -> "tuple[Path, int] | tuple[None, 
     for xls_path in sorted(xls_files):
         df = pd.read_excel(xls_path, engine="calamine", dtype=str)
 
-        numeric_cols = STOCK_COLS + ["可售天数", "181-330天库存数", "331-365天库存数", "365天以上库存数"]
+        numeric_cols = STOCK_COLS + ["可售天数", "日均销量", "181-330天库存数", "331-365天库存数", "365天以上库存数"]
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
@@ -71,6 +72,8 @@ def run(artifact_dir: Path, xls_files: list) -> "tuple[Path, int] | tuple[None, 
         return None, 0
 
     result = pd.concat(frames, ignore_index=True)
+    _order = {s: i for i, s in enumerate(result["店铺名称"].unique())}
+    result = result.iloc[result["店铺名称"].map(_order).argsort(kind="stable")].reset_index(drop=True)
     try:
         result.to_excel(output_file, index=False, engine="openpyxl")
     except PermissionError:

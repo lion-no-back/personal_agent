@@ -18,7 +18,7 @@ def run(output_dir: Optional[Path] = None) -> dict:
     Returns:
         {"message": str, "files": [Path]}
     """
-    from .mabang_export import run as export_run
+    from ..export import run as export_run
     from .filter_slow_moving import run as filter_run
 
     logger.info("=" * 50)

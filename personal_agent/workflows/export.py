@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
-import requests
-import json
-import re
-import math
-import time
-import os
-from datetime import date
-from concurrent.futures import ThreadPoolExecutor, as_completed
+"""
+马帮 ERP - MSKU列表导出（共享模块）
 
-# ==========================================
-# 马帮 ERP - MSKU列表导出脚本
-# 筛选条件：各亚马逊站点 + 已配对 + 正常销售
-# ==========================================
+三个预警工作流（滞销/补货/清货）共用此导出逻辑。
+凭证从环境变量读取：MABANG_USERNAME / MABANG_PASSWORD
+"""
+import json
+import os
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
+from pathlib import Path
+
+import requests
 
 BASE_URL = "https://private.mabangerp.com"
 AMZ_URL  = "https://private-amz.mabangerp.com"
@@ -25,9 +27,9 @@ SITES = {
     "jp": "日本站",
 }
 
-ROWS_PER_PAGE  = 500
-PAGE_WORKERS   = 8   # 单站点内并发页数
-SITE_WORKERS   = len(SITES)  # 站点间并发数
+ROWS_PER_PAGE = 500
+PAGE_WORKERS  = 8
+SITE_WORKERS  = len(SITES)
 
 base_headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -44,17 +46,22 @@ ajax_headers = {
 
 EXPORT_FIELDS = [
     ("店铺名称",        "uq101"),
-    ("MSKU",            "uq102"),
     ("图片链接",        "uq181"),
     ("产品名称",        "uq104"),
     ("父ASIN",          "uq194"),
     ("ASIN",            "uq105"),
+    ("7天销量",         "uq107"),
+    ("14天销量",        "uq108"),
+    ("30天销量",        "uq109"),
+    ("90天销量",        "uq110"),
+    ("日均销量",        "uq114"),
     ("可售",            "uq124"),
     ("待入库",          "uq125"),
     ("预留",            "uq126"),
     ("计划入库",        "uq127"),
     ("在途",            "uq128"),
     ("可售天数",        "uq129"),
+    ("备注",            "uq136"),
     ("本地SKU名称",     "uq141"),
     ("售价",            "uq164"),
     ("上架时间",        "uq167"),
@@ -65,9 +72,6 @@ EXPORT_FIELDS = [
 ]
 
 
-# ==========================================
-# STEP 1: 登录，返回 (session, cm_key)
-# ==========================================
 def login() -> tuple:
     username = os.environ["MABANG_USERNAME"]
     password = os.environ["MABANG_PASSWORD"]
@@ -85,32 +89,28 @@ def login() -> tuple:
     try:
         res_json = r.json()
     except json.JSONDecodeError:
-        raise SystemExit(f"[ERR] 登录响应非JSON: {r.text[:200]}")
+        raise RuntimeError(f"[ERR] 登录响应非JSON: {r.text[:200]}")
 
     if res_json.get("success") is not True:
-        raise SystemExit(f"[ERR] 登录失败: {res_json.get('message', r.text[:200])}")
+        raise RuntimeError(f"[ERR] 登录失败: {res_json.get('message', r.text[:200])}")
 
     s.get(f"{BASE_URL}/index.htm", headers=base_headers, timeout=10)
     time.sleep(0.5)
 
     cm_key = s.cookies.get("MABANG_ERP_PRO_MEMBERINFO_LOGIN_COOKIE", "")
     if not cm_key:
-        raise SystemExit("[ERR] 未找到登录 Cookie")
+        raise RuntimeError("[ERR] 未找到登录 Cookie")
 
     print(f"[OK] 登录成功，cMKey={cm_key[:8]}...")
     return s, cm_key
 
 
 def clone_session(src: requests.Session) -> requests.Session:
-    """共享登录 Cookie，独立线程状态。"""
     s = requests.Session()
     s.cookies.update(src.cookies)
     return s
 
 
-# ==========================================
-# STEP 2: 激活 AMZ 子域名 Session
-# ==========================================
 def activate_amz(s: requests.Session, cm_key: str) -> str:
     iframe_url = (
         f"{AMZ_URL}/index.php?mod=fbanew.list&platform=amazon&version=1"
@@ -125,15 +125,8 @@ def activate_amz(s: requests.Session, cm_key: str) -> str:
     return iframe_url
 
 
-# ==========================================
-# STEP 3: 并发翻页收集 ID
-# ==========================================
 def _fetch_page(s: requests.Session, search_url: str, search_headers: dict,
                 site_code: str, page: int) -> tuple:
-    """
-    返回 (page, ids, total_pages)
-    total_pages 仅在 page==1 时有效，其余为 0。
-    """
     resp = s.post(
         search_url,
         headers=search_headers,
@@ -152,11 +145,9 @@ def _fetch_page(s: requests.Session, search_url: str, search_headers: dict,
     if not data.get("success"):
         return page, [], 0
 
-    # 直接用 fbastockId 字段（逗号分隔 ID），避免解析 6MB+ HTML
     raw = data.get("fbastockId", "")
     ids = [i for i in raw.split(",") if i.strip()] if raw else []
 
-    # 回退：如果 fbastockId 为空才解析 HTML
     if not ids:
         ids = re.findall(r'name="item"\s+value="(\d+)"', data.get("html", ""))
 
@@ -166,7 +157,7 @@ def _fetch_page(s: requests.Session, search_url: str, search_headers: dict,
         if m:
             total_pages = int(m.group(2))
         elif ids:
-            total_pages = 1  # 只有1页
+            total_pages = 1
 
     return page, ids, total_pages
 
@@ -177,7 +168,6 @@ def fetch_ids_for_site(s: requests.Session, cm_key: str,
     search_url  = f"{AMZ_URL}/index.php?mod=fbanew.listsearch"
     search_hdrs = {**ajax_headers, "Origin": AMZ_URL, "Referer": iframe_url}
 
-    # 第 1 页：拿到 ID + 总页数
     _, ids_p1, total_pages = _fetch_page(s, search_url, search_hdrs, site_code, 1)
     if not ids_p1:
         return []
@@ -188,7 +178,6 @@ def fetch_ids_for_site(s: requests.Session, cm_key: str,
 
     print(f"  [{site_name}] 共 {total_pages} 页 / 并发获取中...")
 
-    # 剩余页全部并发
     page_results = {1: ids_p1}
     with ThreadPoolExecutor(max_workers=PAGE_WORKERS) as pool:
         futs = {
@@ -207,9 +196,6 @@ def fetch_ids_for_site(s: requests.Session, cm_key: str,
     return all_ids
 
 
-# ==========================================
-# STEP 4: 导出 + 下载
-# ==========================================
 def export_and_download(s: requests.Session, cm_key: str,
                         all_ids: list, site_name: str, output_dir: str) -> str:
     export_params = [
@@ -257,16 +243,13 @@ def export_and_download(s: requests.Session, cm_key: str,
     return local_path
 
 
-# ==========================================
-# 单站点完整流程（供并发调用）
-# ==========================================
 def process_site(main_session: requests.Session, cm_key: str,
                  site_code: str, site_name: str, output_dir: str) -> tuple:
     s = clone_session(main_session)
     ids = fetch_ids_for_site(s, cm_key, site_code, site_name)
     if not ids:
         print(f"[SKIP] {site_name} 无符合条件的记录")
-        return site_name, None  # None = 无数据，非失败
+        return site_name, None
 
     print(f"[OK] {site_name} 共 {len(ids)} 条，提交导出...")
     path = export_and_download(s, cm_key, ids, site_name, output_dir)
@@ -275,16 +258,11 @@ def process_site(main_session: requests.Session, cm_key: str,
     return site_name, path
 
 
-# ==========================================
-# 主流程
-# ==========================================
 def run(output_dir=None) -> tuple:
     """执行导出，返回 (results, failures, output_dir)。
     results:  {站点名: 本地文件路径}
     failures: [导出失败的站点名]（无数据的站点不算失败）
-    output_dir: 若为 None，则在脚本同目录下按日期创建
     """
-    from pathlib import Path
     if output_dir is None:
         _today = date.today()
         output_dir = Path(os.path.dirname(os.path.abspath(__file__))) / "artifact" / str(_today.year) / f"{_today.month}.{_today.day:02d}"
@@ -308,11 +286,11 @@ def run(output_dir=None) -> tuple:
         }
         for fut in as_completed(futs):
             name, path = fut.result()
-            if path is None:       # 无数据，跳过
+            if path is None:
                 pass
-            elif path == "":       # 导出/下载失败
+            elif path == "":
                 failures.append(name)
-            else:                  # 成功
+            else:
                 results[name] = path
 
     print("\n========================================")

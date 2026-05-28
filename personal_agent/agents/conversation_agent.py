@@ -171,11 +171,6 @@ class ConversationAgent(BaseAgent):
             thread_id=event.thread_id,
         )
 
-        logger.info(
-            f"📨 处理消息 | message_id={event.message_id} "
-            f"session={session_key} content={event.content[:50]!r}"
-        )
-
         if self._interaction_logger:
             self._interaction_logger.log_session_start(session_key, event.content)
 
