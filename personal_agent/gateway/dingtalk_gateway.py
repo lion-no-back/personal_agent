@@ -102,15 +102,6 @@ def _dt_code_blocks(text: str) -> str:
     return re.sub(r"```(\w*)\n(.*?)```", replacer, text, flags=re.DOTALL)
 
 
-def _stream_safe_text(text: str) -> str:
-    """
-    返回可安全流式推送的文本：截取到最近换行边界，
-    避免推送半截 Markdown（表格行、粗体/斜体标记等）时光标插入 token 内部产生黑色占位乱码。
-    无换行时返回原文（单行响应不含多行 Markdown 结构，直接推送即可）。
-    """
-    idx = text.rfind('\n')
-    return text[:idx + 1] if idx >= 0 else text
-
 
 def _dt_tables(text: str) -> str:
     """GFM 表格 → 加粗表头 + 竖线分隔文本行。"""
@@ -147,7 +138,7 @@ class DingTalkCardRenderer:
     "tool" 状态静默忽略，下轮 LLM 文本继续累积。
     """
 
-    THROTTLE_S = 0.3
+    THROTTLE_S = 0.05  # flusher 已在 card_update_interval 节流，renderer 只需防暴打
 
     def __init__(self, out_track_id: str, get_token: Callable[[], str]) -> None:
         self._out_track_id = out_track_id
@@ -208,14 +199,17 @@ class DingTalkCardRenderer:
         now = time.monotonic()
         if now - self._last_push_at < self.THROTTLE_S:
             return
-        # 截取到最近换行边界再推送，避免半截 Markdown 触发黑色占位符
-        safe = _stream_safe_text(text)
-        if safe:
-            self._push(safe)
+        # flusher 追加的 " ▌" 是打字机光标，嵌入表格/标题等 Markdown 结构后
+        # 会被渲染为黑色占位符或导致标题临时变成引用样式。
+        # DingTalk 卡片 flowStatus=2(INPUTING) 自带进度视觉，不需要光标字符。
+        clean = text.removesuffix(" ▌")
+        if clean:
+            self._push(clean)
             self._last_push_at = now
 
     def _on_done(self, text: str) -> None:
-        self._push(text, finalize=True)  # 发送完整内容并正式关闭 streaming 会话
+        # flowStatus=3 隐式关闭 streaming session；跳过单独的 isFinalize push
+        # 可避免两次连续 re-render 导致的视觉闪烁（"一闪"问题）
         self._finalize(text)
 
     def _finalize(self, text: str) -> None:
