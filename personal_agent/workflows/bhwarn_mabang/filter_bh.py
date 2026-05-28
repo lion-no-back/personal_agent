@@ -2,13 +2,13 @@
 """
 补货预警筛选脚本（由 bhwarn.py 调用，不独立运行）
 
-筛选条件（父体级别，按店铺名称+父ASIN分组）：
-  - 备注：组内任意一行含「清货下架」→ 跳过整组
-  - 父体30天销量合计 > 5
-  - 父体可售天数合计 < 60
+筛选条件（ASIN 行级别）：
+  - 可售天数 < 60
+  - 备注不含「清货下架」
+  - 30天销量 > 5
 
-输出列：店铺名称、图片链接、本地SKU名称、父ASIN、
-        库存总数、可售天数、预计补货量
+输出列：店铺名称、图片链接、本地SKU名称、父ASIN、日均销量、ASIN、
+        库存总数、可售天数、预计补货量（日均销量×70−库存总数）、备注
 """
 
 import re
@@ -23,15 +23,15 @@ RESTOCK_DAYS = 70
 
 OUTPUT_COLS = [
     "店铺名称", "图片链接", "本地SKU名称", "父ASIN",
-    "日均销量", "库存总数", "可售天数", "预计补货量", "备注",
+    "日均销量", "ASIN", "库存总数", "可售天数", "预计补货量", "备注",
 ]
 
 
 def _clean_sku(name: str) -> str:
     if not isinstance(name, str):
         return ""
-    name = re.sub(r'\s*[（(][^)）]*[）)]\s*', ' ', name)  # 去括号内容（中英文括号）
-    name = re.sub(r'\s*\d+mm\b\s*', '', name, flags=re.IGNORECASE)  # 去尺码如 38mm
+    name = re.sub(r'\s*[（(][^)）]*[）)]\s*', ' ', name)
+    name = re.sub(r'\s*\d+mm\b\s*', '', name, flags=re.IGNORECASE)
     return re.sub(r' +', ' ', name).strip()
 
 
@@ -65,64 +65,57 @@ def run(artifact_dir: Path, xls_files: list) -> "tuple[Path, int] | tuple[None, 
 
     if not frames:
         print("[OK] 无数据")
-        return
+        return None, 0
 
-    all_data = pd.concat(frames, ignore_index=True)
+    df = pd.concat(frames, ignore_index=True)
 
     # 过滤掉父ASIN为空的行
-    all_data = all_data[all_data["父ASIN"].notna() & (all_data["父ASIN"].str.strip() != "")]
+    df = df[df["父ASIN"].notna() & (df["父ASIN"].str.strip() != "")]
 
-    # 去重：同一站点同一ASIN只保留一行
-    if "ASIN" in all_data.columns:
-        before = len(all_data)
-        all_data = all_data.drop_duplicates(subset=["店铺名称", "ASIN"])
-        removed = before - len(all_data)
+    # 去重：同一店铺同一ASIN只保留一行
+    if "ASIN" in df.columns:
+        before = len(df)
+        df = df.drop_duplicates(subset=["店铺名称", "ASIN"])
+        removed = before - len(df)
         if removed:
             print(f"  [去重] 移除重复行 {removed} 条")
 
-    rows = []
-    for (shop, parent_asin), grp in all_data.groupby(["店铺名称", "父ASIN"], sort=False):
-        # 条件1：任意一行备注含「清货下架」→ 跳过整组
-        if "备注" in grp.columns and grp["备注"].fillna("").str.contains("清货下架", na=False).any():
-            continue
+    # 行级筛选
+    mask = pd.Series(True, index=df.index)
 
-        # 条件2：父体30天销量合计 > 5
-        sales_30 = grp["30天销量"].sum() if "30天销量" in grp.columns else 0
-        if sales_30 <= SALES_MIN:
-            continue
+    if "备注" in df.columns:
+        mask &= ~df["备注"].fillna("").str.contains("清货下架", na=False)
 
-        # 条件3：父体可售天数合计 < 60
-        sellable_days = grp["可售天数"].sum() if "可售天数" in grp.columns else 0
-        if sellable_days >= SELLABLE_MAX:
-            continue
+    if "30天销量" in df.columns:
+        mask &= df["30天销量"] > SALES_MIN
 
-        total_inv     = grp["库存总数"].sum()
-        daily_avg_sum = grp["日均销量"].sum() if "日均销量" in grp.columns else 0
-        restock_qty   = round(daily_avg_sum * RESTOCK_DAYS - total_inv)
+    if "可售天数" in df.columns:
+        mask &= df["可售天数"] < SELLABLE_MAX
 
-        rows.append({
-            "店铺名称":   shop,
-            "图片链接":   grp["图片链接"].dropna().iloc[0] if not grp["图片链接"].dropna().empty else "",
-            "本地SKU名称": _clean_sku(grp["本地SKU名称"].dropna().iloc[0] if not grp["本地SKU名称"].dropna().empty else ""),
-            "父ASIN":     parent_asin,
-            "日均销量":   round(daily_avg_sum, 2),
-            "库存总数":   int(total_inv),
-            "可售天数":   int(sellable_days),
-            "预计补货量": int(restock_qty),
-            "备注":       "关注货件送达时间" if restock_qty < 0 else "",
-        })
+    filtered = df[mask].copy()
 
-    if not rows:
-        print("[OK] 无符合条件的父体记录，未生成文件")
+    if filtered.empty:
+        print("[OK] 无符合条件的记录，未生成文件")
         return None, 0
 
-    result = pd.DataFrame(rows, columns=OUTPUT_COLS)
-    _order = {s: i for i, s in enumerate(result["店铺名称"].unique())}
-    result = result.iloc[result["店铺名称"].map(_order).argsort(kind="stable")].reset_index(drop=True)
+    filtered["预计补货量"] = (filtered["日均销量"] * RESTOCK_DAYS - filtered["库存总数"]).round().astype(int)
+    filtered["备注"]      = filtered["预计补货量"].apply(lambda x: "关注货件送达时间" if x < 0 else "")
+    filtered["本地SKU名称"] = filtered["本地SKU名称"].apply(_clean_sku)
+    filtered["日均销量"]  = filtered["日均销量"].round(2)
+    filtered["库存总数"]  = filtered["库存总数"].astype(int)
+    filtered["可售天数"]  = filtered["可售天数"].astype(int)
+
+    result = filtered[OUTPUT_COLS].copy()
+
+    # 按店铺名称原始出现顺序排序
+    shop_order = {s: i for i, s in enumerate(result["店铺名称"].unique())}
+    result = result.iloc[result["店铺名称"].map(shop_order).argsort(kind="stable")].reset_index(drop=True)
+
     try:
         result.to_excel(output_file, index=False, engine="openpyxl")
     except PermissionError:
         raise RuntimeError(f"无法写入文件，请先关闭 Excel 中的 {output_file.name} 后重试")
+
     hit_count = len(result)
-    print(f"\n[OK] 共 {hit_count} 个父体命中 -> {output_file}")
+    print(f"\n[OK] 共 {hit_count} 条记录命中 -> {output_file}")
     return output_file, hit_count
