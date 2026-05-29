@@ -16,6 +16,7 @@ class KBChunk:
     line_start: int | None
     tags: list[str] = field(default_factory=list)
     created_at: str = ""
+    embedding: list[float] | None = None
 
 
 @dataclass
