@@ -49,3 +49,11 @@ costupdate-saihu = [
     "python-calamine>=0.2",
     "tqdm>=4.66",
 ]
+
+knowledge = [
+    "opendataloader-pdf",
+    "markitdown[all]",
+    "unstructured[pdf,image]",
+    "sqlite-vec",
+    "watchdog",
+]
