@@ -125,6 +125,19 @@ class KBStore:
         self._conn.execute(f"DELETE FROM kb_vec WHERE chunk_id IN ({ph})", ids)
         self._conn.commit()
 
+    def delete_source(self, path: str | Path) -> None:
+        p = str(path)
+        rows = self._conn.execute(
+            "SELECT id FROM kb_chunks WHERE source_path = ?", (p,)
+        ).fetchall()
+        if rows:
+            ids = [r[0] for r in rows]
+            ph = self._placeholders(ids)
+            self._conn.execute(f"DELETE FROM kb_chunks WHERE id IN ({ph})", ids)
+            self._conn.execute(f"DELETE FROM kb_vec WHERE chunk_id IN ({ph})", ids)
+        self._conn.execute("DELETE FROM kb_sources WHERE path = ?", (p,))
+        self._conn.commit()
+
     def get_chunks_by_ids(self, ids: list[str]) -> list[KBChunk]:
         if not ids:
             return []
