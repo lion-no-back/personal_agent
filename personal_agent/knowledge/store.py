@@ -165,6 +165,21 @@ class KBStore:
         )
         self._conn.commit()
 
+    def get_all_chunks(self) -> list[KBChunk]:
+        rows = self._conn.execute(
+            """SELECT id, source_hash, source_path, source_type, wiki_page,
+                       title, content, compiled, chunk_index, page_num,
+                       line_start, tags, created_at FROM kb_chunks"""
+        ).fetchall()
+        return [self._row_to_chunk(row) for row in rows]
+
+    def vector_search(self, embedding: list[float], n: int = 40) -> list[tuple[str, float]]:
+        rows = self._conn.execute(
+            "SELECT chunk_id, distance FROM kb_vec WHERE embedding MATCH ? LIMIT ?",
+            (json.dumps(embedding), n),
+        ).fetchall()
+        return [(row[0], float(row[1])) for row in rows]
+
     def print_stats(self) -> None:
         row = self._conn.execute("""
             SELECT
