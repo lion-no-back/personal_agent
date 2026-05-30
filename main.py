@@ -417,6 +417,23 @@ def main() -> None:
     )
     logger.info("✅ SchedulerDaemon 就绪")
 
+    # ── Step 7.6: 初始化知识库 ────────────────────────────────
+    try:
+        import personal_agent.knowledge as _kb_mod
+        from personal_agent.knowledge import KnowledgeBase
+
+        _kb_instance = KnowledgeBase(
+            db_path=_PROJECT_ROOT / "knowledge_docs" / "kb.sqlite",
+            wiki_dir=_PROJECT_ROOT / "knowledge_docs" / "wiki",
+            sources_dir=_PROJECT_ROOT / "knowledge_docs" / "sources",
+            llm=llm,
+        )  # embed model is read from EMBED_MODEL_ID env var inside embedder.py
+        _kb_instance.start_watcher()
+        _kb_mod.kb = _kb_instance
+        logger.info("✅ KnowledgeBase 就绪 | 监听: %s", _kb_instance.sources_dir)
+    except Exception as e:
+        logger.error("❌ KnowledgeBase 初始化失败（知识库不可用）: %s", e)
+
     # ── Step 8: 多 Gateway 并行启动 ──────────────────────────
     # 每个 gateway 独立 daemon 线程：daemon=True 保证 sys.exit() 可即时终止进程
     # exception queue：监控线程生命周期，任一线程退出则主线程感知并退出

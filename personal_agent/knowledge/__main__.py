@@ -24,10 +24,6 @@ def _build_pipeline() -> tuple[KBStore, Pipeline]:
 
 
 def cmd_ingest(args: argparse.Namespace) -> None:
-    if not args.all and not args.path:
-        print("error: --all or --path required", file=sys.stderr)
-        sys.exit(1)
-
     store, pipeline = _build_pipeline()
 
     if args.all:
@@ -76,7 +72,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command")
 
     p_ingest = sub.add_parser("ingest", help="Ingest files into the knowledge base")
-    grp = p_ingest.add_mutually_exclusive_group()
+    grp = p_ingest.add_mutually_exclusive_group(required=True)
     grp.add_argument("--all", action="store_true", help=f"Ingest all files under {SOURCES_DIR}")
     grp.add_argument("--path", metavar="FILE", help="Ingest a single file")
     p_ingest.add_argument("--force", action="store_true", help="Re-ingest even if hash is unchanged")
