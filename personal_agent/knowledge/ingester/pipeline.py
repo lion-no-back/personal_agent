@@ -91,6 +91,8 @@ class Pipeline:
 
     async def ingest(self, path: str | Path, force: bool = False) -> IngestResult:
         path = Path(path)
+        if not path.exists():
+            return IngestResult(skipped=True, reason="not found")
 
         # Step 1: Change detection
         current_hash = self._sha256_file(path)

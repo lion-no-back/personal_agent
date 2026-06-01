@@ -29,10 +29,19 @@ def ensure_paddle() -> None:
     with _lock:
         if _ensured:
             return
+        import os
+        import warnings
+        # Disable OneDNN (MKL-DNN) before any paddle import — Windows fused_conv2d
+        # crashes with "OneDnnContext does not have the input Filter" when OneDNN is on.
+        os.environ.setdefault("FLAGS_use_mkldnn", "0")
+        # Paddle checks for ccache (C++ compiler cache) on every import. We only use
+        # pre-built paddle binaries and never compile C++ extensions, so suppress it.
+        warnings.filterwarnings("ignore", message="No ccache found", category=UserWarning)
         _ensure_opencv_contrib()   # swap headless→contrib before cv2 is loaded
         if not _is_available():
             _install()
         _fix_torch_if_broken()
+        _patch_inference_ir_opt()
         _ensured = True
 
 
@@ -146,6 +155,32 @@ def _install() -> None:
             "Failed to install PaddleOCR dependencies. "
             "Run manually: uv pip install paddlepaddle unstructured-paddleocr"
         ) from e
+
+
+def _patch_inference_ir_opt() -> None:
+    """Monkey-patch paddle.inference.create_predictor to disable IR optimization.
+
+    On Windows CPU builds, paddle's IR optimizer fuses conv2d into fused_conv2d
+    (an OneDNN operator) even when enable_mkldnn=False.  fused_conv2d then fails
+    with "OneDnnContext does not have the input Filter" because the OneDNN context
+    was never properly initialised for CPU-only inference.
+
+    Disabling IR optimisation (switch_ir_optim(False)) prevents the fusion;
+    plain conv2d is used instead, which runs correctly without OneDNN.
+    """
+    try:
+        import paddle.inference as paddle_inf
+
+        _orig_create = paddle_inf.create_predictor
+
+        def _safe_create(config):
+            config.switch_ir_optim(False)
+            return _orig_create(config)
+
+        paddle_inf.create_predictor = _safe_create
+        logger.info("[paddle_bootstrap] patched create_predictor: IR opt disabled (Windows fused_conv2d fix)")
+    except Exception as exc:
+        logger.warning("[paddle_bootstrap] could not patch create_predictor: %s", exc)
 
 
 def _is_torch_dll_error(exc: OSError) -> bool:

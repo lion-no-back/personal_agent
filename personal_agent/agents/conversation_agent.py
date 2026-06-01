@@ -236,11 +236,19 @@ class ConversationAgent(BaseAgent):
                     "content": messages[0]["content"] + "\n\n" + memory_block,
                 }
 
-            # ── 4.5.5. 瞬态注入 KB 预检索结果 ───────────────────
-            if kb_context_block and messages:
+            # ── 4.5.5. 瞬态注入 KB 预检索结果（仅首轮）────────────
+            # 只在第一轮注入：后续轮次 tool result 已携带完整 KB 内容，
+            # 重复注入会导致 LLM 上下文里同一段内容出现多次，引发循环输出。
+            if kb_context_block and messages and i == 0:
                 messages[0] = {
                     "role": "system",
-                    "content": messages[0]["content"] + "\n\n" + kb_context_block,
+                    "content": (
+                        messages[0]["content"]
+                        + "\n\n"
+                        + "【知识库预取摘要，如已足够请直接作答，"
+                        + "如需详情可调用 knowledge_search（每次提问仅调用一次）】\n"
+                        + kb_context_block.removeprefix("【知识库相关内容，优先参考】\n")
+                    ),
                 }
 
             # ── 4.6. 瞬态注入文件上下文 ─────
@@ -904,10 +912,9 @@ class ConversationAgent(BaseAgent):
                     if accumulated:
                         on_update(accumulated, "generating")
                 # When flow finishes, if no tools, it's safe to mark 'done'. If there are tools, we still mark generating until final loop.
-                if final_tool_calls:
-                    pass  # Keep it generating because tools will be called.
-                else:
-                    on_update(full_response or "", "done")
+                if not final_tool_calls:
+                    # Send final generating frame; process() sends the authoritative "done".
+                    on_update(full_response or "", "generating")
                 return full_response, final_tool_calls
             except Exception as e:
                 if _is_llm_auth_error(e):
@@ -970,16 +977,17 @@ class ConversationAgent(BaseAgent):
                         caught_up = display_idx >= avail
 
                         if llm_done and caught_up:
-                            final_status = "generating" if _buf.get("has_tools") else "done"
-                            on_update(visible, final_status)
+                            # Always "generating" here — the definitive "done" is sent
+                            # by process() after appending routing_suggestion, preventing
+                            # a double _on_done() call that duplicates content in DingTalk.
+                            on_update(visible, "generating")
                             return
                         else:
                             on_update(visible + " ▌", "generating")
 
                     elif llm_done:
                         # display_idx 已追上 buffer 且 LLM 已结束
-                        final_status = "generating" if _buf.get("has_tools") else "done"
-                        on_update(full_text, final_status)
+                        on_update(full_text, "generating")
                         return
                     # else: LLM 仍在生成，buffer 暂无新内容，等下一帧
 

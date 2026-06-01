@@ -21,10 +21,9 @@ def build_knowledge_search_tool() -> ToolDef:
             return "知识库中未找到相关内容。"
         parts = []
         for i, r in enumerate(results, 1):
-            src = r.chunk.source_path
             page = f"，第{r.chunk.page_num}页" if r.chunk.page_num else ""
             body = r.chunk.compiled or r.chunk.content[:400]
-            parts.append(f"**{i}. {r.chunk.title}** [来源: {src}{page}]\n{body}")
+            parts.append(f"**{i}. {r.chunk.title}**{page}\n{body}")
         return "\n\n---\n\n".join(parts)
 
     return ToolDef(

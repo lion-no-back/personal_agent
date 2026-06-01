@@ -52,7 +52,7 @@ costupdate-saihu = [
 
 knowledge = [
     "opendataloader-pdf",
-    "markitdown[all]",
+    "markitdown",
     "unstructured[pdf,image]",
     "sqlite-vec",
     "watchdog",

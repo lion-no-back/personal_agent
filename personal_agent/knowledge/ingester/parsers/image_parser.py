@@ -1,9 +1,23 @@
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .types import ParsedElement
 
+if TYPE_CHECKING:
+    from unstructured_paddleocr import PaddleOCR as _PaddleOCR
+
 logger = logging.getLogger(__name__)
+
+_ocr_instance: "_PaddleOCR | None" = None
+
+
+def _get_ocr() -> "_PaddleOCR":
+    global _ocr_instance
+    if _ocr_instance is None:
+        from unstructured_paddleocr import PaddleOCR
+        _ocr_instance = PaddleOCR(use_angle_cls=True, lang="ch", use_gpu=False, show_log=False)
+    return _ocr_instance
 
 
 def parse_image(path: Path, llm_client=None) -> list[ParsedElement]:
@@ -28,50 +42,45 @@ def parse_image(path: Path, llm_client=None) -> list[ParsedElement]:
     except Exception as e:
         logger.warning("markitdown image description failed (%s): %s", path.name, e)
 
-    # Strategy 2: OCR via PaddleOCR + unstructured
+    # Strategy 2: OCR via PaddleOCR called directly (not through unstructured's partition_image).
+    # Calling directly lets us pass enable_mkldnn=False — the unstructured wrapper has no
+    # parameter for this, and the env-var approach (FLAGS_use_mkldnn=0) races with paddle's
+    # C++ static init on Windows, causing fused_conv2d crashes.
     try:
         # ensure_paddle MUST come first — cv2 is not yet loaded at this point,
         # so the installer can write cv2.pyd without hitting Windows file locks.
         from ...paddle_bootstrap import ensure_paddle
         ensure_paddle()
 
-        from ...hf_bootstrap import ensure_hf_model
-        ensure_hf_model("unstructuredio/detectron2_faster_rcnn_R_50_FPN_3x")
-
-        # Validate the agent module is importable before passing its name as a string.
-        # paddle_bootstrap may succeed (pip exits 0) yet the module remain invisible
-        # to the current process if importlib caches weren't refreshed — this surfaces
-        # that failure as a clear RuntimeError rather than a cryptic unstructured error.
         try:
-            import unstructured_paddleocr as _  # noqa: F401
+            _get_ocr()  # validate importable before use; raises RuntimeError with clear message
         except (ImportError, OSError) as exc:
             raise RuntimeError(
                 "unstructured_paddleocr not importable "
                 f"({type(exc).__name__}); try restarting the process"
             ) from exc
 
-        from unstructured.partition.image import partition_image
-        from unstructured.partition.utils.constants import OCR_AGENT_PADDLE
+        import numpy as np
+        from PIL import Image as PILImage
+
         logger.info("PaddleOCR starting on %s", path.name)
-        raw = partition_image(
-            filename=str(path),
-            strategy="hi_res",
-            ocr_agent=OCR_AGENT_PADDLE,
-            languages=["ch"],
-        )
+        img_array = np.array(PILImage.open(str(path)).convert("RGB"))
+        result = _get_ocr().ocr(img_array, cls=True)
 
         ocr_count = 0
-        for elem in raw:
-            text = str(elem).strip()
-            if text:
-                ocr_count += 1
-                elements.append(ParsedElement(
-                    type="image_ocr",
-                    content=text,
-                    page_num=None,
-                    level=None,
-                    bbox=None,
-                ))
+        for page_result in (result or []):
+            for line in (page_result or []):
+                _bbox, (text, _conf) = line
+                text = text.strip()
+                if text:
+                    ocr_count += 1
+                    elements.append(ParsedElement(
+                        type="image_ocr",
+                        content=text,
+                        page_num=None,
+                        level=None,
+                        bbox=None,
+                    ))
 
         if ocr_count == 0:
             logger.warning(
