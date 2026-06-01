@@ -69,3 +69,46 @@ class Retriever:
 
         reranked = await rerank(query, candidates, self._llm)
         return reranked[:top_k]
+
+    async def search_lightweight(self, query: str, top_k: int = 3) -> list[KBSearchResult]:
+        """No-LLM fast path: keyword + vector only, no decompose/rerank."""
+        all_chunks = self._store.get_all_chunks()
+        if not all_chunks:
+            return []
+
+        sub_queries = [query]
+        vec_task = asyncio.create_task(vector_search_all(self._store, sub_queries, n=20))
+        kw_results = keyword_search_all(all_chunks, sub_queries, n=20)
+        try:
+            vec_results = await vec_task
+        except Exception:
+            vec_results = []
+
+        fused = rrf_merge(kw_results, vec_results, top_n=top_k)
+        if not fused:
+            return []
+
+        chunk_ids = [cid for cid, _ in fused]
+        id_to_score = dict(fused)
+        chunks = self._store.get_chunks_by_ids(chunk_ids)
+        id_to_chunk = {c.id: c for c in chunks}
+
+        kw_ids = {cid for cid, _ in kw_results}
+        vec_ids = {cid for cid, _ in vec_results}
+
+        results = []
+        for cid in chunk_ids:
+            if cid not in id_to_chunk:
+                continue
+            if cid in kw_ids and cid in vec_ids:
+                match_type = "hybrid"
+            elif cid in vec_ids:
+                match_type = "vector"
+            else:
+                match_type = "keyword"
+            results.append(KBSearchResult(
+                chunk=id_to_chunk[cid],
+                score=id_to_score[cid],
+                match_type=match_type,
+            ))
+        return results

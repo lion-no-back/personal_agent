@@ -3,6 +3,8 @@ import asyncio
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from .ingester.pipeline import Pipeline
 from .store import KBStore
 from .watcher import WATCH_EXTENSIONS, KBWatcher
@@ -48,6 +50,11 @@ def cmd_status(_args: argparse.Namespace) -> None:
 
 
 def cmd_watch(_args: argparse.Namespace) -> None:
+    # Pre-warm PaddleOCR deps (install + fix torch DLL) before entering the event loop,
+    # so the first image file doesn't trigger a blocking 200 MB download mid-ingest.
+    from personal_agent.knowledge.paddle_bootstrap import ensure_paddle
+    ensure_paddle()
+
     store, pipeline = _build_pipeline()
     SOURCES_DIR.mkdir(parents=True, exist_ok=True)
     watcher = KBWatcher(pipeline=pipeline, store=store)
@@ -68,6 +75,7 @@ def cmd_watch(_args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
     parser = argparse.ArgumentParser(prog="python -m personal_agent.knowledge")
     sub = parser.add_subparsers(dest="command")
 

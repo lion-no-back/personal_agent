@@ -42,14 +42,22 @@ def _from_opendataloader(data: dict) -> list[ParsedElement]:
         content = str(kid.get("content", "")).strip()
         if not content:
             continue
-        page_raw = kid.get("page_number") or kid.get("page_num") or kid.get("page")
-        level_raw = kid.get("heading_level") or kid.get("level")
-        bbox_raw = kid.get("bounding_box") or kid.get("bbox")
+        page_raw = kid.get("page number") or kid.get("page_number") or kid.get("page_num")
+        level_raw = kid.get("heading level") or kid.get("heading_level")
+        bbox_raw = kid.get("bounding box") or kid.get("bounding_box") or kid.get("bbox")
+        try:
+            level = int(level_raw) if level_raw is not None else None
+        except (ValueError, TypeError):
+            level = None
+        try:
+            page_num = int(page_raw) if page_raw is not None else None
+        except (ValueError, TypeError):
+            page_num = None
         elements.append(ParsedElement(
             type=elem_type,
             content=content,
-            page_num=int(page_raw) if page_raw is not None else None,
-            level=int(level_raw) if level_raw else None,
+            page_num=page_num,
+            level=level,
             bbox=list(bbox_raw) if bbox_raw else None,
         ))
     return elements
@@ -85,23 +93,36 @@ def _from_unstructured(path: Path) -> list[ParsedElement]:
 
 
 def parse_pdf(path: Path, **kwargs) -> list[ParsedElement]:
+    import os
+    from ...java_bootstrap import ensure_java
+    # Silence JUL console output — garbles on Windows and duplicates Python-level logging.
+    _log_cfg = Path(__file__).parent.parent.parent / "java_logging.properties"
+    os.environ.setdefault(
+        "JAVA_TOOL_OPTIONS",
+        f"-Djava.util.logging.config.file={_log_cfg} -Dfile.encoding=UTF-8",
+    )
+    ensure_java()
     try:
         import opendataloader_pdf
-        result = opendataloader_pdf.convert(
+        path = Path(path)
+        opendataloader_pdf.convert(
             str(path),
             format=["json"],
             reading_order="xycut",
             table_method="default",
-            hybrid="docling-fast",
         )
-        if isinstance(result, str):
-            data = json.loads(result)
-        elif hasattr(result, "json") and callable(result.json):
-            data = result.json()
-        elif isinstance(result, dict):
-            data = result
-        else:
-            data = {"kids": []}
+        # convert() writes {stem}.json alongside the input file and returns None
+        json_out = path.with_suffix(".json")
+        if not json_out.exists():
+            raise ValueError("opendataloader_pdf produced no output file")
+        data = json.loads(json_out.read_text(encoding="utf-8"))
+        json_out.unlink()
+        # opendataloader also writes a {stem}_images/ folder; delete it so the
+        # file watcher does not treat the extracted images as new source files.
+        import shutil
+        images_dir = path.with_name(path.stem + "_images")
+        if images_dir.is_dir():
+            shutil.rmtree(images_dir)
         elements = _from_opendataloader(data)
         if elements:
             return elements

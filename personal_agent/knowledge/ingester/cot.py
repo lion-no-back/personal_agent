@@ -91,6 +91,9 @@ async def _stage_a(content: str, wiki_context: str, llm) -> dict:
     return _parse_json(response or "")
 
 
+_STAGE_B_CONCURRENCY = 5  # cap concurrent LLM calls to avoid rate limits
+
+
 async def _stage_b(
     stage_a: dict,
     wiki_dir: Path | None,
@@ -108,24 +111,27 @@ async def _stage_b(
         return {}
 
     stage_a_json = json.dumps(stage_a, ensure_ascii=False, indent=2)
-    wiki_pages: dict[str, str] = {}
+    sem = asyncio.Semaphore(_STAGE_B_CONCURRENCY)
 
-    for page_path in pages:
-        existing = _read_existing(page_path, wiki_dir)
-        messages = [
-            {"role": "user", "content": _STAGE_B_USER.format(
-                existing=existing or "(新页面)",
-                stage_a_json=stage_a_json,
-                path=page_path,
-            )},
-        ]
-        response = await asyncio.to_thread(llm.think, messages, 0.5)
-        if response:
-            extracted = _extract_page(response, page_path)
-            if extracted:
-                wiki_pages[page_path] = extracted
+    async def _generate(page_path: str) -> tuple[str, str | None]:
+        async with sem:
+            existing = _read_existing(page_path, wiki_dir)
+            messages = [
+                {"role": "user", "content": _STAGE_B_USER.format(
+                    existing=existing or "(新页面)",
+                    stage_a_json=stage_a_json,
+                    path=page_path,
+                )},
+            ]
+            try:
+                response = await asyncio.to_thread(llm.think, messages, 0.5)
+                return page_path, _extract_page(response, page_path) if response else None
+            except Exception as e:
+                logger.warning("Stage B failed for %s: %s", page_path, e)
+                return page_path, None
 
-    return wiki_pages
+    results = await asyncio.gather(*(_generate(p) for p in pages))
+    return {path: content for path, content in results if content}
 
 
 def _read_existing(page_path: str, wiki_dir: Path | None) -> str:

@@ -7,6 +7,8 @@ import json
 import concurrent.futures
 from typing import Callable, Optional
 
+import personal_agent.knowledge as _kb_mod
+
 from openai import APIStatusError, AuthenticationError
 
 from ..agents.base_agent import BaseAgent
@@ -196,6 +198,20 @@ class ConversationAgent(BaseAgent):
         if self._memory:
             memory_block = self._memory.retriever.build_memory_block(user_id)
 
+        # ── 3.6. KB 预检索（无 LLM，关键词+向量，注入 system context） ─
+        kb_context_block = ""
+        if _kb_mod.kb is not None and not getattr(event, "is_scheduled", False):
+            try:
+                kb_hits = _kb_mod.kb.quick_search_sync(event.content, top_k=3)
+                if kb_hits:
+                    lines = []
+                    for r in kb_hits:
+                        body = (r.chunk.compiled or r.chunk.content)[:300]
+                        lines.append(f"- 【{r.chunk.title}】{body}")
+                    kb_context_block = "【知识库相关内容，优先参考】\n" + "\n".join(lines)
+            except Exception:
+                logger.debug("KB 预检索失败，跳过", exc_info=True)
+
         final_response = ""
         ui_text_buffer = ""  # UI历史累计区，确保多轮迭代输出不会覆写先前的文字
 
@@ -218,6 +234,13 @@ class ConversationAgent(BaseAgent):
                 messages[0] = {
                     "role": "system",
                     "content": messages[0]["content"] + "\n\n" + memory_block,
+                }
+
+            # ── 4.5.5. 瞬态注入 KB 预检索结果 ───────────────────
+            if kb_context_block and messages:
+                messages[0] = {
+                    "role": "system",
+                    "content": messages[0]["content"] + "\n\n" + kb_context_block,
                 }
 
             # ── 4.6. 瞬态注入文件上下文 ─────

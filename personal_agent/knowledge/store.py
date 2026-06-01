@@ -1,5 +1,6 @@
 import array
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -7,6 +8,8 @@ from pathlib import Path
 import sqlite_vec
 
 from .types import KBChunk, KBSource
+
+_EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
 
 
 class KBStore:
@@ -19,10 +22,10 @@ class KBStore:
         self._create_tables()
 
     def _create_tables(self) -> None:
-        self._conn.executescript("""
+        self._conn.executescript(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS kb_vec USING vec0(
                 chunk_id TEXT,
-                embedding FLOAT[1536]
+                embedding FLOAT[{_EMBED_DIM}]
             );
             CREATE TABLE IF NOT EXISTS kb_chunks (
                 id          TEXT PRIMARY KEY,

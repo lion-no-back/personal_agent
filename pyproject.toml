@@ -56,4 +56,7 @@ knowledge = [
     "unstructured[pdf,image]",
     "sqlite-vec",
     "watchdog",
+    "huggingface-hub",
+    "paddlepaddle",
+    "unstructured-paddleocr",
 ]

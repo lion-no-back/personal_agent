@@ -30,9 +30,9 @@ def build_knowledge_search_tool() -> ToolDef:
     return ToolDef(
         name="knowledge_search",
         description=(
-            "检索内部知识库中的文档、运营规则、产品数据。"
-            "适用于：已导入的 PDF/Word/Excel/文档内容、内部规则、历史分析报告。"
-            "不适用于：实时网络信息、当前时间查询。"
+            "检索用户个人知识库中的文档内容（用户曾导入的任意主题文件：PDF/Word/TXT/图片等）。"
+            "适用于用户明确要求查阅知识库，或需要补充检索更多相关文档时。"
+            "不适用：实时数据（股价、天气）、知识库从未导入过相关内容时。"
         ),
         parameters={
             "type": "object",

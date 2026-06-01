@@ -57,10 +57,18 @@ class KBWatcher:
     def _fire(self, path: str, action: Action) -> None:
         self._pending.pop(path, None)
         if action == "ingest":
-            self._loop.create_task(self._pipeline.ingest(path))
+            logger.info("detected new/modified file, ingesting %s", path)
+            self._loop.create_task(self._ingest_logged(path))
         else:
             self._store.delete_source(path)
             logger.info("deleted lineage for %s", path)
+
+    async def _ingest_logged(self, path: str) -> None:
+        try:
+            result = await self._pipeline.ingest(path)
+            logger.info("ingest done %s → %s", path, result)
+        except Exception:
+            logger.exception("ingest failed for %s", path)
 
 
 class _Handler(FileSystemEventHandler):

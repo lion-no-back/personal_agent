@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import logging
 from dataclasses import dataclass
@@ -97,11 +98,13 @@ class Pipeline:
         if not force and source and source.hash == current_hash:
             return IngestResult(skipped=True, reason="unchanged")
 
-        # Step 2: Parse
+        # Step 2: Parse (run in thread — parsers are sync and may block for seconds/minutes)
         parser = get_parser(path)
         if parser is None:
             return IngestResult(skipped=True, reason="unsupported format")
-        elements = parser(path, llm_client=self._llm_client_for_images)
+        elements = await asyncio.to_thread(
+            parser, path, llm_client=self._llm_client_for_images
+        )
 
         # Step 3: Chunk
         source_type = self._detect_type(path)

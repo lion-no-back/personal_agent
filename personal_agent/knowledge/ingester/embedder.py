@@ -10,9 +10,8 @@ from ..types import KBChunk
 if TYPE_CHECKING:
     from ..store import KBStore
 
-_BATCH_SIZE = 200
+_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "10"))
 _MAX_CONCURRENT = 5
-_DEFAULT_MODEL = os.getenv("EMBED_MODEL_ID", "text-embedding-3-small")
 
 
 def _cache_key(content: str, model: str) -> str:
@@ -21,9 +20,11 @@ def _cache_key(content: str, model: str) -> str:
 
 async def embed_chunks(
     chunks: list[KBChunk],
-    model: str = _DEFAULT_MODEL,
+    model: str | None = None,
     store: "KBStore | None" = None,
 ) -> list[KBChunk]:
+    if model is None:
+        model = os.getenv("EMBED_MODEL_ID", "text-embedding-3-small")
     """Fill chunk.embedding via OpenAI-compatible embedding API.
 
     Checks kb_embed_cache first (cache_key = sha256(content + model)).

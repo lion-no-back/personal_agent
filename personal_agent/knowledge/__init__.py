@@ -58,3 +58,11 @@ class KnowledgeBase:
             self._loop,
         )
         return future.result(timeout=_SEARCH_TIMEOUT)
+
+    def quick_search_sync(self, query: str, top_k: int = 3) -> "list[KBSearchResult]":
+        """No-LLM pre-retrieval: keyword + vector only. Returns empty list on any error."""
+        future = asyncio.run_coroutine_threadsafe(
+            self.retriever.search_lightweight(query, top_k=top_k),
+            self._loop,
+        )
+        return future.result(timeout=10)
