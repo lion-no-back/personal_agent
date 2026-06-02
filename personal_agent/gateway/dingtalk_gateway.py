@@ -103,6 +103,60 @@ def _dt_code_blocks(text: str) -> str:
 
 
 
+def _trim_trailing_table(text: str) -> str:
+    """
+    若文本末尾存在 GFM 表格（无论完整与否），截断到该表格块起始位置前。
+
+    根本原因：钉钉 AI 卡片在 flowStatus=2（streaming）阶段用 content 字段渲染时，
+    对 GFM 表格的列宽计算有 bug——列宽按首帧锁定，后续内容撑不开，
+    导致每字符单独换行。完整表格同样触发此问题。
+    解决策略（参考 soimy/openclaw-channel-dingtalk 的 block-boundary 缓冲）：
+    流式帧永远不推送表格，表格仅在 _finalize 的 blockList 里渲染。
+    """
+    lines = text.split('\n')
+
+    # 找最后一个非空行
+    last_idx = -1
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip():
+            last_idx = i
+            break
+
+    if last_idx == -1 or not lines[last_idx].strip().startswith('|'):
+        return text  # 末尾不是表格行，无需处理
+
+    # 向上找连续的表格行起始（GFM 表格内不允许空行）
+    table_start = last_idx
+    for i in range(last_idx - 1, -1, -1):
+        if lines[i].strip().startswith('|'):
+            table_start = i
+        else:
+            break
+
+    return '\n'.join(lines[:table_start]).rstrip()
+
+
+def _strip_blockquotes(text: str) -> str:
+    """去除 markdown 引用前缀，避免钉钉 streaming 渲染器引用样式粘滞。"""
+    return re.sub(r'^> ?', '', text, flags=re.MULTILINE)
+
+
+def _ensure_table_blank_lines(text: str) -> str:
+    """
+    在 GFM 表格块前插入空行，防止钉钉渲染器将前一行普通文本误识别为表格内容。
+    参考 DingTalk-Real-AI/dingtalk-openclaw-connector 的 ensureTableBlankLines()。
+    """
+    lines = text.split('\n')
+    out: list[str] = []
+    for line in lines:
+        prev = out[-1] if out else ''
+        # 当前行是表格行，前一行非空且非表格行 → 插入空行
+        if line.strip().startswith('|') and prev.strip() and not prev.strip().startswith('|'):
+            out.append('')
+        out.append(line)
+    return '\n'.join(out)
+
+
 def _dt_tables(text: str) -> str:
     """GFM 表格 → 加粗表头 + 竖线分隔文本行。"""
     def replacer(m: re.Match) -> str:
@@ -175,20 +229,24 @@ class DingTalkCardRenderer:
         }
 
     def _push(self, text: str, *, finalize: bool = False) -> None:
-        """全量推送到 streaming 端点（isFull=True）。finalize=True 正式关闭流式会话。"""
-        if text == self._last_text and not finalize:
+        """全量推送到 streaming 端点。统一做流式安全变换：GFM 表格→纯文本、截断未完成表格。"""
+        content = _dt_tables(text)
+        content = _trim_trailing_table(content)
+        content = _strip_blockquotes(content)
+        content = _ensure_table_blank_lines(content).rstrip('\n')
+        if content == self._last_text and not finalize:
             return
         payload = {
             "outTrackId": self._out_track_id,
             "guid": str(uuid.uuid4()),
             "key": "content",
-            "content": text,
+            "content": content,
             "isFull": True,
             "isFinalize": finalize,
             "isError": False,
         }
         httpx.put(_CARD_STREAM_URL, headers=self._mk_headers(), json=payload, timeout=10).raise_for_status()
-        self._last_text = text
+        self._last_text = content
 
     def _on_tool(self, text: str) -> None:
         """工具执行期间立即推送状态，告知用户正在处理（不走节流）。"""
@@ -199,29 +257,26 @@ class DingTalkCardRenderer:
         now = time.monotonic()
         if now - self._last_push_at < self.THROTTLE_S:
             return
-        # flusher 追加的 " ▌" 是打字机光标，嵌入表格/标题等 Markdown 结构后
-        # 会被渲染为黑色占位符或导致标题临时变成引用样式。
-        # DingTalk 卡片 flowStatus=2(INPUTING) 自带进度视觉，不需要光标字符。
         clean = text.removesuffix(" ▌")
         if clean:
             self._push(clean)
             self._last_push_at = now
 
     def _on_done(self, text: str) -> None:
-        # flowStatus=3 隐式关闭 streaming session；跳过单独的 isFinalize push
-        # 可避免两次连续 re-render 导致的视觉闪烁（"一闪"问题）
         self._finalize(text)
 
     def _finalize(self, text: str) -> None:
         """切换卡片到 FINISHED 终态，blockList 使用 markdown-variable-new 渲染完整 GFM。"""
-        block_list = json.dumps([{"type": 0, "markdown": text}], ensure_ascii=False)
+        # 终态同样插入表格空行，确保最终渲染正确
+        normalized = _ensure_table_blank_lines(text)
+        block_list = json.dumps([{"type": 0, "markdown": normalized}], ensure_ascii=False)
         payload = {
             "outTrackId": self._out_track_id,
             "cardData": {
                 "cardParamMap": {
                     "blockList": block_list,
-                    "content": text,
-                    "copy_content": text,
+                    "content": "",
+                    "copy_content": normalized,
                     "flowStatus": "3",  # FINISHED
                 }
             },
@@ -429,6 +484,9 @@ class DingTalkGateway(BaseGateway):
         if not event.content:
             return
 
+        if event.chat_type == "p2p":
+            threading.Thread(target=self._send_ack, args=(incoming,), daemon=True).start()
+
         renderer = self._try_create_renderer(incoming)
 
         session_key = self._compute_session_key(event)
@@ -455,7 +513,7 @@ class DingTalkGateway(BaseGateway):
             open_space_id = (
                 f"dtv1.card//IM_GROUP.{incoming.conversation_id}"
                 if is_group
-                else f"dtv1.card//IM_ROBOT.{incoming.conversation_id}"
+                else f"dtv1.card//IM_ROBOT.{incoming.sender_staff_id}"
             )
             deliver_model = {"robotCode": self._client_id, "extension": "{}"}
             payload: dict = {
@@ -476,7 +534,11 @@ class DingTalkGateway(BaseGateway):
                 payload["imGroupOpenDeliverModel"] = deliver_model
             else:
                 payload["imRobotOpenSpaceModel"] = {"supportForward": True}
-                payload["imRobotOpenDeliverModel"] = {**deliver_model, "spaceType": "IM_ROBOT"}
+                payload["imRobotOpenDeliverModel"] = {
+                    **deliver_model,
+                    "spaceType": "IM_ROBOT",
+                    "userId": incoming.sender_staff_id,
+                }
 
             resp = httpx.post(_CARD_CREATE_URL, headers=create_headers, json=payload, timeout=10)
             resp.raise_for_status()
@@ -574,6 +636,16 @@ class DingTalkGateway(BaseGateway):
                 logger.error("sessionWebhook 回复失败: %s", result)
         except Exception as e:
             logger.error("sessionWebhook 发送异常: %s", e)
+
+    def _send_ack(self, incoming: "ChatbotMessage") -> None:
+        """私聊收到新消息时，立即通过 sessionWebhook 发送「收到」确认，让用户知道请求已在处理中。"""
+        if not incoming.session_webhook:
+            return
+        payload = {"msgtype": "text", "text": {"content": "[收到]"}}
+        try:
+            httpx.post(incoming.session_webhook, json=payload, timeout=5)
+        except Exception as e:
+            logger.debug("收到确认发送失败: %s", e)
 
     def _send_markdown_via_api(self, id_type: str, raw_id: str, text: str) -> None:
         """通过 OpenAPI 主动发 Markdown 消息（send_text 后端，需 api token）。"""
