@@ -5,6 +5,10 @@ from .types import ToolDef
 logger = logging.getLogger(__name__)
 
 
+_MAX_PER_RESULT = 1200   # chars; ~300 tokens per result
+_MAX_TOTAL = 4000        # chars; ~1000 tokens total
+
+
 def build_knowledge_search_tool() -> ToolDef:
     def _call(query: str, top_k: int = 5, **kwargs) -> str:
         import personal_agent.knowledge as _kb_mod
@@ -19,11 +23,24 @@ def build_knowledge_search_tool() -> ToolDef:
             return f"检索出错：{e}"
         if not results:
             return "知识库中未找到相关内容。"
+
         parts = []
+        budget = _MAX_TOTAL
         for i, r in enumerate(results, 1):
             page = f"，第{r.chunk.page_num}页" if r.chunk.page_num else ""
-            body = r.chunk.compiled or r.chunk.content[:400]
-            parts.append(f"**{i}. {r.chunk.title}**{page}\n{body}")
+            # Parent chunks return compiled (per-parent summary) or full content;
+            # both are bounded by _MAX_PER_RESULT to keep context predictable.
+            body = r.chunk.compiled or r.chunk.content
+            if len(body) > _MAX_PER_RESULT:
+                body = body[:_MAX_PER_RESULT] + "…"
+            entry = f"**{i}. {r.chunk.title}**{page}\n{body}"
+            if len(entry) > budget:
+                if budget > 200:
+                    parts.append(entry[:budget] + "…")
+                break
+            parts.append(entry)
+            budget -= len(entry)
+
         return "\n\n---\n\n".join(parts)
 
     return ToolDef(

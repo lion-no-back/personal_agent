@@ -14,6 +14,7 @@ class KBChunk:
     chunk_index: int
     page_num: int | None
     line_start: int | None
+    parent_id: str | None = None  # None = standalone 或 parent；有值 = leaf
     tags: list[str] = field(default_factory=list)
     created_at: str = ""
     embedding: list[float] | None = None

@@ -20,6 +20,7 @@ class KBStore:
         sqlite_vec.load(self._conn)
         self._conn.enable_load_extension(False)
         self._create_tables()
+        self._migrate_schema()
 
     def _create_tables(self) -> None:
         self._conn.executescript(f"""
@@ -40,7 +41,8 @@ class KBStore:
                 page_num    INTEGER,
                 line_start  INTEGER,
                 tags        TEXT DEFAULT '[]',
-                created_at  TEXT
+                created_at  TEXT,
+                parent_id   TEXT
             );
             CREATE TABLE IF NOT EXISTS kb_sources (
                 path        TEXT PRIMARY KEY,
@@ -56,8 +58,18 @@ class KBStore:
             );
             CREATE INDEX IF NOT EXISTS idx_chunks_source ON kb_chunks(source_path);
             CREATE INDEX IF NOT EXISTS idx_chunks_title  ON kb_chunks(title);
+            CREATE INDEX IF NOT EXISTS idx_chunks_parent ON kb_chunks(parent_id);
         """)
         self._conn.commit()
+
+    def _migrate_schema(self) -> None:
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(kb_chunks)")}
+        if "parent_id" not in existing:
+            self._conn.execute("ALTER TABLE kb_chunks ADD COLUMN parent_id TEXT")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chunks_parent ON kb_chunks(parent_id)"
+            )
+            self._conn.commit()
 
     @staticmethod
     def _placeholders(ids: list[str]) -> str:
@@ -77,7 +89,7 @@ class KBStore:
                 c.id, c.source_hash, c.source_path, c.source_type, c.wiki_page,
                 c.title, c.content, c.compiled, c.chunk_index, c.page_num,
                 c.line_start, json.dumps(c.tags, ensure_ascii=False),
-                c.created_at or now,
+                c.created_at or now, c.parent_id,
             )
             for c in chunks
         ]
@@ -86,8 +98,8 @@ class KBStore:
             """INSERT OR REPLACE INTO kb_chunks
                (id, source_hash, source_path, source_type, wiki_page,
                 title, content, compiled, chunk_index, page_num,
-                line_start, tags, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                line_start, tags, created_at, parent_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             rows,
         )
         for chunk in chunks:
@@ -143,7 +155,7 @@ class KBStore:
         rows = self._conn.execute(
             f"""SELECT id, source_hash, source_path, source_type, wiki_page,
                        title, content, compiled, chunk_index, page_num,
-                       line_start, tags, created_at
+                       line_start, tags, created_at, parent_id
                 FROM kb_chunks WHERE id IN ({self._placeholders(ids)})""",
             ids,
         ).fetchall()
@@ -157,6 +169,7 @@ class KBStore:
             page_num=row[9], line_start=row[10],
             tags=json.loads(row[11] or "[]"),
             created_at=row[12] or "",
+            parent_id=row[13] if len(row) > 13 else None,
         )
 
     def get_embed_cache(self, content_hash: str) -> list[float] | None:
@@ -181,7 +194,7 @@ class KBStore:
         rows = self._conn.execute(
             """SELECT id, source_hash, source_path, source_type, wiki_page,
                        title, content, compiled, chunk_index, page_num,
-                       line_start, tags, created_at FROM kb_chunks"""
+                       line_start, tags, created_at, parent_id FROM kb_chunks"""
         ).fetchall()
         return [self._row_to_chunk(row) for row in rows]
 

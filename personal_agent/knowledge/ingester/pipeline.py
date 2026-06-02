@@ -128,7 +128,13 @@ class Pipeline:
             cot_was_used = True
 
         # Step 5: Embed (uses kb_embed_cache for deduplication)
-        chunks = await embedder.embed_chunks(chunks, store=self._store)
+        # Parents are not embedded — only leaves (parent_id is not None) and standalones
+        # (parent_id is None with no children) participate in vector search.
+        _parent_ids = {c.parent_id for c in chunks if c.parent_id is not None}
+        _to_embed = [c for c in chunks if c.parent_id is not None or c.id not in _parent_ids]
+        _to_embed = await embedder.embed_chunks(_to_embed, store=self._store)
+        _embedded = {c.id: c for c in _to_embed}
+        chunks = [_embedded.get(c.id, c) for c in chunks]
 
         # Step 6: Write lineage & replace old chunks
         if source:

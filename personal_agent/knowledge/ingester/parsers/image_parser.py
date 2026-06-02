@@ -1,3 +1,4 @@
+import hashlib
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -21,6 +22,10 @@ def _get_ocr() -> "_PaddleOCR":
 
 
 def parse_image(path: Path, llm_client=None) -> list[ParsedElement]:
+    # All elements from one image file share a group_id so the chunker
+    # merges them into a parent chunk instead of creating isolated shards.
+    gid = hashlib.sha256(str(path).encode()).hexdigest()[:16]
+
     elements: list[ParsedElement] = []
 
     # Strategy 1: semantic description via markitdown (LLM-driven when client provided)
@@ -38,6 +43,7 @@ def parse_image(path: Path, llm_client=None) -> list[ParsedElement]:
                 page_num=None,
                 level=None,
                 bbox=None,
+                group_id=gid,
             ))
     except Exception as e:
         logger.warning("markitdown image description failed (%s): %s", path.name, e)
@@ -80,6 +86,7 @@ def parse_image(path: Path, llm_client=None) -> list[ParsedElement]:
                         page_num=None,
                         level=None,
                         bbox=None,
+                        group_id=gid,
                     ))
 
         if ocr_count == 0:

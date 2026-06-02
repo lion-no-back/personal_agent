@@ -51,11 +51,16 @@ async def run(
 ) -> tuple[list[KBChunk], dict[str, str]]:
     """Two-phase CoT: Stage A analysis → Stage B wiki generation.
 
-    Returns updated chunks (compiled filled) and wiki_pages {rel_path: content}.
+    Returns updated chunks (compiled filled on top-level chunks) and
+    wiki_pages {rel_path: content}.
     wiki_pages keys are paths like "wiki/entities/xxx.md" relative to wiki_dir.parent.
     """
+    # Stage A / B use only top-level content to avoid duplicate input from
+    # leaf chunks (leaves duplicate their parent's text).
+    top_level = [c for c in chunks if c.parent_id is None]
+
     all_content = "\n\n".join(
-        f"[Chunk {c.chunk_index}] {c.title}\n{c.content}" for c in chunks
+        f"[Chunk {c.chunk_index}] {c.title}\n{c.content}" for c in top_level
     )
     if len(all_content) > _CHAR_LIMIT:
         logger.warning(
@@ -71,13 +76,38 @@ async def run(
     stage_a = await _stage_a(all_content, wiki_context, llm)
     wiki_pages = await _stage_b(stage_a, wiki_dir, llm)
 
-    key_facts = stage_a.get("key_facts", [])
-    if key_facts:
-        compiled = "\n".join(f"- {f}" for f in key_facts)
-        for chunk in chunks:
-            chunk.compiled = compiled
+    # Per-top-level-chunk compiled to avoid broadcasting one summary to all chunks.
+    if len(top_level) == 1:
+        # Single top-level chunk: reuse Stage A key_facts (zero extra LLM calls)
+        key_facts = stage_a.get("key_facts", [])
+        if key_facts:
+            top_level[0].compiled = "\n".join(f"- {f}" for f in key_facts)
+    else:
+        # Multiple top-level chunks: generate a focused summary per chunk
+        await _compile_top_level(top_level, llm)
 
     return chunks, wiki_pages
+
+
+async def _compile_top_level(chunks: list[KBChunk], llm) -> None:
+    """Generate a per-chunk key-facts summary; concurrency limited."""
+    sem = asyncio.Semaphore(_STAGE_B_CONCURRENCY)
+
+    async def _one(chunk: KBChunk) -> None:
+        async with sem:
+            if not chunk.content.strip():
+                return
+            messages = [{"role": "user", "content": (
+                "请用 3-5 条要点概括以下内容的关键信息，只输出要点列表：\n\n"
+                f"{chunk.content[:_CHAR_LIMIT]}"
+            )}]
+            try:
+                resp = await asyncio.to_thread(llm.think, messages, 0.2)
+                chunk.compiled = resp.strip() if resp else None
+            except Exception as e:
+                logger.warning("per-chunk compiled 提取失败 (chunk %d): %s", chunk.chunk_index, e)
+
+    await asyncio.gather(*(_one(c) for c in chunks))
 
 
 async def _stage_a(content: str, wiki_context: str, llm) -> dict:
