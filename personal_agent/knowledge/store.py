@@ -1,5 +1,6 @@
 import array
 import json
+import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -9,7 +10,17 @@ import sqlite_vec
 
 from .types import KBChunk, KBSource
 
+logger = logging.getLogger(__name__)
+
 _EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
+
+# FTS5 trigram requires each query term to be >= 3 characters.
+# Shorter queries fall back to LIKE on title + source_path (both short fields).
+_FTS_MIN_CHARS = 3
+
+# Single source of truth for the FTS table schema — used in both _create_tables
+# and _migrate_schema so they can never drift apart.
+_FTS_SCHEMA = "chunk_id UNINDEXED, title, content, path_stem, tokenize = 'trigram'"
 
 
 class KBStore:
@@ -28,6 +39,7 @@ class KBStore:
                 chunk_id TEXT,
                 embedding FLOAT[{_EMBED_DIM}]
             );
+            CREATE VIRTUAL TABLE IF NOT EXISTS kb_fts USING fts5({_FTS_SCHEMA});
             CREATE TABLE IF NOT EXISTS kb_chunks (
                 id          TEXT PRIMARY KEY,
                 source_hash TEXT NOT NULL,
@@ -63,6 +75,7 @@ class KBStore:
         self._conn.commit()
 
     def _migrate_schema(self) -> None:
+        # 1. kb_chunks: add parent_id column if missing (legacy DBs)
         existing = {row[1] for row in self._conn.execute("PRAGMA table_info(kb_chunks)")}
         if "parent_id" not in existing:
             self._conn.execute("ALTER TABLE kb_chunks ADD COLUMN parent_id TEXT")
@@ -70,6 +83,38 @@ class KBStore:
                 "CREATE INDEX IF NOT EXISTS idx_chunks_parent ON kb_chunks(parent_id)"
             )
             self._conn.commit()
+
+        # 2. kb_fts: rebuild if tokenizer is not trigram (old unicode61 schema)
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'kb_fts'"
+        ).fetchone()
+        if row is None or "trigram" not in (row[0] or ""):
+            self._conn.executescript(
+                f"DROP TABLE IF EXISTS kb_fts;"
+                f"CREATE VIRTUAL TABLE kb_fts USING fts5({_FTS_SCHEMA});"
+            )
+            self._conn.commit()
+
+        # 3. Backfill: populate FTS from kb_chunks if FTS is empty (covers both
+        #    the first-ever startup and the just-rebuilt case above).
+        self._backfill_fts()
+
+    def _backfill_fts(self) -> None:
+        """Populate kb_fts from kb_chunks when the index is empty but data exists.
+        Fetches only the four columns needed for FTS — avoids loading embeddings
+        and other unused fields that get_all_chunks() would pull in."""
+        fts_empty = self._conn.execute("SELECT 1 FROM kb_fts LIMIT 1").fetchone() is None
+        has_chunks = self._conn.execute("SELECT 1 FROM kb_chunks LIMIT 1").fetchone() is not None
+        if not fts_empty or not has_chunks:
+            return
+        rows = self._conn.execute(
+            "SELECT id, title, content, source_path FROM kb_chunks"
+        ).fetchall()
+        self._conn.executemany(
+            "INSERT INTO kb_fts (chunk_id, title, content, path_stem) VALUES (?,?,?,?)",
+            [(r[0], r[1] or "", r[2] or "", Path(r[3]).stem) for r in rows],
+        )
+        self._conn.commit()
 
     @staticmethod
     def _placeholders(ids: list[str]) -> str:
@@ -101,6 +146,13 @@ class KBStore:
                 line_start, tags, created_at, parent_id)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             rows,
+        )
+        # FTS: batch delete then insert (2 statements regardless of chunk count).
+        # FTS covers every chunk independent of embedding readiness.
+        cur.executemany("DELETE FROM kb_fts WHERE chunk_id = ?", [(c.id,) for c in chunks])
+        cur.executemany(
+            "INSERT INTO kb_fts (chunk_id, title, content, path_stem) VALUES (?,?,?,?)",
+            [(c.id, c.title or "", c.content or "", Path(c.source_path).stem) for c in chunks],
         )
         for chunk in chunks:
             if chunk.embedding is not None:
@@ -138,12 +190,16 @@ class KBStore:
         ph = self._placeholders(ids)
         self._conn.execute(f"DELETE FROM kb_chunks WHERE id IN ({ph})", ids)
         self._conn.execute(f"DELETE FROM kb_vec WHERE chunk_id IN ({ph})", ids)
+        self._conn.execute(f"DELETE FROM kb_fts WHERE chunk_id IN ({ph})", ids)
         self._conn.commit()
 
     def delete_source(self, path: str | Path) -> None:
         p = str(path)
         self._conn.execute(
             "DELETE FROM kb_vec WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE source_path = ?)", (p,)
+        )
+        self._conn.execute(
+            "DELETE FROM kb_fts WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE source_path = ?)", (p,)
         )
         self._conn.execute("DELETE FROM kb_chunks WHERE source_path = ?", (p,))
         self._conn.execute("DELETE FROM kb_sources WHERE path = ?", (p,))
@@ -204,6 +260,43 @@ class KBStore:
             (json.dumps(embedding), n),
         ).fetchall()
         return [(row[0], float(row[1])) for row in rows]
+
+    def fts_search_all(self, queries: list[str], n: int = 40) -> list[str]:
+        """Keyword candidate generation — sparse twin of vector_search.
+
+        Long queries (>= 3 chars): FTS5 trigram MATCH, BM25-ranked, no full-table scan.
+        Short queries / FTS parse errors: LIKE fallback on title + source_path.
+
+        Returns a deduped list of chunk_ids preserving BM25 order within each
+        sub-query and first-seen order across sub-queries.
+        """
+        seen: dict[str, None] = {}
+        for q in queries:
+            q = q.strip()
+            if not q:
+                continue
+            if len(q) >= _FTS_MIN_CHARS:
+                try:
+                    rows = self._conn.execute(
+                        "SELECT chunk_id FROM kb_fts WHERE kb_fts MATCH ?"
+                        " ORDER BY bm25(kb_fts) LIMIT ?",
+                        (q, n),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    logger.debug("FTS MATCH failed for %r, falling back to LIKE", q)
+                else:
+                    for (cid,) in rows:
+                        seen.setdefault(cid, None)
+                    continue
+            # Short-query or FTS-error fallback: LIKE on title + source_path.
+            # Both are short strings; source_path coverage is needed so that
+            # filename-keyed queries reach the bespoke scorer's FILENAME_EXACT_BONUS.
+            for (cid,) in self._conn.execute(
+                "SELECT id FROM kb_chunks WHERE title LIKE ? OR source_path LIKE ? LIMIT ?",
+                (f"%{q}%", f"%{q}%", n),
+            ).fetchall():
+                seen.setdefault(cid, None)
+        return list(seen.keys())
 
     def print_stats(self) -> None:
         row = self._conn.execute("""

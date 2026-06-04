@@ -1,5 +1,11 @@
 import asyncio
+import importlib
+import importlib.util
+import logging
+import shutil
+import subprocess
 import threading
+import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -12,10 +18,45 @@ if TYPE_CHECKING:
     from personal_agent.core.llm_router import LLMRouter
     from personal_agent.knowledge.types import KBSearchResult
 
+logger = logging.getLogger(__name__)
+
 _SEARCH_TIMEOUT = 30  # seconds — budget for one retriever.search() call
+
+_DEP_GROUP = "knowledge"
+# 任一缺失即触发安装，防止部分安装时误判
+_CHECK_PACKAGES = ["opendataloader_pdf", "sqlite_vec"]
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # Module-level singleton set by main.py after initialization.
 kb: "KnowledgeBase | None" = None
+
+
+def _ensure_deps() -> None:
+    """检查知识库依赖是否齐全，有缺失时从 pyproject.toml dependency-group 自动安装。
+
+    故意不用 uv sync：sync 会删除 lockfile 外的包（含 paddle/opencv 等动态装入的包），
+    且会因锁住的 DLL（sqlite_vec.dll）而拒绝访问。pip install 是纯加法。
+    """
+    missing = [p for p in _CHECK_PACKAGES if importlib.util.find_spec(p) is None]
+    if not missing:
+        return
+
+    with open(_PROJECT_ROOT / "pyproject.toml", "rb") as f:
+        data = tomllib.load(f)
+    packages = data.get("dependency-groups", {}).get(_DEP_GROUP, [])
+    if not packages:
+        packages = missing  # pyproject.toml 解析失败时退化到哨兵包
+
+    uv = shutil.which("uv") or "uv"
+    logger.info("[knowledge] 缺少依赖 %s，正在安装依赖组 %s，请稍候...", missing, _DEP_GROUP)
+    try:
+        subprocess.run([uv, "pip", "install"] + packages, check=True, capture_output=False)
+        importlib.invalidate_caches()
+        logger.info("[knowledge] 依赖安装完成")
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"依赖组 {_DEP_GROUP!r} 安装失败，请手动执行：uv pip install {' '.join(packages)}"
+        ) from exc
 
 
 class KnowledgeBase:
@@ -26,6 +67,7 @@ class KnowledgeBase:
         sources_dir: Path,
         llm: "LLMRouter",
     ) -> None:
+        _ensure_deps()
         self.sources_dir = Path(sources_dir)
         self._wiki_dir = Path(wiki_dir)
 

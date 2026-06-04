@@ -1,25 +1,13 @@
-import re
 from collections import Counter
 from pathlib import Path
 
+from personal_agent.knowledge.text_tokenize import tokenize as _tokenize
 from personal_agent.knowledge.types import KBChunk
 
 FILENAME_EXACT_BONUS = 200.0
 PHRASE_IN_TITLE_BONUS = 50.0
 TITLE_TOKEN_WEIGHT = 5.0
 CONTENT_TOKEN_WEIGHT = 1.0
-
-
-def _tokenize(text: str) -> list[str]:
-    """CJK bigrams + unigrams, plus ASCII words."""
-    tokens: list[str] = []
-    cjk = re.findall(r"[一-鿿㐀-䶿豈-﫿]", text)
-    for i, ch in enumerate(cjk):
-        tokens.append(ch)
-        if i + 1 < len(cjk):
-            tokens.append(cjk[i] + cjk[i + 1])
-    tokens.extend(re.findall(r"[a-zA-Z0-9]+", text.lower()))
-    return tokens
 
 
 def keyword_search_all(
