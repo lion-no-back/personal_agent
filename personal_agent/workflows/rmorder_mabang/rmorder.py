@@ -319,13 +319,11 @@ def download_reports(tasks: list[dict], output_dir: str) -> list[str]:
 def main():
     now = datetime.now()
     run_time = now.strftime("%Y-%m-%d %H:%M:%S")
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     output_dir = os.path.join(
         project_root,
         "artifact",
-        f"rmorder{now.year}",
-        f"{now.month}.{now.day}",
-        now.strftime("%H%M%S"),
+        now.strftime("rmorder_%Y%m%d_%H%M%S"),
     )
     start_time, end_time = last_month_range()
     log(f"报告区间: {start_time} ~ {end_time}")

@@ -553,24 +553,24 @@ async def run_pipeline(task_list, main_session, amz_cookie_str, memcache_key, ca
                     continue
 
                 children_dict, total_items_count = entry
-                total_material_cost = 0.0
+                unit_price_sum = 0.0
                 missing_child_skus = []
 
-                for child_sku, qty in children_dict.items():
+                for child_sku in children_dict:
                     p_data = price_cache.get(child_sku)
                     if p_data is None:
-                        # 库存系统完全找不到该子件 → 真正失败
                         missing_child_skus.append(child_sku)
                     else:
-                        # price=0.0 合法（包装件等），以 0 成本参与汇总
-                        total_material_cost += p_data[0] * qty
+                        unit_price_sum += p_data[0]
 
                 if missing_child_skus:
                     logger.warning(f"MSKU={m} 本地SKU={ls} 子件在库存系统中未找到: {missing_child_skus}")
                     final_results[m] = "库存SKU获取不到采购价"
                     combo_fail += 1
                 else:
-                    final_combo_price = total_material_cost + 1.0 + 1.0 * (total_items_count - 1)
+                    # 公式：各子件单价之和 + 子件种类数
+                    child_type_count = len(children_dict)
+                    final_combo_price = unit_price_sum + child_type_count
                     final_results[m] = round(final_combo_price, 2)
                     combo_success += 1
 
