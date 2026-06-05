@@ -215,6 +215,25 @@ def _try_add_feishu(gateways, agent, context, task_manager, file_stash) -> None:
         logger.error("❌ 飞书网关初始化失败: %s", e)
 
 
+def _heal_venv() -> None:
+    """清除 METADATA 文件缺失的残缺 dist-info 目录。
+
+    uv pip install 在解析阶段会扫描所有已装包的元数据，遇到 METADATA 文件缺失的
+    dist-info 目录会直接退出，导致无关包的安装也失败。根因是历史上 uv sync 删除了
+    元数据文件（DLL 因进程锁无法删除，模块本身仍可用）。
+    修复方式：删除残缺的 dist-info 目录，让 uv 把该包视为未安装并重新装到正确版本，
+    而不是补写假 METADATA（假文件会让版本检测误判已安装正确版本）。
+    """
+    import shutil as _shutil
+    import sysconfig
+    site_dir = Path(sysconfig.get_path("purelib"))
+    for dist_info in site_dir.glob("*.dist-info"):
+        if (dist_info / "METADATA").exists():
+            continue
+        logger.info("[startup] 移除残缺 dist-info: %s", dist_info.name)
+        _shutil.rmtree(dist_info, ignore_errors=True)
+
+
 def main() -> None:
     # ── Step 1: 加载 .env ────────────────────────────────────
     # 优先读取与 main.py 同目录的 .env（不依赖当前工作目录）。
@@ -226,6 +245,11 @@ def main() -> None:
 
     # ── Step 2: 配置日志 ─────────────────────────────────────
     setup_logging()
+
+    # ── Step 2.5: venv 自愈 ──────────────────────────────────
+    # 在任何组件初始化之前修复残缺的 dist-info，避免后续 uv pip install 因读不到
+    # 包元数据而崩溃。仅补写缺失的 METADATA 文件，不触发任何包重装。
+    _heal_venv()
 
     logger.info("=" * 60)
     logger.info("  PersonalAgent 启动中...")

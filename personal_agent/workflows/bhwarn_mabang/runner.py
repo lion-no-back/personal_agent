@@ -27,18 +27,22 @@ def _get_project_root() -> Path:
     return path.parents[3]
 
 
+_INSTALL_PACKAGES = ["openpyxl>=3.1", "pandas>=2.0", "python-calamine>=0.2"]
+
+
 def _ensure_deps() -> None:
     missing = [p for p in _CHECK_PACKAGES if importlib.util.find_spec(p) is None]
     if not missing:
         return
     uv = shutil.which("uv") or "uv"
-    logger.info("[bhwarn_mabang] 缺少依赖 %s，正在安装 %s...", missing, _DEP_GROUP)
+    logger.info("[bhwarn_mabang] 缺少依赖 %s，正在安装...", missing)
     try:
-        subprocess.run([uv, "sync", "--group", _DEP_GROUP], check=True, capture_output=False)
+        subprocess.run([uv, "pip", "install"] + _INSTALL_PACKAGES, check=True, capture_output=False)
+        importlib.invalidate_caches()
         logger.info("[bhwarn_mabang] 依赖安装完成")
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
-            f"依赖组 {_DEP_GROUP!r} 安装失败，请手动执行：uv sync --group {_DEP_GROUP}"
+            f"依赖安装失败，请手动执行：uv pip install {' '.join(_INSTALL_PACKAGES)}"
         ) from exc
 
 

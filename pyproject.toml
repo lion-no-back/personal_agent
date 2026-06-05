@@ -50,11 +50,20 @@ costupdate-saihu = [
     "tqdm>=4.66",
 ]
 
+rmorder-mabang = [
+    "aiohttp>=3.9",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    "openpyxl>=3.1",
+    "pandas>=2.0",
+    "tqdm>=4.66",
+]
+
 knowledge = [
     "opendataloader-pdf",
     "markitdown",
     "unstructured[pdf,image]",
-    "sqlite-vec",
+    "sqlite-vec==0.1.9",
     "watchdog",
     "huggingface-hub",
     "paddlepaddle",

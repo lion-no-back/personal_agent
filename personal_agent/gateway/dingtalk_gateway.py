@@ -82,9 +82,12 @@ def _fmt_for_dingtalk(text: str) -> str:
     不支持：围栏代码块 ``` 、GFM 表格、内联代码 `
 
     转换策略：
+    - 单个 \n → \n\n（钉钉 Markdown 单换行等同于空格，需双换行才成段落）
     - 代码块 → > 引用块（官方支持，视觉上与正文区分）
     - 表格   → 首行加粗 + 竖线分隔文本行
     """
+    # 单 \n → \n\n，已是 \n\n 的不重复扩展
+    text = re.sub(r'(?<!\n)\n(?!\n)', '\n\n', text)
     text = _dt_code_blocks(text)
     text = _dt_tables(text)
     return text

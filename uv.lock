@@ -2521,6 +2521,14 @@ knowledge = [
     { name = "unstructured-paddleocr" },
     { name = "watchdog" },
 ]
+rmorder-mabang = [
+    { name = "aiohttp" },
+    { name = "beautifulsoup4" },
+    { name = "lxml" },
+    { name = "openpyxl" },
+    { name = "pandas" },
+    { name = "tqdm" },
+]
 zxwarn-mabang = [
     { name = "openpyxl" },
     { name = "pandas" },
@@ -2562,10 +2570,18 @@ knowledge = [
     { name = "markitdown" },
     { name = "opendataloader-pdf" },
     { name = "paddlepaddle" },
-    { name = "sqlite-vec" },
+    { name = "sqlite-vec", specifier = "==0.1.9" },
     { name = "unstructured", extras = ["pdf", "image"] },
     { name = "unstructured-paddleocr" },
     { name = "watchdog" },
+]
+rmorder-mabang = [
+    { name = "aiohttp", specifier = ">=3.9" },
+    { name = "beautifulsoup4", specifier = ">=4.12" },
+    { name = "lxml", specifier = ">=5.0" },
+    { name = "openpyxl", specifier = ">=3.1" },
+    { name = "pandas", specifier = ">=2.0" },
+    { name = "tqdm", specifier = ">=4.66" },
 ]
 zxwarn-mabang = [
     { name = "openpyxl", specifier = ">=3.1" },

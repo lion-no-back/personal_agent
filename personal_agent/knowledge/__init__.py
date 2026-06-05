@@ -32,27 +32,62 @@ kb: "KnowledgeBase | None" = None
 
 
 def _ensure_deps() -> None:
-    """检查知识库依赖是否齐全，有缺失时从 pyproject.toml dependency-group 自动安装。
+    """检查知识库依赖是否齐全且版本正确，否则自动安装/重装。
 
-    故意不用 uv sync：sync 会删除 lockfile 外的包（含 paddle/opencv 等动态装入的包），
-    且会因锁住的 DLL（sqlite_vec.dll）而拒绝访问。pip install 是纯加法。
+    故意不用 uv sync：sync 会删除 lockfile 外的包（含 paddle/opencv 等动态装入的包）。
+    版本检查只用元数据（importlib.metadata），不 import 原生扩展，避免在 Windows 上
+    因 DLL 已被进程锁定而导致子进程 reinstall 无效。
     """
+    import importlib.metadata
+
     missing = [p for p in _CHECK_PACKAGES if importlib.util.find_spec(p) is None]
-    if not missing:
-        return
 
     with open(_PROJECT_ROOT / "pyproject.toml", "rb") as f:
         data = tomllib.load(f)
     packages = data.get("dependency-groups", {}).get(_DEP_GROUP, [])
     if not packages:
-        packages = missing  # pyproject.toml 解析失败时退化到哨兵包
+        packages = missing
+
+    # 检查有 == 约束的包版本是否匹配，不匹配则强制重装。
+    # 注意：不对原生扩展（如 sqlite_vec）做运行时 API 探针。
+    # 原因：store.py 顶层 import sqlite_vec 在本函数调用前已将 DLL 锁入进程，
+    # Windows 下子进程无法替换被锁定的 .pyd 文件，探针只会制造"安装成功但实际无效"的假象。
+    reinstall_flags: list[str] = []
+    wrong_version: list[str] = []
+    for spec in packages:
+        if "==" not in spec:
+            continue
+        name, expected = spec.split("==", 1)
+        name, expected = name.strip(), expected.strip()
+        try:
+            installed = importlib.metadata.version(name)
+            if installed != expected:
+                wrong_version.append(f"{name} {installed}→{expected}")
+                reinstall_flags += ["--reinstall-package", name]
+        except importlib.metadata.PackageNotFoundError:
+            pass  # 已在 missing 中处理
+
+    if not missing and not wrong_version:
+        return
 
     uv = shutil.which("uv") or "uv"
-    logger.info("[knowledge] 缺少依赖 %s，正在安装依赖组 %s，请稍候...", missing, _DEP_GROUP)
+    if missing:
+        logger.info("[knowledge] 缺少依赖 %s，正在安装...", missing)
+    if wrong_version:
+        logger.warning("[knowledge] 依赖版本不匹配 %s，正在修正...", wrong_version)
+
     try:
-        subprocess.run([uv, "pip", "install"] + packages, check=True, capture_output=False)
+        subprocess.run(
+            [uv, "pip", "install"] + reinstall_flags + packages,
+            check=True, capture_output=False,
+        )
         importlib.invalidate_caches()
         logger.info("[knowledge] 依赖安装完成")
+        if wrong_version:
+            # 原生扩展版本修正后必须重启进程才能生效（DLL 已被当前进程锁定）
+            raise RuntimeError(
+                f"原生扩展版本已修正 {wrong_version}，请重启进程后知识库将自动恢复正常。"
+            )
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
             f"依赖组 {_DEP_GROUP!r} 安装失败，请手动执行：uv pip install {' '.join(packages)}"
