@@ -1,38 +1,93 @@
+import re
 import logging
+from urllib.parse import urlparse
 import requests
 from .types import ToolDef
 
 logger = logging.getLogger(__name__)
 
+# URL 路由表：匹配 netloc 前缀 → provider 链
+_ROUTE_TABLE: dict[str, list[str]] = {
+    "mp.weixin.qq.com": ["defuddle"],
+}
+_DEFAULT_CHAIN = ["jina", "defuddle"]
+
+_MAX_CHARS = 15000
+
+
+def _route(url: str) -> list[str]:
+    netloc = urlparse(url).netloc
+    for pattern, chain in _ROUTE_TABLE.items():
+        if netloc == pattern or netloc.endswith("." + pattern):
+            return chain
+    return _DEFAULT_CHAIN
+
+
+def _fetch_jina(url: str) -> str | None:
+    try:
+        resp = requests.get(
+            f"https://r.jina.ai/{url}",
+            headers={"Accept": "text/plain", "X-Return-Format": "markdown"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.text or None
+    except Exception as e:
+        logger.warning("Jina 失败 (%s): %s", url, e)
+        return None
+
+
+def _fetch_defuddle(url: str) -> str | None:
+    try:
+        resp = requests.get(
+            f"https://defuddle.md/{url}",
+            headers={"Accept": "text/plain"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.text or None
+    except Exception as e:
+        logger.warning("Defuddle 失败 (%s): %s", url, e)
+        return None
+
+
+_PROVIDERS = {
+    "jina": _fetch_jina,
+    "defuddle": _fetch_defuddle,
+}
+
+
+def _strip_frontmatter(text: str) -> str:
+    """剥离 defuddle 返回的 YAML frontmatter（--- ... --- 头部块）"""
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            return text[end + 4:].lstrip("\n")
+    return text
+
+
+def _normalize(content: str, from_defuddle: bool) -> str:
+    if from_defuddle:
+        content = _strip_frontmatter(content)
+    if len(content) > _MAX_CHARS:
+        content = content[:_MAX_CHARS] + f"\n\n...(截断: 省略后 {len(content) - _MAX_CHARS} 字符)"
+    return content
+
+
 def build_web_fetch_tool() -> ToolDef:
-    """构建读取网页内容的工具（使用 Jina Reader，返回干净 Markdown）"""
 
     def web_fetch_call(url: str, **kwargs) -> str:
-        try:
-            if not url.startswith("http"):
-                url = "https://" + url
+        if not url.startswith("http"):
+            url = "https://" + url
 
-            jina_url = f"https://r.jina.ai/{url}"
-            headers = {
-                "Accept": "text/plain",
-                "X-Return-Format": "markdown",
-            }
+        chain = _route(url)
+        for provider_name in chain:
+            raw = _PROVIDERS[provider_name](url)
+            if raw:
+                content = _normalize(raw, from_defuddle=(provider_name == "defuddle"))
+                return f"网页 '{url}' 获取成功:\n\n{content}"
 
-            response = requests.get(jina_url, headers=headers, timeout=30)
-            response.raise_for_status()
-
-            content = response.text
-
-            max_chars = 15000
-            if len(content) > max_chars:
-                content = content[:max_chars] + f"\n\n...(截断: 省略后 {len(content) - max_chars} 字符，因网页内容过大暂不显示全部)..."
-
-            return f"网页 '{url}' 获取成功:\n\n{content}"
-
-        except requests.exceptions.RequestException as e:
-            return f"Error: 网络请求异常 '{str(e)}'"
-        except Exception as e:
-            return f"Error: 读取网页时发生异常 '{str(e)}'"
+        return f"Error: 所有提取方式均失败，无法获取网页内容 '{url}'"
 
     return ToolDef(
         name="web_fetch",
