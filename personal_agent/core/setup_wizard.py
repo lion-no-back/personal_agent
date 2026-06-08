@@ -170,7 +170,7 @@ def _write_env(app_id: str, app_secret: str, env_path: Path) -> None:
     secret_written = False
 
     if env_path.exists():
-        with open(env_path, "r", encoding="utf-8") as f:
+        with open(env_path, "r", encoding="utf-8-sig") as f:
             for line in f:
                 key = line.split("=", 1)[0].strip()
                 if key == "FEISHU_APP_ID":

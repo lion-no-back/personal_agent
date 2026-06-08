@@ -7,6 +7,8 @@ import json
 import concurrent.futures
 from typing import Callable, Optional
 
+from ..core.json_repair import repair_tool_arguments
+
 import personal_agent.knowledge as _kb_mod
 
 from openai import APIStatusError, AuthenticationError
@@ -352,7 +354,7 @@ class ConversationAgent(BaseAgent):
                         res = f"Error: 找不到工具 '{c_func_name}'"
                     else:
                         try:
-                            kwargs_dict = json.loads(c_func_args_str)
+                            kwargs_dict = repair_tool_arguments(c_func_args_str)
                             log_args = kwargs_dict.copy()
                             # 注入上下文供支持后台通知的工具（如 exec）使用
                             if push_fn is not None:
