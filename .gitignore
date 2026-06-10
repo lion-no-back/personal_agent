@@ -34,3 +34,6 @@ CLAUDE.md
 
 knowledge_docs
 .clauge-worktrees/
+
+# User memory storage (runtime-generated, not version-controlled)
+memory_store/
