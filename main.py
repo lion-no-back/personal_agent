@@ -437,6 +437,7 @@ def main() -> None:
     scheduler.start(
         agent=agent,
         notify_fn=_broadcast_notify,
+        send_file_fn=_broadcast_send_file,
         alert_callback=None,
     )
     logger.info("✅ SchedulerDaemon 就绪")

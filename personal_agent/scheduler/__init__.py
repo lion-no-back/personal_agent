@@ -59,6 +59,7 @@ class SchedulerDaemon:
         *,
         agent=None,
         notify_fn: Optional[Callable[[str, str], None]] = None,
+        send_file_fn: Optional[Callable[[str, str, str], None]] = None,
         alert_callback: Optional[AlertCallback] = None,
     ) -> None:
         """
@@ -66,7 +67,8 @@ class SchedulerDaemon:
 
         Args:
             agent:          ConversationAgent 实例（agent_message 类型任务需要）
-            notify_fn:      notify_fn(chat_id, text) 将 cron 结果投递到飞书
+            notify_fn:      notify_fn(session_key, text) 将 cron 结果投递到网关
+            send_file_fn:   send_file_fn(session_key, file_path, filename) 投递文件
             alert_callback: 心跳状态变更回调 callback(id, name, is_up, message)
         """
         config = (
@@ -116,6 +118,7 @@ class SchedulerDaemon:
             timezone=config.timezone,
             agent=agent,
             notify_fn=notify_fn,
+            send_file_fn=send_file_fn,
             persistence=persistence,
             default_misfire_grace_time=config.persist.default_misfire_grace_time,
         )

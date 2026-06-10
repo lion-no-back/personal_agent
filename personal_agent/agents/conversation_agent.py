@@ -491,10 +491,12 @@ class ConversationAgent(BaseAgent):
                 result: dict = mod.run()
                 message = result.get("message", "✅ 完成")
                 files = result.get("files", [])
+                success = True
             except Exception as exc:
                 logger.exception("[ondemand:%s] 执行失败", meta.id)
                 message = f"❌ 【{meta.name}】执行失败：{exc}"
                 files = []
+                success = False
 
             if self._notify_fn:
                 try:
@@ -508,6 +510,18 @@ class ConversationAgent(BaseAgent):
                         self._send_file_fn(delivery_key, str(fp), fp.name)
                     except Exception:
                         logger.exception("[ondemand:%s] 文件发送失败: %s", meta.id, fp)
+
+            if success and delivery_key and getattr(meta, "persist_delivery", False):
+                try:
+                    from pathlib import Path as _Path
+                    _data_dir = _Path(__file__).resolve().parents[2] / "data"
+                    _data_dir.mkdir(exist_ok=True)
+                    (_data_dir / f"{meta.id}_delivery_target").write_text(
+                        delivery_key, encoding="utf-8"
+                    )
+                    logger.info("[ondemand:%s] 已持久化投递目标: %s", meta.id, delivery_key)
+                except Exception:
+                    logger.exception("[ondemand:%s] 持久化投递目标失败", meta.id)
 
         t = threading.Thread(target=_run, name=f"ondemand-{meta.id}", daemon=True)
         t.start()

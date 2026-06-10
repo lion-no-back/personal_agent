@@ -34,10 +34,13 @@ logger = logging.getLogger(__name__)
 
 
 def _is_valid_receive_id(value: str) -> bool:
-    """判断 deliver_to 是否像一个合法的飞书 ID（ou_ / oc_ / p2p_），排除占位符。"""
+    """判断 deliver_to 是否像合法的投递目标，排除空值和占位符。
+    飞书：ou_xxx（用户）/ oc_xxx（群）/ p2p_xxx（会话）
+    钉钉：dingtalk:group:xxx（群）/ dingtalk:user:xxx（用户）
+    """
     if not value:
         return False
-    return value.startswith(("ou_", "oc_", "p2p_"))
+    return value.startswith(("ou_", "oc_", "p2p_", "dingtalk:"))
 
 
 def _wrap_job(
@@ -213,6 +216,7 @@ class CronEngine:
         timezone: str = "UTC",
         agent=None,
         notify_fn: Optional[Callable[[str, str], None]] = None,
+        send_file_fn: Optional[Callable[[str, str, str], None]] = None,
         persistence: "Optional[JobPersistence]" = None,
         default_misfire_grace_time: int = 259200,
     ) -> None:
@@ -221,7 +225,8 @@ class CronEngine:
             jobs:                       cron 任务配置列表
             timezone:                   调度时区，约束要求统一 UTC
             agent:                      ConversationAgent 实例（agent_message 类型需要）
-            notify_fn:                  notify_fn(chat_id, text) 投递结果到飞书（可选）
+            notify_fn:                  notify_fn(session_key, text) 投递文本消息（可选）
+            send_file_fn:               send_file_fn(session_key, file_path, filename) 投递文件（可选）
             persistence:                JobPersistence 实例；None = 不持久化、不补跑
             default_misfire_grace_time: 全局默认补跑窗口（秒），可被任务级配置覆盖
         """
@@ -229,6 +234,7 @@ class CronEngine:
         self._timezone = timezone
         self._agent = agent
         self._notify_fn = notify_fn
+        self._send_file_fn = send_file_fn
         self._persistence = persistence
         self._default_grace = default_misfire_grace_time
         self._scheduler: Optional[AsyncIOScheduler] = None
@@ -442,9 +448,8 @@ class CronEngine:
             if job_cfg.deliver_to and self._notify_fn:
                 if not _is_valid_receive_id(job_cfg.deliver_to):
                     logger.error(
-                        "[cron:%s] deliver_to=%r 不是有效的飞书 ID，跳过投递。"
-                        " 格式应为 ou_xxx（用户 open_id）或 oc_xxx / p2p_xxx（chat_id）。"
-                        " 向机器人发一条消息后，从日志 'session=p2p_<open_id>' 中提取 open_id。",
+                        "[cron:%s] deliver_to=%r 不是有效的投递目标，跳过投递。"
+                        " 飞书格式：ou_xxx / oc_xxx / p2p_xxx；钉钉格式：dingtalk:group:xxx。",
                         job_cfg.id,
                         job_cfg.deliver_to,
                     )
@@ -486,10 +491,42 @@ class CronEngine:
                 loop = asyncio.get_running_loop()
                 result = await loop.run_in_executor(None, fn)
 
-            if job_cfg.deliver_to and self._notify_fn and isinstance(result, str):
-                try:
-                    self._notify_fn(job_cfg.deliver_to, result)
-                except Exception:
-                    logger.exception("[cron:%s] 投递消息失败", job_cfg.id)
+            # 优先使用按需触发时持久化的投递目标（群/用户），回退到静态配置
+            effective_deliver_to = job_cfg.deliver_to
+            try:
+                from pathlib import Path as _Path
+                _state = _Path(__file__).resolve().parents[2] / "data" / f"{job_cfg.id}_delivery_target"
+                if _state.exists():
+                    _saved = _state.read_text(encoding="utf-8").strip()
+                    if _saved:
+                        effective_deliver_to = _saved
+            except Exception:
+                pass
+
+            if effective_deliver_to:
+                if isinstance(result, str):
+                    if self._notify_fn:
+                        try:
+                            self._notify_fn(effective_deliver_to, result)
+                        except Exception:
+                            logger.exception("[cron:%s] 投递消息失败", job_cfg.id)
+                elif isinstance(result, dict):
+                    msg = result.get("message", "")
+                    files = result.get("files", [])
+                    if msg and self._notify_fn:
+                        try:
+                            self._notify_fn(effective_deliver_to, msg)
+                        except Exception:
+                            logger.exception("[cron:%s] 投递消息失败", job_cfg.id)
+                    if files and self._send_file_fn:
+                        for f in files:
+                            try:
+                                self._send_file_fn(
+                                    effective_deliver_to, str(f), getattr(f, "name", str(f))
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "[cron:%s] 投递文件失败 | file=%s", job_cfg.id, f
+                                )
 
         return inner
