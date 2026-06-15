@@ -467,6 +467,20 @@ class ConversationAgent(BaseAgent):
         命中则启动后台线程执行，立即返回 ACK 字符串；未命中返回 None。
         """
         content = event.content
+
+        if "工作流使用说明" in content:
+            workflows = self._get_ondemand_workflows()
+            if not workflows:
+                return "当前没有可用的按需工作流。"
+            lines = ["📋 按需工作流列表："]
+            for m in workflows:
+                triggers = "」或「".join(m.intent_triggers)
+                lines.append(f"• {m.name} → 发送「{triggers}」触发")
+            help_text = "\n".join(lines)
+            if on_update:
+                on_update(help_text, "done")
+            return help_text
+
         for meta in self._get_ondemand_workflows():
             if not any(trigger in content for trigger in meta.intent_triggers):
                 continue
@@ -476,19 +490,25 @@ class ConversationAgent(BaseAgent):
             if on_update:
                 on_update(ack, "done")
 
-            self._run_ondemand_workflow_async(meta, delivery_key)
+            self._run_ondemand_workflow_async(meta, delivery_key, content)
             return ack
 
         return None
 
-    def _run_ondemand_workflow_async(self, meta, delivery_key: str) -> None:
+    def _run_ondemand_workflow_async(self, meta, delivery_key: str, event_content: str = "") -> None:
         """在后台 daemon 线程中执行按需 workflow，完成后通过 notify_fn/send_file_fn 投递结果。"""
         import importlib
+        import inspect
 
         def _run():
             try:
                 mod = importlib.import_module(f"personal_agent.workflows.{meta.id}.runner")
-                result: dict = mod.run()
+                # 若 runner.run 接受 content 参数，则传入用户原始消息（用于提取动态参数如 ASIN）
+                sig = inspect.signature(mod.run)
+                if "content" in sig.parameters:
+                    result: dict = mod.run(content=event_content)
+                else:
+                    result: dict = mod.run()
                 message = result.get("message", "✅ 完成")
                 files = result.get("files", [])
                 success = True

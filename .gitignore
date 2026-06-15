@@ -37,3 +37,7 @@ knowledge_docs
 
 # User memory storage (runtime-generated, not version-controlled)
 memory_store/
+
+# fxreview_amazon workflow runtime assets (local Chromium binary + logged-in profile)
+personal_agent/workflows/fxreview_amazon/chromium/
+personal_agent/workflows/fxreview_amazon/browser_profile/

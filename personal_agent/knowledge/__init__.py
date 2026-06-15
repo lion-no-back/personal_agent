@@ -9,11 +9,6 @@ import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .store import KBStore
-from .ingester.pipeline import Pipeline
-from .retriever.search import Retriever
-from .watcher import KBWatcher
-
 if TYPE_CHECKING:
     from personal_agent.core.llm_router import LLMRouter
     from personal_agent.knowledge.types import KBSearchResult
@@ -23,7 +18,6 @@ logger = logging.getLogger(__name__)
 _SEARCH_TIMEOUT = 30  # seconds — budget for one retriever.search() call
 
 _DEP_GROUP = "knowledge"
-# 任一缺失即触发安装，防止部分安装时误判
 _CHECK_PACKAGES = ["opendataloader_pdf", "sqlite_vec"]
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -35,12 +29,25 @@ def _ensure_deps() -> None:
     """检查知识库依赖是否齐全且版本正确，否则自动安装/重装。
 
     故意不用 uv sync：sync 会删除 lockfile 外的包（含 paddle/opencv 等动态装入的包）。
-    版本检查只用元数据（importlib.metadata），不 import 原生扩展，避免在 Windows 上
-    因 DLL 已被进程锁定而导致子进程 reinstall 无效。
+
+    用 importlib.metadata.version 而非 find_spec 来检查包是否就绪：
+    find_spec 只要 .pyd 存在就返回非 None，即使 dist-info 已被 _heal_venv 清除（包已损坏）。
+    metadata.version 读取 dist-info，dist-info 缺失即视为未安装，触发重装。
+
+    此函数必须在任何 sqlite_vec import 之前调用（即在 KnowledgeBase.__init__ 最开头），
+    否则 Windows 会锁住 .pyd，子进程无法替换它。
     """
     import importlib.metadata
 
-    missing = [p for p in _CHECK_PACKAGES if importlib.util.find_spec(p) is None]
+    def _is_healthy(pkg: str) -> bool:
+        """dist-info 存在且可读即视为健康；.pyd 存在但 dist-info 缺失视为损坏。"""
+        try:
+            importlib.metadata.version(pkg.replace("_", "-"))
+            return True
+        except importlib.metadata.PackageNotFoundError:
+            return False
+
+    missing = [p for p in _CHECK_PACKAGES if not _is_healthy(p)]
 
     with open(_PROJECT_ROOT / "pyproject.toml", "rb") as f:
         data = tomllib.load(f)
@@ -48,10 +55,6 @@ def _ensure_deps() -> None:
     if not packages:
         packages = missing
 
-    # 检查有 == 约束的包版本是否匹配，不匹配则强制重装。
-    # 注意：不对原生扩展（如 sqlite_vec）做运行时 API 探针。
-    # 原因：store.py 顶层 import sqlite_vec 在本函数调用前已将 DLL 锁入进程，
-    # Windows 下子进程无法替换被锁定的 .pyd 文件，探针只会制造"安装成功但实际无效"的假象。
     reinstall_flags: list[str] = []
     wrong_version: list[str] = []
     for spec in packages:
@@ -84,7 +87,6 @@ def _ensure_deps() -> None:
         importlib.invalidate_caches()
         logger.info("[knowledge] 依赖安装完成")
         if wrong_version:
-            # 原生扩展版本修正后必须重启进程才能生效（DLL 已被当前进程锁定）
             raise RuntimeError(
                 f"原生扩展版本已修正 {wrong_version}，请重启进程后知识库将自动恢复正常。"
             )
@@ -102,7 +104,15 @@ class KnowledgeBase:
         sources_dir: Path,
         llm: "LLMRouter",
     ) -> None:
+        # 必须在所有 sqlite_vec import 之前运行，否则 Windows 锁住 DLL 导致重装无效
         _ensure_deps()
+
+        # 延迟 import：store.py 顶层会 import sqlite_vec，必须在 _ensure_deps() 之后
+        from .store import KBStore
+        from .ingester.pipeline import Pipeline
+        from .retriever.search import Retriever
+        from .watcher import KBWatcher
+
         self.sources_dir = Path(sources_dir)
         self._wiki_dir = Path(wiki_dir)
 
