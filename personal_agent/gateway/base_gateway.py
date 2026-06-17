@@ -54,9 +54,9 @@ class BaseGateway(ABC):
         """
 
     @abstractmethod
-    def send_image(self, session_key: str, image_path: str) -> None:
+    def send_image_text(self, session_key: str, image_path: str, text: str) -> None:
         """
-        向指定会话发送一张图片消息。
-        各平台实现不同（钉钉：上传图拿 media_id 后用 sampleImageMsg / photoURL 发出）。
+        向指定会话发送「图片 + 文字」合并的一条消息（图在前、文字在后）。
+        各平台实现不同（钉钉：上传图拿 media_id，用 sampleMarkdown 内嵌 ![](media_id) + 文字）。
         未实现的平台应抛出 NotImplementedError，调用方负责 per-gateway 隔离。
         """

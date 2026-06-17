@@ -442,8 +442,34 @@ def _result_lines(r, shot_path):
 
 
 def segment_text(r):
-    """图文投递用的文字块 (不含图片行): 品牌 / 店铺 / 排名。"""
-    return "\n".join([f"品牌: {r['brand']}", f"店铺：{r['shop_str']}"] + r["rank_lines"])
+    """图文投递用的文字块 (不含图片行): 品牌 / 店铺 / 排名, 合并成一行 (中文逗号分隔)。"""
+    return "，".join([f"品牌：{r['brand']}", f"店铺：{r['shop_str']}"] + r["rank_lines"])
+
+
+def build_header(stats):
+    """喜报头部。逐小句判断: 前50/50-100 各为 0 则省略对应小句, 某榜两小句全空则省略该榜行,
+    两榜行皆空返回 None (调用方据此不发头部)。占位数字由 stats 动态填入。"""
+    def board_line(emoji, name, top50, next50):
+        clauses = []
+        if top50 > 0:
+            clauses.append(f"前50名占{top50}席")
+        if next50 > 0:
+            clauses.append(f"50-100名再添{next50}席")
+        return f"{emoji} {name} 榜单{'，'.join(clauses)}！" if clauses else None
+
+    lines = [
+        line for line in (
+            board_line("🏆", "Best Sellers", stats["bs_top50"], stats["bs_next50"]),
+            board_line("🔥", "New Releases", stats["nr_top50"], stats["nr_next50"]),
+        ) if line
+    ]
+    if not lines:
+        return None
+    return "\n".join(
+        ["【每日播报】🎆🧨🧨Best Sellers快讯 🧨🧨🎆", "🇺🇸 美国站喜报："]
+        + lines
+        + ["继续冲榜，再创佳绩～ 🧧🚀🚀🧧"]
+    )
 
 
 def _page_url_for(board_url, list_rank):
@@ -592,9 +618,9 @@ def collect_hits():
                 nr_item = nr_by_asin.get(item["asin"]) or (nr_hits[0] if nr_hits else None)
                 logger.info("[%s] 销量榜命中 #%s 新品榜#%s asin=%s 店铺=%s",
                             brand, item["rank"], nr_item["rank"] if nr_item else "-", item["asin"], shop_str)
-                rank_lines = [f"销量榜排名：#{item['rank']}"]
+                rank_lines = [f"销量榜排名：{item['rank']}"]
                 if nr_item:
-                    rank_lines.append(f"新品榜排名：#{nr_item['rank']}")
+                    rank_lines.append(f"新品榜排名：{nr_item['rank']}")
                 # 既命中销量榜(又可能命中新品榜)→ 统一按销量榜列表页截图
                 results.append(_make_result(brand, item["asin"], item["image_url"], shop_str,
                                             int(item["rank"]), rank_lines,
@@ -622,25 +648,37 @@ def collect_hits():
         else:
             logger.debug("[%s] 销量榜/新品榜均未上榜", brand)
 
-    return results
+    # 头部"占X席"统计：按榜分别计、双榜各计（同一商品同时上两榜则两边各算一席）。
+    def _matches_any(b):
+        return any(brand_matches(k, b) for k in BRANDS)
+
+    def _counts(items):
+        ranks = [int(it["rank"]) for it in items if _matches_any(it.get("brand")) and it["rank"].isdigit()]
+        return sum(1 for r in ranks if r <= 50), sum(1 for r in ranks if 51 <= r <= 100)
+
+    bs_top50, bs_next50 = _counts(bestseller_items)
+    nr_top50, nr_next50 = _counts(new_release_items)
+    stats = {"bs_top50": bs_top50, "bs_next50": bs_next50,
+             "nr_top50": nr_top50, "nr_next50": nr_next50}
+    return results, stats
 
 
 def run_pipeline():
-    """完整流程: collect_hits + 截图, 返回 (results_sorted, shots)。
+    """完整流程: collect_hits + 截图, 返回 (results_sorted, shots, stats)。
 
-    results_sorted 按 sort_key 升序; shots 为 asin -> 本地 png 路径 (截图失败的 asin 不在内)。
-    供 main() (CLI 打印) 与 runner (图文投递) 共用。
+    results_sorted 按 sort_key 升序; shots 为 asin -> 本地 png 路径 (截图失败的 asin 不在内);
+    stats 为头部"占X席"统计。供 main() (CLI 打印) 与 runner (图文投递) 共用。
     """
     init_run_paths()  # 每次运行独立的 artifact 目录 + 日志文件
-    results = collect_hits()
+    results, stats = collect_hits()
     if not results:
-        return [], {}
+        return [], {}, stats
     print("\n[截图] 回放命中商品卡片...")
     t_shot0 = time.time()
     shots = screenshot_cards(results)
     logger.info("阶段耗时: 截图回放 %.1fs", time.time() - t_shot0)
     print(f"[耗时] 截图回放: {time.time() - t_shot0:.1f}s")
-    return sorted(results, key=lambda r: r["sort_key"]), shots
+    return sorted(results, key=lambda r: r["sort_key"]), shots, stats
 
 
 def main():
@@ -650,11 +688,14 @@ def main():
     print("Amazon 榜单品牌排名查询")
     print("=" * 70)
 
-    results_sorted, shots = run_pipeline()
+    results_sorted, shots, stats = run_pipeline()
 
+    header = build_header(stats)
     print("\n" + "=" * 70)
     print("查询结果")
     print("=" * 70)
+    if header:
+        print("\n" + header + "\n")
     if results_sorted:
         for r in results_sorted:
             for line in _result_lines(r, shots.get(r["asin"])):

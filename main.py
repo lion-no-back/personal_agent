@@ -427,18 +427,18 @@ def main() -> None:
             except Exception as exc:
                 logger.error("%s.send_file 失败: %s", gw.platform, exc)
 
-    def _broadcast_send_image(session_key: str, image_path: str) -> None:
+    def _broadcast_send_image_text(session_key: str, image_path: str, text: str) -> None:
         for gw in gateways:
             try:
-                gw.send_image(session_key, image_path)
+                gw.send_image_text(session_key, image_path, text)
             except NotImplementedError:
-                logger.debug("%s.send_image 未实现，跳过", gw.platform)
+                logger.debug("%s.send_image_text 未实现，跳过", gw.platform)
             except Exception as exc:
-                logger.error("%s.send_image 失败: %s", gw.platform, exc)
+                logger.error("%s.send_image_text 失败: %s", gw.platform, exc)
 
     agent._notify_fn = _broadcast_notify
     agent._send_file_fn = _broadcast_send_file
-    agent._send_image_fn = _broadcast_send_image
+    agent._send_image_text_fn = _broadcast_send_image_text
     logger.info("✅ 按需 workflow 投递回调已注入 Agent")
 
     scheduler = SchedulerDaemon(

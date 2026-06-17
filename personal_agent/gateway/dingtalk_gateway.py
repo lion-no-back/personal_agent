@@ -461,13 +461,14 @@ class DingTalkGateway(BaseGateway):
         except Exception as e:
             logger.error("send_file 失败 | session_key=%s error=%s", session_key, e)
 
-    def send_image(self, session_key: str, image_path: str) -> None:
+    def send_image_text(self, session_key: str, image_path: str, text: str) -> None:
         """
-        向指定会话发送一张图片消息（两步）：先上传 media 拿 media_id，再发 sampleImageMsg。
+        向指定会话发送「图片 + 文字」合并的一条消息（图在前、文字在后）。
 
-        用 OpenAPI 的 sampleImageMsg（msgParam={"photoURL": media_id}）发原生图片消息，
-        media_id 用 /media/upload 返回的原值（含 @ 前缀）。之所以不用 markdown 内嵌
-        ![](down.dingtalk.com/...)：该下载 URL 在客户端不可访问、会渲染成裂图。
+        先把本地图上传 media 拿 media_id（/media/upload 返回原值，含 @ 前缀），
+        再用 sampleMarkdown 发 ![](media_id) + 文字一条消息。钉钉 markdown 支持把
+        media_id 直接当作图片地址（注意：不能用 down.dingtalk.com 下载 URL，那个
+        在客户端不可访问会裂图；而 media_id 与 sampleImageMsg 用的是同一份、可渲染）。
 
         session_key 路由同 send_text，非 dingtalk: 前缀直接跳过。
         """
@@ -475,41 +476,15 @@ class DingTalkGateway(BaseGateway):
             return
         parts = session_key.split(":", 2)
         if len(parts) != 3:
-            logger.warning("send_image: 无效 session_key=%s", session_key)
+            logger.warning("send_image_text: 无效 session_key=%s", session_key)
             return
         _, id_type, raw_id = parts
         try:
             media_id = self._media_client.upload(image_path)
-            self._send_image_msg_via_api(id_type, raw_id, media_id)
+            markdown = f"![]({media_id})\n\n{text}" if text else f"![]({media_id})"
+            self._send_markdown_via_api(id_type, raw_id, markdown)
         except Exception as e:
-            logger.error("send_image 失败 | session_key=%s error=%s", session_key, e)
-
-    def _send_image_msg_via_api(self, id_type: str, raw_id: str, media_id: str) -> None:
-        """通过 OpenAPI 发图片消息（msgKey=sampleImageMsg，media_id 已上传）。"""
-        token = self._get_api_token()
-        payload = {
-            "msgKey": "sampleImageMsg",
-            "msgParam": json.dumps({"photoURL": media_id}, ensure_ascii=False),
-            "robotCode": self._client_id,
-        }
-        if id_type == "group":
-            payload["openConversationId"] = raw_id
-            url = _GROUP_SEND_URL
-        else:
-            payload["userIds"] = [raw_id]
-            url = _SINGLE_SEND_URL
-
-        resp = httpx.post(
-            url,
-            headers={"x-acs-dingtalk-access-token": token},
-            json=payload,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if "processQueryKey" not in data and data.get("code"):
-            raise RuntimeError(f"API 发图片失败: {data}")
-        logger.info("图片消息发送成功 | id_type=%s", id_type)
+            logger.error("send_image_text 失败 | session_key=%s error=%s", session_key, e)
 
     # ──────────────────────────────────────────────────────────
     #   消息派发（由 _MessageHandler 调用）

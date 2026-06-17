@@ -97,7 +97,7 @@ class ConversationAgent(BaseAgent):
         scorer: Optional[RequestScorer] = None,
         notify_fn: Optional[Callable[[str, str], None]] = None,
         send_file_fn: Optional[Callable[[str, str, str], None]] = None,
-        send_image_fn: Optional[Callable[[str, str], None]] = None,
+        send_image_text_fn: Optional[Callable[[str, str, str], None]] = None,
     ):
         """
         Args:
@@ -118,7 +118,7 @@ class ConversationAgent(BaseAgent):
         self._memory: Optional[MemoryModule] = None
         self._notify_fn = notify_fn
         self._send_file_fn = send_file_fn
-        self._send_image_fn = send_image_fn
+        self._send_image_text_fn = send_image_text_fn
         self._ondemand_workflows: Optional[list] = None  # lazy-loaded
         self._card_update_interval = card_update_interval or float(
             os.getenv("CARD_UPDATE_INTERVAL", "0.3")
@@ -525,7 +525,7 @@ class ConversationAgent(BaseAgent):
                 segments = []
                 success = False
 
-            if self._notify_fn:
+            if self._notify_fn and message:
                 try:
                     self._notify_fn(delivery_key, message)
                 except Exception:
@@ -538,16 +538,16 @@ class ConversationAgent(BaseAgent):
                     except Exception:
                         logger.exception("[ondemand:%s] 文件发送失败: %s", meta.id, fp)
 
-            # segments：逐条投递（图在前、文字在后）——先发图片消息再发文字，各一条。
-            # 有图则发图，无论有无图都发文字，确保截图缺失时文字信息不丢。
+            # segments：逐条「图片 + 文字」合并投递（图在前、文字在后，一条消息）。
+            # 有图走 send_image_text，无图回退纯文本，确保截图缺失时文字信息不丢。
             if segments:
                 for seg in segments:
                     img = seg.get("image")
                     txt = seg.get("text", "")
                     try:
-                        if img and self._send_image_fn:
-                            self._send_image_fn(delivery_key, str(img))
-                        if txt and self._notify_fn:
+                        if img and self._send_image_text_fn:
+                            self._send_image_text_fn(delivery_key, str(img), txt)
+                        elif txt and self._notify_fn:
                             self._notify_fn(delivery_key, txt)
                     except Exception:
                         logger.exception("[ondemand:%s] 图文段投递失败: %s", meta.id, img)
