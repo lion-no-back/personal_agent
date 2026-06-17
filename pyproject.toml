@@ -59,6 +59,11 @@ rmorder-mabang = [
     "tqdm>=4.66",
 ]
 
+# 所需 Chromium 二进制，由 runner 首次运行时下载到 rankbb_amazon/chromium/（PLAYWRIGHT_BROWSERS_PATH 重定向），
+rankbb-amazon = [
+    "scrapling[all]>=0.4.9",
+]
+
 knowledge = [
     "opendataloader-pdf",
     "markitdown",

@@ -97,6 +97,7 @@ class ConversationAgent(BaseAgent):
         scorer: Optional[RequestScorer] = None,
         notify_fn: Optional[Callable[[str, str], None]] = None,
         send_file_fn: Optional[Callable[[str, str, str], None]] = None,
+        send_image_fn: Optional[Callable[[str, str], None]] = None,
     ):
         """
         Args:
@@ -117,6 +118,7 @@ class ConversationAgent(BaseAgent):
         self._memory: Optional[MemoryModule] = None
         self._notify_fn = notify_fn
         self._send_file_fn = send_file_fn
+        self._send_image_fn = send_image_fn
         self._ondemand_workflows: Optional[list] = None  # lazy-loaded
         self._card_update_interval = card_update_interval or float(
             os.getenv("CARD_UPDATE_INTERVAL", "0.3")
@@ -472,10 +474,13 @@ class ConversationAgent(BaseAgent):
             workflows = self._get_ondemand_workflows()
             if not workflows:
                 return "当前没有可用的按需工作流。"
-            lines = ["📋 按需工作流列表："]
+            lines = [
+                "| 工作流 | 触发词 |",
+                "|:---|:---|",
+            ]
             for m in workflows:
-                triggers = "」或「".join(m.intent_triggers)
-                lines.append(f"• {m.name} → 发送「{triggers}」触发")
+                triggers = " / ".join(f"**{t}**" for t in m.intent_triggers)
+                lines.append(f"| {m.name} | {triggers} |")
             help_text = "\n".join(lines)
             if on_update:
                 on_update(help_text, "done")
@@ -511,11 +516,13 @@ class ConversationAgent(BaseAgent):
                     result: dict = mod.run()
                 message = result.get("message", "✅ 完成")
                 files = result.get("files", [])
+                segments = result.get("segments", [])
                 success = True
             except Exception as exc:
                 logger.exception("[ondemand:%s] 执行失败", meta.id)
                 message = f"❌ 【{meta.name}】执行失败：{exc}"
                 files = []
+                segments = []
                 success = False
 
             if self._notify_fn:
@@ -530,6 +537,20 @@ class ConversationAgent(BaseAgent):
                         self._send_file_fn(delivery_key, str(fp), fp.name)
                     except Exception:
                         logger.exception("[ondemand:%s] 文件发送失败: %s", meta.id, fp)
+
+            # segments：逐条投递（图在前、文字在后）——先发图片消息再发文字，各一条。
+            # 有图则发图，无论有无图都发文字，确保截图缺失时文字信息不丢。
+            if segments:
+                for seg in segments:
+                    img = seg.get("image")
+                    txt = seg.get("text", "")
+                    try:
+                        if img and self._send_image_fn:
+                            self._send_image_fn(delivery_key, str(img))
+                        if txt and self._notify_fn:
+                            self._notify_fn(delivery_key, txt)
+                    except Exception:
+                        logger.exception("[ondemand:%s] 图文段投递失败: %s", meta.id, img)
 
             if success and delivery_key and getattr(meta, "persist_delivery", False):
                 try:

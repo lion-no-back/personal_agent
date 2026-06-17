@@ -885,6 +885,9 @@ class FeishuGateway(BaseGateway):
     def send_file(self, session_key: str, file_path: str, filename: str) -> None:
         raise NotImplementedError("FeishuGateway.send_file 尚未实现，计划 Phase 2 支持")
 
+    def send_image(self, session_key: str, image_path: str) -> None:
+        raise NotImplementedError("FeishuGateway.send_image 尚未实现，计划 Phase 2 支持")
+
     def send_stash_remind_card(self, chat_id: str, file_name: str) -> None:
         """发送超时卡片提醒"""
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody

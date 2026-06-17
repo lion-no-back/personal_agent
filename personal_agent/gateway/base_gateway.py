@@ -52,3 +52,11 @@ class BaseGateway(ABC):
         各平台实现不同（如钉钉需要两步：先上传 media 拿 media_id 再发消息）。
         未实现的平台应抛出 NotImplementedError，调用方负责 per-gateway 隔离。
         """
+
+    @abstractmethod
+    def send_image(self, session_key: str, image_path: str) -> None:
+        """
+        向指定会话发送一张图片消息。
+        各平台实现不同（钉钉：上传图拿 media_id 后用 sampleImageMsg / photoURL 发出）。
+        未实现的平台应抛出 NotImplementedError，调用方负责 per-gateway 隔离。
+        """
