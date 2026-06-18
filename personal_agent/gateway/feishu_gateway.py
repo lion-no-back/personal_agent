@@ -38,6 +38,7 @@ from lark_oapi.api.im.v1 import (
 
 from ..core.task_manager import TaskManager
 from ..guardrails import check_input
+from ..routing import AccessPolicy, SessionRunLocks
 from .base_gateway import BaseGateway
 
 logger = logging.getLogger(__name__)
@@ -245,10 +246,12 @@ class FeishuGateway(BaseGateway):
             thread_name_prefix="feishu-worker",
         )
 
-        # 会话级串行锁：同一 session_key 的请求必须排队，防止并发写共享上下文
-        # 导致 assistant/tool 消息交错，引发 OpenAI 400 invalid_request_error
-        self._session_run_locks: dict[str, threading.Lock] = {}
-        self._session_run_locks_guard = threading.Lock()
+        # 会话级串行锁（按 session_key 串行，rationale 见 SessionRunLocks）
+        self._run_locks = SessionRunLocks()
+
+        # 用户白名单：FEISHU_ALLOWED_USERS 逗号分隔的 open_id 列表。
+        # 未配置时放行所有（飞书默认靠群聊 @机器人 控制，故不打告警）。
+        self._access = AccessPolicy.from_env("feishu")
 
         # 活跃任务的 sink 注册表，用于接收卡片取消信号（task_id → sink）
         self._active_sinks: dict[str, "_CardStreamAsyncSink"] = {}
@@ -1016,6 +1019,14 @@ class FeishuGateway(BaseGateway):
         # 标记为已处理（在提交线程池之前，防止并发重入）
         self._context.mark_processed(event.message_id)
 
+        # ── 准入检查：配置了 FEISHU_ALLOWED_USERS 时，非白名单用户静默拒绝 ──
+        if not self._access.is_allowed(event.sender_open_id):
+            logger.warning(
+                "拒绝未授权用户 | open_id=%s message_id=%s",
+                event.sender_open_id, event.message_id,
+            )
+            return
+
         logger.info(
             f"📨 收到新消息 | message_id={event.message_id} "
             f"chat_type={event.chat_type} "
@@ -1049,10 +1060,7 @@ class FeishuGateway(BaseGateway):
         )
 
         # ── 会话串行锁：同 session 并发请求排队，防止上下文消息交错 ──
-        with self._session_run_locks_guard:
-            if session_key not in self._session_run_locks:
-                self._session_run_locks[session_key] = threading.Lock()
-        with self._session_run_locks[session_key]:
+        with self._run_locks.get(session_key):
             self._handle_async_body(event, session_key)
 
     def _handle_async_body(self, event: "MessageEvent", session_key: str) -> None:

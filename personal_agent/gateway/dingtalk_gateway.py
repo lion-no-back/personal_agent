@@ -30,6 +30,7 @@ except ImportError as _e:
         "dingtalk-stream 未安装，请执行: pip install dingtalk-stream"
     ) from _e
 
+from ..routing import AccessPolicy, SessionRunLocks
 from .base_gateway import BaseGateway
 from .dingtalk_media import DingTalkMediaClient
 
@@ -352,11 +353,8 @@ class DingTalkGateway(BaseGateway):
 
         # 用户白名单：DINGTALK_ALLOWED_USERS 逗号分隔的 staffId 列表
         # 未配置时允许所有人（兼容现有部署），但打印警告
-        raw_allowlist = os.getenv("DINGTALK_ALLOWED_USERS", "")
-        self._allowed_users: frozenset[str] = frozenset(
-            uid.strip() for uid in raw_allowlist.split(",") if uid.strip()
-        )
-        if not self._allowed_users:
+        self._access = AccessPolicy.from_env("dingtalk")
+        if self._access.is_open:
             logger.warning(
                 "DINGTALK_ALLOWED_USERS 未配置，任何人均可触发机器人。"
                 "建议在 .env 中设置白名单。"
@@ -369,8 +367,7 @@ class DingTalkGateway(BaseGateway):
         )
 
         # 会话级串行锁：防止同一会话并发写共享上下文
-        self._session_run_locks: dict[str, threading.Lock] = {}
-        self._session_run_locks_guard = threading.Lock()
+        self._run_locks = SessionRunLocks()
 
         # api.dingtalk.com token（发文件/主动消息用）
         self._api_token: str = ""
@@ -507,7 +504,7 @@ class DingTalkGateway(BaseGateway):
         self._context.mark_processed(incoming.message_id)
 
         # 白名单检查：配置了 DINGTALK_ALLOWED_USERS 时，不在列表中的用户静默拒绝
-        if self._allowed_users and incoming.sender_staff_id not in self._allowed_users:
+        if not self._access.is_allowed(incoming.sender_staff_id):
             logger.warning(
                 "拒绝未授权用户 | staffId=%s nick=%s",
                 incoming.sender_staff_id, incoming.sender_nick,
@@ -524,7 +521,7 @@ class DingTalkGateway(BaseGateway):
         renderer = self._try_create_renderer(incoming)
 
         session_key = self._compute_session_key(event)
-        lock = self._get_session_lock(session_key)
+        lock = self._run_locks.get(session_key)
         self._executor.submit(self._handle, event, incoming, session_key, lock, renderer)
 
     def _try_create_renderer(self, incoming: "ChatbotMessage") -> "DingTalkCardRenderer | None":
@@ -805,12 +802,6 @@ class DingTalkGateway(BaseGateway):
             chat_id=event.chat_id,
             thread_id=event.thread_id,
         )
-
-    def _get_session_lock(self, session_key: str) -> threading.Lock:
-        with self._session_run_locks_guard:
-            if session_key not in self._session_run_locks:
-                self._session_run_locks[session_key] = threading.Lock()
-            return self._session_run_locks[session_key]
 
     def _recreate_stream_client(self) -> None:
         """重连前重建 SDK 客户端（旧客户端状态不可复用）。"""
