@@ -111,23 +111,32 @@ def _run_broadcast() -> dict:
 
     from . import brand_rank_checker as checker
 
-    results_sorted, shots, stats = checker.run_pipeline()
+    results_sorted, shots, stats_by_site = checker.run_pipeline()
 
     if not results_sorted:
         return {"message": "（本次抓取范围内无目标品牌上榜）", "segments": []}
 
+    # 按站穿插投递：每站 喜报头部(纯文字段) → 该站命中商品图文段。
+    # 头部用 image=None 的文字段（投递层会发成独立文字气泡），故 message 留空；
+    # 某站无命中则整块（头部+商品）都不发。
     segments = []
-    for r in results_sorted:
-        shot = shots.get(r["asin"])
-        if not shot:
-            logger.warning("[rankbb_amazon] 命中商品无截图，仅发文字 asin=%s", r.get("asin"))
-        segments.append({
-            "image": Path(shot) if shot else None,
-            "text": checker.segment_text(r),
-        })
+    for site in checker.SITES:
+        site_results = [r for r in results_sorted if r["site_order"] == site.order]
+        if not site_results:
+            continue
+        header = checker.build_site_header(site, stats_by_site.get(site.order) or {})
+        if header:
+            segments.append({"image": None, "text": header})
+        for r in site_results:
+            shot = shots.get(r["asin"])
+            if not shot:
+                logger.warning("[rankbb_amazon] 命中商品无截图，仅发文字 asin=%s", r.get("asin"))
+            segments.append({
+                "image": Path(shot) if shot else None,
+                "text": checker.segment_text(r),
+            })
 
-    # 头部喜报作为首条消息（前50/50-100 全无则 build_header 返回 None → 不发头部，仅发商品图文）。
-    return {"message": checker.build_header(stats) or "", "segments": segments}
+    return {"message": "", "segments": segments}
 
 
 # ────────────────────────── 入口分流 ──────────────────────────

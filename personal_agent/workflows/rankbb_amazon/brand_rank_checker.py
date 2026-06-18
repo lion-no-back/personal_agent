@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -53,9 +54,42 @@ SOLD_BY_MAP = {
     },
 }
 
-CATEGORY_ID = "11591904011"  # Smartwatch Bands 子类 id
-BESTSELLERS_URL = f"https://www.amazon.com/gp/bestsellers/wireless/{CATEGORY_ID}"
-NEW_RELEASES_URL = f"https://www.amazon.com/gp/new-releases/wireless/{CATEGORY_ID}"
+@dataclass(frozen=True)
+class Site:
+    """单个 Amazon 站点的抓取配置。品牌表 (BRANDS/SOLD_BY_MAP) 与英文正则跨站共享, 不放这里。
+
+    locale_cookies 仅在详情页 HTTP 抓取时注入, 强制页面渲染英文以复用英文正则
+    (DE 用 lc-acbde=en_GB; US 默认英文, 留空)。榜单页/截图按结构选择器解析, 与
+    语言无关, 故不注入 locale。
+    """
+    order: int            # 输出/喜报排序: 小的先发完再发大的 (US=0, DE=1)
+    flag: str             # 喜报头部旗帜 emoji
+    name_cn: str          # 喜报头部站点名
+    bestsellers_url: str
+    new_releases_url: str
+    dp_base: str          # 详情页前缀, 直接拼 asin
+    category_id: str      # 详情页定位本类目 BSR 排名用
+    locale_cookies: dict  # 详情页 HTTP 请求注入的语言 cookie
+
+
+SITE_US = Site(
+    order=0, flag="🇺🇸", name_cn="美国站",
+    bestsellers_url="https://www.amazon.com/gp/bestsellers/wireless/11591904011",
+    new_releases_url="https://www.amazon.com/gp/new-releases/wireless/11591904011",
+    dp_base="https://www.amazon.com/dp/",
+    category_id="11591904011",   # Smartwatch Bands 子类 id
+    locale_cookies={},
+)
+SITE_DE = Site(
+    order=1, flag="🇩🇪", name_cn="德国站",
+    bestsellers_url="https://www.amazon.de/gp/bestsellers/ce-de/8561056031",
+    new_releases_url="https://www.amazon.de/gp/new-releases/ce-de/8561056031",
+    dp_base="https://www.amazon.de/dp/",
+    category_id="8561056031",    # Smartwatch Replacement Bands 子类 id
+    locale_cookies={"lc-acbde": "en_GB"},  # 强制 amazon.de 渲染英文, 复用英文正则
+)
+SITES = [SITE_US, SITE_DE]
+
 PAGES = [1, 2]  # 每个榜单抓 2 页 (top ~100)
 
 # ---------------------------------------------------------------- 路径 / 日志
@@ -268,14 +302,14 @@ def brand_matches(target, resolved):
     return tl == rl or re.search(r"\b" + re.escape(tl) + r"\b", rl) is not None
 
 
-def _extract_bsr_rank(page, full_text):
+def _extract_bsr_rank(page, full_text, category_id):
     """从详情页取本类目 (Smartwatch Bands) 的销量榜排名数字; 取不到返回 None。
 
     用 href 含类目 id 的链接文字作为类目名, 再在全页文本 (full_text) 里匹配
     "#<数字> in <类目名>", 兼容 detailBullets 与 productDetails 两种版式。
     """
     cat_name = None
-    for a in page.css(f'a[href*="{CATEGORY_ID}"]'):
+    for a in page.css(f'a[href*="{category_id}"]'):
         href = a.attrib.get("href", "")
         if "bestsellers" in href or "/zg" in href or "hrsr" in href:
             cat_name = a.get_all_text(strip=True)
@@ -337,21 +371,24 @@ def _close_all_sessions():
     _all_sessions.clear()
 
 
-def resolve_product(asin, attempts=3):
+def resolve_product(asin, site, attempts=3):
     """纯 HTTP 拉商品详情页, 返回 {brand, bsr_rank, sold_by}。
 
     品牌取 byline "Visit the X Store" (匿名访问下榜单列表标题不含品牌, 详情页才可靠)。
+    site.locale_cookies 注入语言偏好 (DE 强制英文), 使 byline/BSR/Sold by 文案为英文,
+    复用英文正则。
 
     HTTP 状态 200 不代表拿到了真实商品页 (可能是验证码/拦截页), 所以用
     `#productTitle` 是否存在校验内容真实性; 校验失败按软失败重试, 并记录
     诊断信息 (文本长度/是否命中拦截关键词), 避免"状态200但内容是空的"被
     误判为成功而不重试。
     """
-    url = f"https://www.amazon.com/dp/{asin}"
+    url = f"{site.dp_base}{asin}"
     page = None
     for i in range(1, attempts + 1):
         try:
-            candidate = _get_thread_session().get(url, impersonate=_IMPERSONATE_POOL)
+            candidate = _get_thread_session().get(
+                url, impersonate=_IMPERSONATE_POOL, cookies=site.locale_cookies or None)
         except Exception as e:
             logger.warning("详情页拉取异常 asin=%s 第%d次: %s", asin, i, e)
             continue
@@ -373,14 +410,16 @@ def resolve_product(asin, attempts=3):
 
     full_text = page.get_all_text(separator=" ", strip=True)  # 全页文本只序列化一次, 供品牌兜底与BSR共用
     brand = _extract_brand(page, full_text)
-    bsr_rank = _extract_bsr_rank(page, full_text)
+    bsr_rank = _extract_bsr_rank(page, full_text, site.category_id)
     sold_by = _extract_sold_by(page)
     logger.debug("详情页 asin=%s 品牌=%s 销量榜排名=%s Sold by=%s", asin, brand, bsr_rank, sold_by)
     return {"brand": brand, "bsr_rank": bsr_rank, "sold_by": sold_by}
 
 
-def resolve_all(asins, workers=8):
+def resolve_all(asins, site, workers=8):
     """并发解析所有 asin 的品牌与销量榜排名, 返回 asin -> {brand, bsr_rank}。
+
+    asin 属于 site 所在站点, 详情页只能用该站 dp 前缀查 (跨站 asin 不通用)。
 
     workers=8 是验证过稳定的并发数。曾测试过把它提到16/24/32, 但连续高并发
     压测本身就会让 IP 被亚马逊判定为可疑, 污染后续请求 (实测命中 "Continue
@@ -390,7 +429,7 @@ def resolve_all(asins, workers=8):
     asins = list(asins)
     result, done = {}, 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(resolve_product, a): a for a in asins}
+        futs = {ex.submit(resolve_product, a, site): a for a in asins}
         for fut in as_completed(futs):
             result[futs[fut]] = fut.result()
             done += 1
@@ -417,13 +456,15 @@ def resolve_shop_name(brand, shops, item):
     return shop
 
 
-def _make_result(brand, asin, image_url, shop_str, sort_key, rank_lines, board_url, list_rank):
+def _make_result(brand, asin, image_url, shop_str, sort_key, rank_lines, board_url, list_rank, site_order):
     """组装一条命中记录 (结构化)。图片行延后到截图阶段再生成 (见 _result_lines)。
 
     board_url / list_rank 用于截图回放: 确定去哪个榜单页、翻到第几页定位卡片。
     既命中销量榜又命中新品榜时只走销量榜分支, 故这里只会带销量榜的 url 与排名。
+    site_order 用于输出排序: 同站内按 sort_key, 站间按 site_order (小的先发)。
     """
     return {
+        "site_order": site_order,
         "sort_key": sort_key,
         "brand": brand,
         "asin": asin,
@@ -446,9 +487,12 @@ def segment_text(r):
     return "，".join([f"品牌：{r['brand']}", f"店铺：{r['shop_str']}"] + r["rank_lines"])
 
 
-def build_header(stats):
-    """喜报头部。逐小句判断: 前50/50-100 各为 0 则省略对应小句, 某榜两小句全空则省略该榜行,
-    两榜行皆空返回 None (调用方据此不发头部)。占位数字由 stats 动态填入。"""
+def build_site_header(site, stats):
+    """单站喜报块 (自包裹: 标题 + 站喜报 + 结尾, 供按站穿插输出)。
+
+    逐小句判断 (前50/50-100 各为 0 则省略对应小句, 某榜两小句全空则省略该榜行);
+    该站两榜行皆空返回 None (调用方据此不发该站头部)。占位数字由 stats 动态填入。
+    """
     def board_line(emoji, name, top50, next50):
         clauses = []
         if top50 > 0:
@@ -466,7 +510,7 @@ def build_header(stats):
     if not lines:
         return None
     return "\n".join(
-        ["【每日播报】🎆🧨🧨Best Sellers快讯 🧨🧨🎆", "🇺🇸 美国站喜报："]
+        ["【每日播报】🎆🧨🧨Best Sellers快讯 🧨🧨🎆", f"{site.flag} {site.name_cn}喜报："]
         + lines
         + ["继续冲榜，再创佳绩～ 🧧🚀🚀🧧"]
     )
@@ -574,37 +618,10 @@ def _scrape_one(url, label):
         return scrape_ranking(session, url, label)
 
 
-def collect_hits():
-    """抓榜 + 详情页解析 + 按品牌匹配, 返回命中记录列表 (未截图、未排序)。"""
-    # 1) 两个独立浏览器会话并行抓两个榜单 (asin + 排名 + 图片)
-    t_scrape0 = time.time()
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        fut_bs = ex.submit(_scrape_one, BESTSELLERS_URL, "销量榜")
-        fut_nr = ex.submit(_scrape_one, NEW_RELEASES_URL, "新品榜")
-        bestseller_items = fut_bs.result()
-        new_release_items = fut_nr.result()
-    t_scrape = time.time() - t_scrape0
-    logger.info("阶段耗时: 浏览器抓榜单(并行) %.1fs", t_scrape)
-    print(f"\n[耗时] 浏览器抓榜单(并行): {t_scrape:.1f}s")
-
-    # 2) 并发查详情页, 得到每个商品的真实品牌 + 销量榜排名 (列表标题不含品牌)
-    t_resolve0 = time.time()
-    all_asins = {it["asin"] for it in bestseller_items + new_release_items if it["asin"]}
-    print(f"\n[品牌解析] 共 {len(all_asins)} 个商品, 并发查询详情页...")
-    logger.info("开始品牌解析, 共 %d 个 asin", len(all_asins))
-    info = resolve_all(all_asins)
-    t_resolve = time.time() - t_resolve0
-    logger.info("阶段耗时: 详情页并发解析 %.1fs", t_resolve)
-    print(f"[耗时] 详情页并发解析: {t_resolve:.1f}s")
-    for it in bestseller_items + new_release_items:
-        meta = info.get(it["asin"]) or {}
-        it["brand"] = meta.get("brand")
-        it["bsr_rank"] = meta.get("bsr_rank")
-        it["sold_by"] = meta.get("sold_by")
-
-    # 3) 按品牌匹配
+def _match_brands(site, bestseller_items, new_release_items):
+    """对单站两榜按 BRANDS 匹配, 返回命中记录列表 (带 site.order, 未排序)。"""
     nr_by_asin = {it["asin"]: it for it in new_release_items}
-    results = []  # 收集所有命中, 最后按销量榜排名数字统一排序输出
+    results = []
     for brand, shops in BRANDS.items():
         bs_hits = [it for it in bestseller_items if brand_matches(brand, it.get("brand"))]
         nr_hits = [it for it in new_release_items if brand_matches(brand, it.get("brand"))]
@@ -616,15 +633,16 @@ def collect_hits():
                 if shop_str is None:
                     continue
                 nr_item = nr_by_asin.get(item["asin"]) or (nr_hits[0] if nr_hits else None)
-                logger.info("[%s] 销量榜命中 #%s 新品榜#%s asin=%s 店铺=%s",
-                            brand, item["rank"], nr_item["rank"] if nr_item else "-", item["asin"], shop_str)
+                logger.info("[%s/%s] 销量榜命中 #%s 新品榜#%s asin=%s 店铺=%s",
+                            site.name_cn, brand, item["rank"], nr_item["rank"] if nr_item else "-",
+                            item["asin"], shop_str)
                 rank_lines = [f"销量榜排名：{item['rank']}"]
                 if nr_item:
                     rank_lines.append(f"新品榜排名：{nr_item['rank']}")
                 # 既命中销量榜(又可能命中新品榜)→ 统一按销量榜列表页截图
                 results.append(_make_result(brand, item["asin"], item["image_url"], shop_str,
                                             int(item["rank"]), rank_lines,
-                                            BESTSELLERS_URL, int(item["rank"])))
+                                            site.bestsellers_url, int(item["rank"]), site.order))
 
         elif nr_hits:
             # 仅新品榜命中: 销量榜排名取详情页 BSR
@@ -634,21 +652,25 @@ def collect_hits():
                     continue
                 bsr = nr_item.get("bsr_rank")
                 if not bsr:
-                    logger.error("[%s] 仅新品榜命中但详情页未取到销量榜排名 asin=%s", brand, nr_item["asin"])
+                    logger.error("[%s/%s] 仅新品榜命中但详情页未取到销量榜排名 asin=%s",
+                                 site.name_cn, brand, nr_item["asin"])
                     print(f"\n品牌: {brand}  ⚠ 详情页未取到销量榜排名 (asin={nr_item['asin']})")
                     continue
-                logger.info("[%s] 仅新品榜命中 新品榜#%s 销量榜#%s asin=%s 店铺=%s",
-                            brand, nr_item["rank"], bsr, nr_item["asin"], shop_str)
+                logger.info("[%s/%s] 仅新品榜命中 新品榜#%s 销量榜#%s asin=%s 店铺=%s",
+                            site.name_cn, brand, nr_item["rank"], bsr, nr_item["asin"], shop_str)
                 # 仅新品榜命中: 排序键用 BSR, 但截图翻页要用新品榜列表排名
                 results.append(_make_result(
                     brand, nr_item["asin"], nr_item["image_url"], shop_str, int(bsr),
                     [f"今日销量榜：{bsr}名", f"新品榜：{nr_item['rank']}名"],
-                    NEW_RELEASES_URL, int(nr_item["rank"])))
+                    site.new_releases_url, int(nr_item["rank"]), site.order))
 
         else:
-            logger.debug("[%s] 销量榜/新品榜均未上榜", brand)
+            logger.debug("[%s/%s] 销量榜/新品榜均未上榜", site.name_cn, brand)
+    return results
 
-    # 头部"占X席"统计：按榜分别计、双榜各计（同一商品同时上两榜则两边各算一席）。
+
+def _board_stats(bestseller_items, new_release_items):
+    """单站头部"占X席"统计：按榜分别计、双榜各计（同一商品同时上两榜则两边各算一席）。"""
     def _matches_any(b):
         return any(brand_matches(k, b) for k in BRANDS)
 
@@ -658,27 +680,76 @@ def collect_hits():
 
     bs_top50, bs_next50 = _counts(bestseller_items)
     nr_top50, nr_next50 = _counts(new_release_items)
-    stats = {"bs_top50": bs_top50, "bs_next50": bs_next50,
-             "nr_top50": nr_top50, "nr_next50": nr_next50}
+    return {"bs_top50": bs_top50, "bs_next50": bs_next50,
+            "nr_top50": nr_top50, "nr_next50": nr_next50}
+
+
+def _collect_site(site):
+    """抓单站两榜 + 详情页解析 + 按品牌匹配, 返回 (命中记录列表, stats)。"""
+    print(f"\n{'=' * 70}\n{site.flag} {site.name_cn}\n{'=' * 70}")
+    # 1) 两个独立浏览器会话并行抓两个榜单 (asin + 排名 + 图片)
+    t_scrape0 = time.time()
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut_bs = ex.submit(_scrape_one, site.bestsellers_url, f"{site.name_cn}销量榜")
+        fut_nr = ex.submit(_scrape_one, site.new_releases_url, f"{site.name_cn}新品榜")
+        bestseller_items = fut_bs.result()
+        new_release_items = fut_nr.result()
+    t_scrape = time.time() - t_scrape0
+    logger.info("[%s] 阶段耗时: 浏览器抓榜单(并行) %.1fs", site.name_cn, t_scrape)
+    print(f"\n[耗时] {site.name_cn} 浏览器抓榜单(并行): {t_scrape:.1f}s")
+
+    # 2) 并发查详情页, 得到每个商品的真实品牌 + 销量榜排名 (列表标题不含品牌)
+    t_resolve0 = time.time()
+    all_asins = {it["asin"] for it in bestseller_items + new_release_items if it["asin"]}
+    print(f"\n[品牌解析] {site.name_cn} 共 {len(all_asins)} 个商品, 并发查询详情页...")
+    logger.info("[%s] 开始品牌解析, 共 %d 个 asin", site.name_cn, len(all_asins))
+    info = resolve_all(all_asins, site)
+    t_resolve = time.time() - t_resolve0
+    logger.info("[%s] 阶段耗时: 详情页并发解析 %.1fs", site.name_cn, t_resolve)
+    print(f"[耗时] {site.name_cn} 详情页并发解析: {t_resolve:.1f}s")
+    for it in bestseller_items + new_release_items:
+        meta = info.get(it["asin"]) or {}
+        it["brand"] = meta.get("brand")
+        it["bsr_rank"] = meta.get("bsr_rank")
+        it["sold_by"] = meta.get("sold_by")
+
+    # 3) 按品牌匹配 + 统计
+    results = _match_brands(site, bestseller_items, new_release_items)
+    stats = _board_stats(bestseller_items, new_release_items)
     return results, stats
 
 
-def run_pipeline():
-    """完整流程: collect_hits + 截图, 返回 (results_sorted, shots, stats)。
+def collect_hits():
+    """逐站抓榜 + 详情页解析 + 按品牌匹配, 返回 (命中记录列表, 各站 stats)。
 
-    results_sorted 按 sort_key 升序; shots 为 asin -> 本地 png 路径 (截图失败的 asin 不在内);
-    stats 为头部"占X席"统计。供 main() (CLI 打印) 与 runner (图文投递) 共用。
+    各站串行 (避免并发翻倍触发反爬); 站间 asin 不通用, 详情页解析按站独立。
+    返回的 results 未截图、未排序; stats_by_site 为 {site.order: stats}, 供头部喜报用。
+    """
+    all_results, stats_by_site = [], {}
+    for site in SITES:
+        results, stats = _collect_site(site)
+        all_results.extend(results)
+        stats_by_site[site.order] = stats
+    return all_results, stats_by_site
+
+
+def run_pipeline():
+    """完整流程: collect_hits + 截图, 返回 (results_sorted, shots, stats_by_site)。
+
+    results_sorted 按 (site_order, sort_key) 升序: 站间按 site_order (美国先发完再德国),
+    站内按销量榜排名数字。shots 为 asin -> 本地 png 路径 (截图失败的 asin 不在内);
+    stats_by_site 为各站头部"占X席"统计。供 main() (CLI 打印) 与 runner (图文投递) 共用。
     """
     init_run_paths()  # 每次运行独立的 artifact 目录 + 日志文件
-    results, stats = collect_hits()
+    results, stats_by_site = collect_hits()
     if not results:
-        return [], {}, stats
+        return [], {}, stats_by_site
     print("\n[截图] 回放命中商品卡片...")
     t_shot0 = time.time()
     shots = screenshot_cards(results)
     logger.info("阶段耗时: 截图回放 %.1fs", time.time() - t_shot0)
     print(f"[耗时] 截图回放: {time.time() - t_shot0:.1f}s")
-    return sorted(results, key=lambda r: r["sort_key"]), shots, stats
+    return sorted(results, key=lambda r: (r["site_order"], r["sort_key"])), shots, stats_by_site
 
 
 def main():
@@ -688,18 +759,23 @@ def main():
     print("Amazon 榜单品牌排名查询")
     print("=" * 70)
 
-    results_sorted, shots, stats = run_pipeline()
+    results_sorted, shots, stats_by_site = run_pipeline()
 
-    header = build_header(stats)
     print("\n" + "=" * 70)
     print("查询结果")
     print("=" * 70)
-    if header:
-        print("\n" + header + "\n")
     if results_sorted:
-        for r in results_sorted:
-            for line in _result_lines(r, shots.get(r["asin"])):
-                print(line)
+        # 按站穿插: 每站 喜报头部(自包裹) → 该站命中商品图文
+        for site in SITES:
+            site_results = [r for r in results_sorted if r["site_order"] == site.order]
+            if not site_results:
+                continue
+            header = build_site_header(site, stats_by_site.get(site.order) or {})
+            if header:
+                print("\n" + header + "\n")
+            for r in site_results:
+                for line in _result_lines(r, shots.get(r["asin"])):
+                    print(line)
     else:
         print("\n(本次抓取范围内无目标品牌上榜)")
 
