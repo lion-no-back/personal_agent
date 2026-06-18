@@ -182,6 +182,85 @@ def _dt_tables(text: str) -> str:
     return re.sub(table_re, replacer, text)
 
 
+# ──────────────────────────────────────────────────────────────
+#   钉钉卡片 API 全局限流（跨会话共享，防 403 QpsLimit）
+# ──────────────────────────────────────────────────────────────
+
+# 钉钉卡片接口总 QPS 约 40（按机器人 appKey 计，所有会话累加，与会话数无关）。
+# 保守取 20，给 createAndDeliver 等非流式调用留出余量。
+_CARD_MAX_QPS = float(os.getenv("DINGTALK_CARD_MAX_QPS", "20"))
+# 撞 QpsLimit 后的退避时长（秒）
+_CARD_QPS_BACKOFF_S = 2.0
+
+
+class _CardRateLimiter:
+    """进程级全局令牌桶：所有钉钉卡片 streaming/更新请求共享同一速率上限。
+
+    背景：钉钉卡片 API 的 QPS 按机器人 appKey 累加，与会话数无关。
+    DingTalkCardRenderer 每个会话各自的 THROTTLE_S 只能约束「单会话」速度，
+    多个会话并发流式推送时总量会叠加超过钉钉上限，触发 403 QpsLimit。
+    本限流器把所有会话的卡片请求汇到一处统一限速：无论几个会话同时在线，
+    合计速度都不超过 _CARD_MAX_QPS。
+
+    线程安全：取令牌期间持锁（含必要的 sleep），天然把并发请求串行成
+    「每 1/QPS 秒放行一个」，避免多线程各自判断「有令牌」把令牌桶击穿。
+    """
+
+    def __init__(self, max_qps: float, backoff_s: float) -> None:
+        self._max_qps = max_qps
+        self._backoff_s = backoff_s
+        self._tokens = max_qps
+        self._last_refill = time.monotonic()
+        self._backoff_until = 0.0
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        """阻塞直到取得一个令牌（必要时先等退避结束，再等令牌补充）。"""
+        with self._lock:
+            now = time.monotonic()
+            if now < self._backoff_until:
+                time.sleep(self._backoff_until - now)
+                now = time.monotonic()
+            self._refill(now)
+            if self._tokens < 1:
+                time.sleep((1 - self._tokens) / self._max_qps)
+                self._refill(time.monotonic())
+            self._tokens -= 1
+
+    def trigger_backoff(self) -> None:
+        """撞 QpsLimit 后调用：暂停所有卡片请求一段时间并清空令牌。"""
+        with self._lock:
+            self._backoff_until = time.monotonic() + self._backoff_s
+            self._tokens = 0
+            self._last_refill = self._backoff_until
+
+    def _refill(self, now: float) -> None:
+        elapsed = now - self._last_refill
+        if elapsed > 0:
+            self._tokens = min(self._max_qps, self._tokens + elapsed * self._max_qps)
+            self._last_refill = now
+
+
+# 全局唯一实例：跨所有 DingTalkCardRenderer / 会话共享
+_CARD_RATE_LIMITER = _CardRateLimiter(_CARD_MAX_QPS, _CARD_QPS_BACKOFF_S)
+
+
+def _is_qps_limit_error(exc: httpx.HTTPStatusError) -> bool:
+    """识别钉钉卡片接口的 403 QpsLimit 限流错误（瞬时、可重试）。
+
+    与「网络/鉴权等真失败」区分开：只有这类错误才静默退避重试，
+    其余错误照常抛出交由上层降级，避免把可恢复错误展示成「处理失败」。
+    """
+    resp = exc.response
+    if resp.status_code != 403:
+        return False
+    try:
+        code = str(resp.json().get("code", ""))
+    except Exception:
+        code = ""
+    return "QpsLimit" in code or "QpsLimit" in (resp.text or "")
+
+
 class DingTalkCardRenderer:
     """
     钉钉 AI 卡片 v2 流式渲染器。
@@ -232,6 +311,27 @@ class DingTalkCardRenderer:
             "Content-Type": "application/json",
         }
 
+    def _put_card(self, url: str, payload: dict) -> None:
+        """经全局限流后 PUT 卡片接口；撞 QpsLimit 时退避重试一次。
+
+        仅对瞬时可恢复的 QpsLimit 做静默重试；其余错误照常抛出，
+        交由上层（on_update 的 except / 降级路径）处理，不掩盖真失败。
+        """
+        _CARD_RATE_LIMITER.acquire()
+        try:
+            httpx.put(url, headers=self._mk_headers(), json=payload, timeout=10).raise_for_status()
+            return
+        except httpx.HTTPStatusError as exc:
+            if not _is_qps_limit_error(exc):
+                raise
+        # QpsLimit：退避后重试一次。流式帧带 guid，刷新以避免被去重丢弃。
+        logger.warning("钉钉卡片撞 QpsLimit，退避 %.1fs 后重试 | url=%s", _CARD_QPS_BACKOFF_S, url)
+        _CARD_RATE_LIMITER.trigger_backoff()
+        if "guid" in payload:
+            payload["guid"] = str(uuid.uuid4())
+        _CARD_RATE_LIMITER.acquire()
+        httpx.put(url, headers=self._mk_headers(), json=payload, timeout=10).raise_for_status()
+
     def _push(self, text: str, *, finalize: bool = False) -> None:
         """全量推送到 streaming 端点。统一做流式安全变换：GFM 表格→纯文本、截断未完成表格。"""
         content = _dt_tables(text)
@@ -249,7 +349,7 @@ class DingTalkCardRenderer:
             "isFinalize": finalize,
             "isError": False,
         }
-        httpx.put(_CARD_STREAM_URL, headers=self._mk_headers(), json=payload, timeout=10).raise_for_status()
+        self._put_card(_CARD_STREAM_URL, payload)
         self._last_text = content
 
     def _on_tool(self, text: str) -> None:
@@ -285,7 +385,7 @@ class DingTalkCardRenderer:
                 }
             },
         }
-        httpx.put(_CARD_UPDATE_URL, headers=self._mk_headers(), json=payload, timeout=10).raise_for_status()
+        self._put_card(_CARD_UPDATE_URL, payload)
 
 
 _API_BASE = "https://api.dingtalk.com"
