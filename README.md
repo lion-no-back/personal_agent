@@ -324,6 +324,7 @@ PersonalAgent/
 | `DINGTALK_CLIENT_ID` / `DINGTALK_CLIENT_SECRET` | 钉钉机器人凭证 |
 | `DINGTALK_ALLOWED_USERS` | *可选* 白名单用户 ID（逗号分隔） |
 | `DINGTALK_MAX_WORKERS` | *可选* 钉钉并发线程数 |
+| `DINGTALK_ACK_EMOTION` | *可选* 收到调用时贴在用户消息上的表情名称（全程保留），默认 `OK`（👌，普通无背景表情；名称见钉钉「表情列表」，未知名称回退为带背景文字表情） |
 
 ### Agent / 记忆 / 工具
 

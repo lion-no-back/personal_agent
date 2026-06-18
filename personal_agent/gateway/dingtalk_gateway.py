@@ -297,6 +297,12 @@ _CARD_CREATE_URL = f"{_API_BASE}/v1.0/card/instances/createAndDeliver"
 _CARD_STREAM_URL = f"{_API_BASE}/v1.0/card/streaming"
 _CARD_UPDATE_URL = f"{_API_BASE}/v1.0/card/instances"
 
+# 消息表情回复 API：收到调用时在用户消息上贴一个 👌（OK）表情，替代发独立贴纸消息
+# emotionType=1 为普通表情（无背景气泡）；OK 对应钉钉标准表情 emotion_023
+_EMOTION_REPLY_URL = f"{_API_BASE}/v1.0/robot/emotion/reply"
+_ACK_EMOTION_ID = "emotion_023"
+_ACK_EMOTION_NAME = "OK"
+
 # 默认使用 openclaw-channel-dingtalk 验证过的社区模板（content=markdown-variable-new, blockList=loopArray）
 # 如需自建模板，在 .env 中设置 DINGTALK_CARD_TEMPLATE_ID
 _CARD_TEMPLATE_ID = os.getenv(
@@ -512,8 +518,8 @@ class DingTalkGateway(BaseGateway):
         if not event.content:
             return
 
-        if event.chat_type == "p2p":
-            threading.Thread(target=self._send_ack, args=(incoming,), daemon=True).start()
+        # 收到调用：在用户消息上贴一个 👌 表情回复（替代发送独立的「收到」贴纸消息）
+        threading.Thread(target=self._react, args=(incoming,), daemon=True).start()
 
         renderer = self._try_create_renderer(incoming)
 
@@ -665,15 +671,30 @@ class DingTalkGateway(BaseGateway):
         except Exception as e:
             logger.error("sessionWebhook 发送异常: %s", e)
 
-    def _send_ack(self, incoming: "ChatbotMessage") -> None:
-        """私聊收到新消息时，立即通过 sessionWebhook 发送「收到」确认，让用户知道请求已在处理中。"""
-        if not incoming.session_webhook:
-            return
-        payload = {"msgtype": "text", "text": {"content": "[收到]"}}
+    def _react(self, incoming: "ChatbotMessage") -> None:
+        """
+        收到调用时在触发消息上贴一个 👌（OK）表情回复，告知用户请求已在处理中。
+        替代旧的「[收到]」贴纸消息：表情贴在用户原消息上，不占独立气泡，更轻量。
+        emotionType=1 普通表情（无背景）。失败仅告警，不影响主流程。
+        """
+        payload = {
+            "robotCode": self._client_id,
+            "openMsgId": incoming.message_id,
+            "openConversationId": incoming.conversation_id,
+            "emotionType": 1,
+            "emotionId": _ACK_EMOTION_ID,
+            "emotionName": _ACK_EMOTION_NAME,
+        }
         try:
-            httpx.post(incoming.session_webhook, json=payload, timeout=5)
+            resp = httpx.post(
+                _EMOTION_REPLY_URL,
+                headers={"x-acs-dingtalk-access-token": self._get_api_token()},
+                json=payload,
+                timeout=10,
+            )
+            resp.raise_for_status()
         except Exception as e:
-            logger.debug("收到确认发送失败: %s", e)
+            logger.warning("表情回复失败 | error=%s", e)
 
     def _send_markdown_via_api(self, id_type: str, raw_id: str, text: str) -> None:
         """通过 OpenAPI 主动发 Markdown 消息（send_text 后端，需 api token）。"""
