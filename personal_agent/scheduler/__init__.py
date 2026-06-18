@@ -60,6 +60,7 @@ class SchedulerDaemon:
         agent=None,
         notify_fn: Optional[Callable[[str, str], None]] = None,
         send_file_fn: Optional[Callable[[str, str, str], None]] = None,
+        send_image_text_fn: Optional[Callable[[str, str, str], None]] = None,
         alert_callback: Optional[AlertCallback] = None,
     ) -> None:
         """
@@ -119,6 +120,7 @@ class SchedulerDaemon:
             agent=agent,
             notify_fn=notify_fn,
             send_file_fn=send_file_fn,
+            send_image_text_fn=send_image_text_fn,
             persistence=persistence,
             default_misfire_grace_time=config.persist.default_misfire_grace_time,
         )

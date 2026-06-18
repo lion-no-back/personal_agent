@@ -217,6 +217,7 @@ class CronEngine:
         agent=None,
         notify_fn: Optional[Callable[[str, str], None]] = None,
         send_file_fn: Optional[Callable[[str, str, str], None]] = None,
+        send_image_text_fn: Optional[Callable[[str, str, str], None]] = None,
         persistence: "Optional[JobPersistence]" = None,
         default_misfire_grace_time: int = 259200,
     ) -> None:
@@ -235,6 +236,7 @@ class CronEngine:
         self._agent = agent
         self._notify_fn = notify_fn
         self._send_file_fn = send_file_fn
+        self._send_image_text_fn = send_image_text_fn
         self._persistence = persistence
         self._default_grace = default_misfire_grace_time
         self._scheduler: Optional[AsyncIOScheduler] = None
@@ -491,17 +493,19 @@ class CronEngine:
                 loop = asyncio.get_running_loop()
                 result = await loop.run_in_executor(None, fn)
 
-            # 优先使用按需触发时持久化的投递目标（群/用户），回退到静态配置
+            # 投递目标：以 WORKFLOW_META.deliver_to（__init__.py 静态配置）为主；
+            # 仅当它为空时，才回退到按需触发持久化的目标（data/<id>_delivery_target）。
             effective_deliver_to = job_cfg.deliver_to
-            try:
-                from pathlib import Path as _Path
-                _state = _Path(__file__).resolve().parents[2] / "data" / f"{job_cfg.id}_delivery_target"
-                if _state.exists():
-                    _saved = _state.read_text(encoding="utf-8").strip()
-                    if _saved:
-                        effective_deliver_to = _saved
-            except Exception:
-                pass
+            if not effective_deliver_to:
+                try:
+                    from pathlib import Path as _Path
+                    _state = _Path(__file__).resolve().parents[2] / "data" / f"{job_cfg.id}_delivery_target"
+                    if _state.exists():
+                        _saved = _state.read_text(encoding="utf-8").strip()
+                        if _saved:
+                            effective_deliver_to = _saved
+                except Exception:
+                    pass
 
             if effective_deliver_to:
                 if isinstance(result, str):
@@ -528,5 +532,19 @@ class CronEngine:
                                 logger.exception(
                                     "[cron:%s] 投递文件失败 | file=%s", job_cfg.id, f
                                 )
+
+                    # segments：逐条「图片 + 文字」合并投递（与按需触发路径一致）。
+                    for seg in result.get("segments", []):
+                        img = seg.get("image")
+                        txt = seg.get("text", "")
+                        try:
+                            if img and self._send_image_text_fn:
+                                self._send_image_text_fn(effective_deliver_to, str(img), txt)
+                            elif txt and self._notify_fn:
+                                self._notify_fn(effective_deliver_to, txt)
+                        except Exception:
+                            logger.exception(
+                                "[cron:%s] 投递图文段失败 | image=%s", job_cfg.id, img
+                            )
 
         return inner
