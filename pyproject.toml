@@ -64,6 +64,11 @@ rankbb-amazon = [
     "scrapling[all]>=0.4.9",
 ]
 
+# cloakbrowser 首次发送【评论配置】时由 runner 自动安装；Chromium 二进制由 cloakbrowser 下载到 fxreview_amazon/chromium/
+fxreview-amazon = [
+    "cloakbrowser>=0.3.31",
+]
+
 knowledge = [
     "opendataloader-pdf",
     "markitdown",

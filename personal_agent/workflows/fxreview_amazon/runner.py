@@ -2,8 +2,8 @@
 亚马逊评论采集与 VoC 分析 workflow 入口（配置 / 运行两段，详见 SPEC.md）。
 
 由 ConversationAgent 按需触发，单包内按消息内容分流：
-  - 含「亚马逊配置」 → 配置段：确保 Chromium + 有头自动登录建立 browser_profile 信任态
-  - 否则抽 ASIN     → 运行段：headless 采集 + DeepSeek VoC 分析
+  - 含「评论配置」 → 配置段：装 cloakbrowser + 确保 Chromium + 有头自动登录建立 browser_profile 信任态
+  - 否则抽 ASIN   → 运行段：headless 采集 + DeepSeek VoC 分析
 
 均返回 {"message": str, "files": [Path]}，调用方负责把文件发回原会话。
 """
@@ -14,6 +14,8 @@ import importlib.util
 import logging
 import os
 import re
+import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -21,13 +23,16 @@ logger = logging.getLogger(__name__)
 
 # ASIN：10 位字母数字（消息里的中文触发词不参与匹配）
 _ASIN_RE = re.compile(r"[A-Za-z0-9]{10}")
-_CONFIG_TRIGGER = "亚马逊配置"
+_CONFIG_TRIGGER = "评论配置"
 _LLM_KEYS = ("LLM_REASONING_API_KEY", "LLM_REASONING_BASE_URL", "LLM_REASONING_MODEL_ID")
+
+# 配置段按需安装的依赖（cloakbrowser 为 PyPI 包，首次发送【评论配置】时自动安装）
+_INSTALL_PACKAGES = ["cloakbrowser>=0.3.31"]
 
 # 文案（SPEC §3 / §4）
 _MSG_NO_ASIN = "⚠️ 未能识别 ASIN。请按【评论采集+10位ASIN】发送，例如：评论采集B0CWKH83WY"
-_MSG_NEED_CONFIG = "⚠️ 尚未完成亚马逊配置，请先发送【亚马逊配置】"
-_MSG_RELOGIN_FAILED = "无头登录失效，请再次发送【亚马逊配置】"
+_MSG_NEED_CONFIG = "⚠️ 首次使用请先发送【评论配置】完成初始化，配置完成后即可正常采集"
+_MSG_RELOGIN_FAILED = "无头登录失效，请再次发送【评论配置】"
 
 
 # ────────────────────────── 工具函数 ──────────────────────────
@@ -74,10 +79,25 @@ def _chromium_ready() -> bool:
 
 # ────────────────────────── 配置段 ──────────────────────────
 
+def _ensure_deps() -> None:
+    """配置段调用：缺 cloakbrowser 时自动安装（纯加法 uv pip install，不触碰现有包）。"""
+    if importlib.util.find_spec("cloakbrowser") is not None:
+        return
+    uv = shutil.which("uv") or "uv"
+    logger.info("[fxreview_amazon] 缺少依赖 cloakbrowser，正在安装...")
+    try:
+        subprocess.run([uv, "pip", "install"] + _INSTALL_PACKAGES, check=True)
+        importlib.invalidate_caches()
+        logger.info("[fxreview_amazon] 依赖安装完成")
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"依赖安装失败，请手动执行：uv pip install {' '.join(_INSTALL_PACKAGES)}"
+        ) from exc
+
+
 def _run_config() -> dict:
-    """确保 Chromium + 有头自动登录建立信任态。"""
-    if importlib.util.find_spec("cloakbrowser") is None:
-        raise RuntimeError("缺少依赖 cloakbrowser，请先安装后重试")
+    """确保 cloakbrowser + Chromium + 有头自动登录建立信任态。"""
+    _ensure_deps()
     email, password = _require_credentials()
 
     from . import session  # noqa: F401 — 设置 CLOAKBROWSER_* 环境
@@ -89,7 +109,7 @@ def _run_config() -> dict:
         ensure_binary()
     except Exception as exc:
         logger.exception("[fxreview_amazon] Chromium 准备失败")
-        return {"message": f"❌ 亚马逊配置失败：Chromium 下载/准备失败：{exc}", "files": []}
+        return {"message": f"❌ 评论配置失败：Chromium 下载/准备失败：{exc}", "files": []}
 
     # ② 有头自动登录建立信任态
     message = asyncio.run(_config_login_async(email, password))
@@ -104,27 +124,26 @@ async def _config_login_async(email: str, password: str) -> str:
         ok = await run_login(email, password, headless=False)
     except Exception as exc:
         logger.exception("[fxreview_amazon] 有头登录异常")
-        return f"❌ 亚马逊配置失败：登录异常：{exc}"
+        return f"❌ 评论配置失败：登录异常：{exc}"
 
     if ok:
-        return "✅ 亚马逊配置完成，现在可发送【评论采集+ASIN】"
-    return "❌ 亚马逊配置失败：有头登录未建立信任态（如有验证码请在弹出窗口清理后重试）"
+        return "✅ 评论配置完成，现在可发送【评论采集+ASIN】"
+    return "❌ 评论配置失败：有头登录未建立信任态（如有验证码请在弹出窗口清理后重试）"
 
 
 # ────────────────────────── 运行段 ──────────────────────────
 
 def _run_collect(asin: str) -> dict:
-    """headless 采集 + VoC 分析。前置：已完成亚马逊配置。"""
+    """headless 采集 + VoC 分析。前置：已完成评论配置。"""
     email, password = _require_credentials()
 
     missing_llm = [k for k in _LLM_KEYS if not os.environ.get(k)]
     if missing_llm:
         raise RuntimeError(f"缺少 DeepSeek 分析配置，请在 .env 配置：{', '.join(missing_llm)}")
-    if importlib.util.find_spec("cloakbrowser") is None:
-        raise RuntimeError("缺少依赖 cloakbrowser，请先安装后重试")
 
-    # Chromium 未就绪即视为未配置——绝不在运行段静默下载 500MB
-    if not _chromium_ready():
+    # 首次使用：cloakbrowser 未装 或 Chromium 未就绪 → 提示先发【评论配置】，绝不在运行段
+    # 静默安装依赖或下载 500MB 浏览器。（or 短路：未装 cloakbrowser 时不会调用 _chromium_ready）
+    if importlib.util.find_spec("cloakbrowser") is None or not _chromium_ready():
         return {"message": _MSG_NEED_CONFIG, "files": []}
 
     start = datetime.now()
@@ -173,7 +192,7 @@ async def _collect_async(email: str, password: str, asin: str) -> dict:
 # ────────────────────────── 入口分流 ──────────────────────────
 
 def run(content: str = "") -> dict:
-    """按消息内容分流：含「亚马逊配置」走配置段，否则抽 ASIN 走运行段。"""
+    """按消息内容分流：含「评论配置」走配置段，否则抽 ASIN 走运行段。"""
     if _CONFIG_TRIGGER in content:
         return _run_config()
 

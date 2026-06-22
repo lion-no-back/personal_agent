@@ -5,7 +5,7 @@
 返回 {"message": str, "files": [Path]}，调用方负责将文件发回原会话。
 """
 
-import importlib.util
+import importlib.metadata
 import logging
 import os
 import shutil
@@ -16,7 +16,6 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _DEP_GROUP = "zxwarn-mabang"
-_CHECK_PACKAGES = ["pandas", "openpyxl"]
 
 
 def _get_project_root() -> Path:
@@ -30,8 +29,27 @@ def _get_project_root() -> Path:
 _INSTALL_PACKAGES = ["openpyxl>=3.1", "pandas>=2.0", "python-calamine>=0.2"]
 
 
+def _dist_name(spec: str) -> str:
+    """从 pip 依赖串取出发行名（PyPI 名）：'python-calamine>=0.2' -> 'python-calamine'。"""
+    for sep in ("<", ">", "=", "!", "~", "[", " "):
+        spec = spec.split(sep, 1)[0]
+    return spec.strip()
+
+
+# 检查清单从 _INSTALL_PACKAGES 自动推导，确保两份清单永不漏项
+_CHECK_PACKAGES = [_dist_name(p) for p in _INSTALL_PACKAGES]
+
+
 def _ensure_deps() -> None:
-    missing = [p for p in _CHECK_PACKAGES if importlib.util.find_spec(p) is None]
+    def _installed(dist: str) -> bool:
+        """读 dist-info 判断发行包是否就绪（自动归一化连字符/下划线、大小写）。"""
+        try:
+            importlib.metadata.version(dist)
+            return True
+        except importlib.metadata.PackageNotFoundError:
+            return False
+
+    missing = [p for p in _CHECK_PACKAGES if not _installed(p)]
     if not missing:
         return
     uv = shutil.which("uv") or "uv"
