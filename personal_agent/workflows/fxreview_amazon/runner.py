@@ -14,7 +14,6 @@ import importlib.util
 import logging
 import os
 import re
-import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -83,11 +82,10 @@ def _ensure_deps() -> None:
     """配置段调用：缺 cloakbrowser 时自动安装（纯加法 uv pip install，不触碰现有包）。"""
     if importlib.util.find_spec("cloakbrowser") is not None:
         return
-    uv = shutil.which("uv") or "uv"
     logger.info("[fxreview_amazon] 缺少依赖 cloakbrowser，正在安装...")
     try:
-        subprocess.run([uv, "pip", "install"] + _INSTALL_PACKAGES, check=True)
-        importlib.invalidate_caches()
+        from personal_agent.workflows.deplock import uv_pip_install
+        uv_pip_install(_INSTALL_PACKAGES)  # 跨进程串行装包 + 刷新导入缓存
         logger.info("[fxreview_amazon] 依赖安装完成")
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(

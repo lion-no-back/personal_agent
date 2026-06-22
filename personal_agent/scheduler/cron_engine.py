@@ -490,8 +490,29 @@ class CronEngine:
             if asyncio.iscoroutinefunction(fn):
                 result = await fn()
             else:
+                # 同步工作流放到独立子进程运行：隔离重原生库（numpy/pandas/torch）的导入与
+                # 运行时按需装包，避免与主进程其它线程并发首次导入产生竞态。
+                from personal_agent.workflows.dispatch import run_in_subprocess
+
+                # 子进程超时设得略早于外层 asyncio.wait_for(job_config.timeout)，
+                # 由子进程先触发并杀掉整棵进程树，再映射成 TimeoutError 走"不重试"分支。
+                sub_timeout = max(int(job_cfg.timeout) - 30, 30) if job_cfg.timeout else None
                 loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(None, fn)
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: run_in_subprocess(
+                        module=job_cfg.module,
+                        function=job_cfg.function,
+                        timeout=sub_timeout,
+                    ),
+                )
+                if result.get("error") == "timeout":
+                    raise asyncio.TimeoutError()  # 子进程超时 → _wrap_job 超时分支（不重试）
+                if not result.get("ok"):
+                    # 真正失败：抛出交给 _wrap_job 的重试/失败通知逻辑
+                    raise RuntimeError(
+                        result.get("error") or result.get("message") or "工作流子进程执行失败"
+                    )
 
             # 投递目标：以 WORKFLOW_META.deliver_to（__init__.py 静态配置）为主；
             # 仅当它为空时，才回退到按需触发持久化的目标（data/<id>_delivery_target）。

@@ -44,3 +44,6 @@ personal_agent/workflows/fxreview_amazon/browser_profile/
 
 # rankbb_amazon workflow runtime assets (local Playwright Chromium binary)
 personal_agent/workflows/rankbb_amazon/chromium/
+
+# 跨进程装包锁（运行时产物）
+.install.lock

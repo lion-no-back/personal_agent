@@ -476,6 +476,20 @@ wheels = [
 ]
 
 [[package]]
+name = "cloakbrowser"
+version = "0.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "httpx" },
+    { name = "playwright" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6b/15/0c9adb23596824142466749a4c193f30a48f5e2c261e95e0fb7bf2911efa/cloakbrowser-0.4.0.tar.gz", hash = "sha256:c0abde12cca9daa39a98468f5bdbf00d00882adcd1d258b1af9d629c9783ba42", size = 5409022, upload-time = "2026-06-22T01:15:45.193Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6e/4a/59af86f0b2511b5fe6a487e9a2f748453fbdb05e1e860c5d50469b697833/cloakbrowser-0.4.0-py3-none-any.whl", hash = "sha256:f7be2b6223fc6ca313ab3094ee681394c0fc143671029b957704f003c84e2786", size = 88558, upload-time = "2026-06-22T01:15:43.539Z" },
+]
+
+[[package]]
 name = "cloudpathlib"
 version = "0.24.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2848,6 +2862,9 @@ costupdate-saihu = [
     { name = "python-calamine" },
     { name = "tqdm" },
 ]
+fxreview-amazon = [
+    { name = "cloakbrowser" },
+]
 knowledge = [
     { name = "huggingface-hub" },
     { name = "markitdown" },
@@ -2905,6 +2922,7 @@ costupdate-saihu = [
     { name = "python-calamine", specifier = ">=0.2" },
     { name = "tqdm", specifier = ">=4.66" },
 ]
+fxreview-amazon = [{ name = "cloakbrowser", specifier = ">=0.3.31" }]
 knowledge = [
     { name = "huggingface-hub" },
     { name = "markitdown" },

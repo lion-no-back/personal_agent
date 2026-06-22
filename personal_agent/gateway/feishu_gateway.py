@@ -282,6 +282,15 @@ class FeishuGateway(BaseGateway):
             .build()
         )
 
+        # ── 未注册事件统一兜底 ───────────────────────────────────
+        # lark-oapi 的分发器是纯 map 匹配、无兜底：凡是飞书后台订阅了、但这里没
+        # register 的事件类型（如 im.message.reaction.created 表情回应），都会被
+        # do_without_validation 抛 "processor not found"，进而被 WS 客户端打成
+        # ERROR 日志并向飞书回 HTTP 500 —— 飞书据此判定投递失败而重试，形成噪音+重试风暴。
+        # 这里在分发入口加一道兜底：识别出"未注册的事件类型"则安静忽略并回成功（200），
+        # 不靠脆弱的异常文案匹配，只放过真正没注册的事件；已注册事件的真实错误照常上抛。
+        self._install_unregistered_event_guard(_handler)
+
         # ── WebSocket Client（被动接收）──────────────────────
         self._ws_client = lark.ws.Client(
             self._app_id,
@@ -928,6 +937,38 @@ class FeishuGateway(BaseGateway):
     #   事件回调（必须在 3 秒内返回）
     # ──────────────────────────────────────────────────────────
 
+
+    @staticmethod
+    def _install_unregistered_event_guard(handler) -> None:
+        """给事件分发器加一道兜底：未注册的事件类型安静忽略并回成功，避免回 500 触发飞书重试。
+
+        实现：包裹 handler.do_without_validation（WS 长连接收到事件时调用的入口）。
+        先按 SDK 同样的方式解析出事件 key（p2.<event_type> / p1.<type>），若该 key 既不在
+        事件处理器表、也不在回调处理器表中，则判定为"订阅了但未注册"，记 DEBUG 后返回 None
+        （WS 客户端据此回 200）。其余情况一律走原逻辑，已注册事件的真实异常照常上抛。
+        若解析或内省失败则回退到原逻辑，绝不改变既有行为。
+        """
+        registered = set(getattr(handler, "_processorMap", {})) | set(
+            getattr(handler, "_callback_processor_map", {})
+        )
+        orig_do = handler.do_without_validation
+
+        def _do(payload: bytes):
+            key = None
+            try:
+                ctx = json.loads(payload.decode("utf-8"))
+                if ctx.get("schema"):  # p2 事件
+                    key = "p2." + (ctx.get("header") or {}).get("event_type", "")
+                elif ctx.get("uuid"):  # p1 事件
+                    key = "p1." + (ctx.get("event") or {}).get("type", "")
+            except Exception:
+                key = None
+            if key and key not in registered:
+                logger.debug("忽略未注册的飞书事件: %s", key)
+                return None
+            return orig_do(payload)
+
+        handler.do_without_validation = _do
 
     def _on_im_message_read_v1(self, data: P2ImMessageMessageReadV1) -> None:
         """消息已读事件：用户侧已读会话中的消息时飞书会推送，本机器人无需处理，仅消费事件以完成 SDK 分发。"""

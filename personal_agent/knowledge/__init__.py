@@ -2,7 +2,6 @@ import asyncio
 import importlib
 import importlib.util
 import logging
-import shutil
 import subprocess
 import threading
 import tomllib
@@ -73,18 +72,14 @@ def _ensure_deps() -> None:
     if not missing and not wrong_version:
         return
 
-    uv = shutil.which("uv") or "uv"
     if missing:
         logger.info("[knowledge] 缺少依赖 %s，正在安装...", missing)
     if wrong_version:
         logger.warning("[knowledge] 依赖版本不匹配 %s，正在修正...", wrong_version)
 
     try:
-        subprocess.run(
-            [uv, "pip", "install"] + reinstall_flags + packages,
-            check=True, capture_output=False,
-        )
-        importlib.invalidate_caches()
+        from personal_agent.workflows.deplock import uv_pip_install
+        uv_pip_install(reinstall_flags + packages)  # 跨进程串行装包 + 刷新导入缓存
         logger.info("[knowledge] 依赖安装完成")
         if wrong_version:
             raise RuntimeError(

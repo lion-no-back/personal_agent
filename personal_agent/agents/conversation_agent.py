@@ -501,29 +501,32 @@ class ConversationAgent(BaseAgent):
         return None
 
     def _run_ondemand_workflow_async(self, meta, delivery_key: str, event_content: str = "") -> None:
-        """在后台 daemon 线程中执行按需 workflow，完成后通过 notify_fn/send_file_fn 投递结果。"""
-        import importlib
-        import inspect
+        """在后台 daemon 线程中执行按需 workflow，完成后通过 notify_fn/send_file_fn 投递结果。
+
+        工作流在独立子进程里运行（见 workflows/dispatch.py）：主进程不 import 其重原生库
+        （numpy/pandas/torch 等），从根上避免多线程并发首次导入的竞态。
+        """
+        from personal_agent.workflows.dispatch import run_in_subprocess, INSTALL_GRACE_SECONDS
 
         def _run():
-            try:
-                mod = importlib.import_module(f"personal_agent.workflows.{meta.id}.runner")
-                # 若 runner.run 接受 content 参数，则传入用户原始消息（用于提取动态参数如 ASIN）
-                sig = inspect.signature(mod.run)
-                if "content" in sig.parameters:
-                    result: dict = mod.run(content=event_content)
-                else:
-                    result: dict = mod.run()
-                message = result.get("message", "✅ 完成")
-                files = result.get("files", [])
-                segments = result.get("segments", [])
-                success = True
-            except Exception as exc:
-                logger.exception("[ondemand:%s] 执行失败", meta.id)
-                message = f"❌ 【{meta.name}】执行失败：{exc}"
-                files = []
-                segments = []
-                success = False
+            base_timeout = getattr(meta, "timeout", None)
+            result = run_in_subprocess(
+                module=f"personal_agent.workflows.{meta.id}.runner",
+                function="run",
+                content=event_content,
+                # 按需入口无外层超时，硬总额 = 执行超时 + 装包宽限（首次现装大依赖用）
+                timeout=(base_timeout + INSTALL_GRACE_SECONDS) if base_timeout else None,
+            )
+            success = result.get("ok", False)
+            files = result.get("files", [])
+            segments = result.get("segments", [])
+            if success:
+                message = result.get("message") or "✅ 完成"
+            elif result.get("error") == "timeout":
+                message = result.get("message") or f"❌ 【{meta.name}】执行超时"
+            else:
+                err = result.get("error") or "未知错误"
+                message = result.get("message") or f"❌ 【{meta.name}】执行失败：{err}"
 
             if self._notify_fn and message:
                 try:

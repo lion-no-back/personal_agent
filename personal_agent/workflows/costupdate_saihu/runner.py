@@ -10,10 +10,9 @@
 """
 
 import importlib
-import importlib.util
+import importlib.metadata
 import logging
 import os
-import shutil
 import subprocess
 import tomllib
 from datetime import datetime
@@ -22,8 +21,25 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _DEP_GROUP = "costupdate-saihu"
-# 多包检查：任一缺失都触发安装，防止单哨兵在部分安装时误判
-_CHECK_PACKAGES = ["ddddocr", "pandas", "openpyxl"]
+# pyproject 解析失败时的兜底哨兵；正常路径下检查清单从依赖组同源推导
+_FALLBACK_CHECK = ["ddddocr", "pandas", "openpyxl", "python-calamine"]
+
+
+def _dist_name(spec: str) -> str:
+    """从依赖串取发行名（PyPI 名）：'python-calamine>=0.2' -> 'python-calamine'。"""
+    for sep in ("<", ">", "=", "!", "~", "[", " "):
+        spec = spec.split(sep, 1)[0]
+    return spec.strip()
+
+
+def _installed(dist: str) -> bool:
+    """读 dist-info 判断发行包是否就绪（按 PEP 503 归一化连字符/下划线/大小写）。"""
+    try:
+        importlib.metadata.version(dist)
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -38,31 +54,31 @@ def _group_packages() -> list[str]:
 def _ensure_deps() -> None:
     """检查 workflow 依赖是否齐全，有缺失时用 uv pip install 补装。
 
+    检查清单从 pyproject 的依赖组同源推导（按发行名查 dist-info），确保"检查的包"
+    与"安装的包"永远一致，不会再漏检单个依赖（如 python-calamine）。
+
     故意不用 uv sync：sync 是全量同步语义，会删除 lockfile 之外的包（含
     paddle_bootstrap 动态装入的 opencv/torch/paddlepaddle 等），并因锁住的
     DLL（sqlite_vec.dll）而拒绝访问。pip install 是纯加法，不删现有包。
     """
-    missing = [p for p in _CHECK_PACKAGES if importlib.util.find_spec(p) is None]
+    packages = _group_packages()
+    check_names = [_dist_name(p) for p in packages] or _FALLBACK_CHECK
+
+    missing = [n for n in check_names if not _installed(n)]
     if not missing:
         return
 
-    packages = _group_packages()
     if not packages:
-        packages = missing  # pyproject.toml 解析失败时退化到哨兵包
+        packages = missing  # pyproject.toml 解析失败时退化到兜底哨兵
 
-    uv = shutil.which("uv") or "uv"
     logger.info(
         "[costupdate_saihu] 缺少依赖 %s，正在安装依赖组 %s，请稍候...",
         missing,
         _DEP_GROUP,
     )
     try:
-        subprocess.run(
-            [uv, "pip", "install"] + packages,
-            check=True,
-            capture_output=False,
-        )
-        importlib.invalidate_caches()
+        from personal_agent.workflows.deplock import uv_pip_install
+        uv_pip_install(packages)  # 跨进程串行装包 + 刷新导入缓存
         logger.info("[costupdate_saihu] 依赖安装完成")
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(

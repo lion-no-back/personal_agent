@@ -14,7 +14,6 @@
 
 import importlib.util
 import logging
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -75,11 +74,10 @@ def _ensure_deps() -> None:
     """配置段调用：装 scrapling[all]，并确保本工作流目录内有 Chromium（缺则下载）。"""
     missing = [p for p in _CHECK_PACKAGES if importlib.util.find_spec(p) is None]
     if missing:
-        uv = shutil.which("uv") or "uv"
         logger.info("[rankbb_amazon] 缺少依赖 %s，正在安装...", missing)
         try:
-            subprocess.run([uv, "pip", "install"] + _INSTALL_PACKAGES, check=True)
-            importlib.invalidate_caches()
+            from personal_agent.workflows.deplock import uv_pip_install
+            uv_pip_install(_INSTALL_PACKAGES)  # 跨进程串行装包 + 刷新导入缓存
             logger.info("[rankbb_amazon] 依赖安装完成")
         except subprocess.CalledProcessError as exc:
             raise RuntimeError(

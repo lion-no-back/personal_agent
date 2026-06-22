@@ -10,7 +10,6 @@
 import importlib.util
 import logging
 import os
-import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -38,15 +37,10 @@ def _ensure_deps() -> None:
     missing = [p for p in _CHECK_PACKAGES if importlib.util.find_spec(p) is None]
     if not missing:
         return
-    uv = shutil.which("uv") or "uv"
     logger.info("[kswarn_saihu] 缺少依赖 %s，正在安装...", missing)
     try:
-        subprocess.run(
-            [uv, "pip", "install"] + _INSTALL_PACKAGES,
-            check=True,
-            capture_output=False,
-        )
-        importlib.invalidate_caches()
+        from personal_agent.workflows.deplock import uv_pip_install
+        uv_pip_install(_INSTALL_PACKAGES)  # 跨进程串行装包 + 刷新导入缓存
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
             f"依赖安装失败，请手动执行：uv pip install {' '.join(_INSTALL_PACKAGES)}"

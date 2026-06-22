@@ -35,7 +35,9 @@ def _ensure_huggingface_hub() -> None:
            else [sys.executable, "-m", "pip", "install", "huggingface-hub"])
     logger.info("[hf_bootstrap] huggingface-hub missing, installing...")
     try:
-        subprocess.check_call(cmd, env={**os.environ, "UV_LINK_MODE": "copy"})
+        from personal_agent.workflows.deplock import install_lock
+        with install_lock():  # 跨进程串行装包，避免与工作流子进程并发改写共享 venv
+            subprocess.check_call(cmd, env={**os.environ, "UV_LINK_MODE": "copy"})
         importlib.invalidate_caches()
         _hub_installed = True
         logger.info("[hf_bootstrap] huggingface-hub installed")

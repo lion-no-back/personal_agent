@@ -83,16 +83,18 @@ def _ensure_opencv_contrib() -> None:
     env = {**__import__("os").environ, "UV_LINK_MODE": "copy"}
     logger.info("[paddle_bootstrap] auto-swapping opencv-python-headless → opencv-contrib-python")
     try:
-        if uv:
-            subprocess.check_call([uv, "pip", "uninstall", "opencv-python-headless"], env=env)
-            subprocess.check_call([uv, "pip", "install", "opencv-contrib-python"], env=env)
-        else:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "uninstall", "opencv-python-headless", "-y"], env=env
-            )
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "opencv-contrib-python"], env=env
-            )
+        from personal_agent.workflows.deplock import install_lock
+        with install_lock():  # 跨进程串行装包，避免与工作流子进程并发改写共享 venv
+            if uv:
+                subprocess.check_call([uv, "pip", "uninstall", "opencv-python-headless"], env=env)
+                subprocess.check_call([uv, "pip", "install", "opencv-contrib-python"], env=env)
+            else:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "uninstall", "opencv-python-headless", "-y"], env=env
+                )
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", "opencv-contrib-python"], env=env
+                )
         importlib.invalidate_caches()
         logger.info("[paddle_bootstrap] opencv-contrib-python installed")
     except subprocess.CalledProcessError as e:
@@ -126,26 +128,28 @@ def _install() -> None:
 
     print(f"[paddle_bootstrap] Installing {', '.join(_PACKAGES)} ...", file=sys.stderr)
     try:
-        if uv:
-            # Always install paddlepaddle normally.
-            subprocess.check_call(
-                [uv, "pip", "install", "--reinstall-package", "paddlepaddle", "paddlepaddle"],
-                env=env,
-            )
-            # Install unstructured-paddleocr: skip deps if cv2 is locked to avoid
-            # replacing cv2.pyd; otherwise do a full install so opencv-contrib-python
-            # lands correctly.
-            undep_flag = ["--no-deps"] if cv2_locked else []
-            subprocess.check_call(
-                [uv, "pip", "install", "--reinstall-package", "unstructured-paddleocr"]
-                + undep_flag
-                + ["unstructured-paddleocr"],
-                env=env,
-            )
-        else:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install"] + _PACKAGES, env=env
-            )
+        from personal_agent.workflows.deplock import install_lock
+        with install_lock():  # 跨进程串行装包，避免与工作流子进程并发改写共享 venv
+            if uv:
+                # Always install paddlepaddle normally.
+                subprocess.check_call(
+                    [uv, "pip", "install", "--reinstall-package", "paddlepaddle", "paddlepaddle"],
+                    env=env,
+                )
+                # Install unstructured-paddleocr: skip deps if cv2 is locked to avoid
+                # replacing cv2.pyd; otherwise do a full install so opencv-contrib-python
+                # lands correctly.
+                undep_flag = ["--no-deps"] if cv2_locked else []
+                subprocess.check_call(
+                    [uv, "pip", "install", "--reinstall-package", "unstructured-paddleocr"]
+                    + undep_flag
+                    + ["unstructured-paddleocr"],
+                    env=env,
+                )
+            else:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install"] + _PACKAGES, env=env
+                )
         importlib.invalidate_caches()
         print("[paddle_bootstrap] Installation complete.", file=sys.stderr)
         logger.info("[paddle_bootstrap] paddlepaddle + unstructured-paddleocr installed")
@@ -280,7 +284,9 @@ def _install_torch_cpu() -> None:
                "torch", "--index-url", cpu_index]
 
     try:
-        subprocess.check_call(cmd, env={**__import__("os").environ, "UV_LINK_MODE": "copy"})
+        from personal_agent.workflows.deplock import install_lock
+        with install_lock():  # 跨进程串行装包，避免与工作流子进程并发改写共享 venv
+            subprocess.check_call(cmd, env={**__import__("os").environ, "UV_LINK_MODE": "copy"})
         logger.info("[paddle_bootstrap] CPU-only torch installed")
     except subprocess.CalledProcessError as e:
         logger.error("[paddle_bootstrap] Failed to install CPU-only torch: %s", e)
