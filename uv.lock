@@ -2922,7 +2922,7 @@ costupdate-saihu = [
     { name = "python-calamine", specifier = ">=0.2" },
     { name = "tqdm", specifier = ">=4.66" },
 ]
-fxreview-amazon = [{ name = "cloakbrowser", specifier = ">=0.3.31" }]
+fxreview-amazon = [{ name = "cloakbrowser", specifier = "==0.4.0" }]
 knowledge = [
     { name = "huggingface-hub" },
     { name = "markitdown" },

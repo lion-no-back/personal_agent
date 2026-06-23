@@ -24,6 +24,7 @@ Login model:
 """
 
 import asyncio
+import logging
 import os
 import random
 from pathlib import Path
@@ -41,6 +42,11 @@ if _chromium.exists():
 
 from cloakbrowser import launch_persistent_context_async
 
+logger = logging.getLogger(__name__)
+
+# Playwright 的 node 驱动冷启动偶发的瞬时错误（外部进程启动失败），可重试恢复
+_DRIVER_TRANSIENT_ERR = "Connection closed while reading from the driver"
+
 
 async def _delay(lo: float = 1.0, hi: float = 2.0):
     await asyncio.sleep(random.uniform(lo, hi))
@@ -54,19 +60,54 @@ _TIMEZONE = "America/Los_Angeles"
 
 
 async def open_context(headless: bool = True):
-    """Open the shared persistent browser context. The caller must close it."""
+    """Open the shared persistent browser context. The caller must close it.
+
+    首次冷启动时 Playwright 的 node 驱动偶发 "Connection closed while reading from the
+    driver"（外部进程启动瞬时失败）。命中该错误则等 3 秒重试 1 次，自动恢复。
+    """
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    return await launch_persistent_context_async(
-        user_data_dir=str(PROFILE_DIR),
-        headless=headless,
-        locale=_LOCALE,
-        timezone=_TIMEZONE,
-        humanize=True,
-        human_config={
-            "idle_between_actions": True,
-            "idle_between_duration": [0.3, 0.8],
-        },
-    )
+    for attempt in (1, 2):  # 初次 + 1 次重试
+        try:
+            context = await launch_persistent_context_async(
+                user_data_dir=str(PROFILE_DIR),
+                headless=headless,
+                locale=_LOCALE,
+                timezone=_TIMEZONE,
+                humanize=True,
+                human_config={
+                    "idle_between_actions": True,
+                    "idle_between_duration": [0.3, 0.8],
+                },
+            )
+            break
+        except Exception as exc:
+            if attempt == 2 or _DRIVER_TRANSIENT_ERR not in str(exc):
+                raise
+            logger.warning("[fxreview] Playwright 驱动启动瞬时失败，3 秒后重试 1 次: %s", exc)
+            await asyncio.sleep(3)
+    if not headless:
+        await _sync_headed_viewport(context)
+    return context
+
+
+async def _sync_headed_viewport(context) -> None:
+    """有头模式下补上 page.viewport_size，让 cloakbrowser 的拟人滚动可用。
+
+    cloakbrowser 0.4.0 有头默认 no_viewport（页面跟随真实 OS 窗口，避免 CDP 模拟造成
+    outerWidth<innerWidth 的「假窗口」指纹）——但其自带拟人滚动 scroll_async 会读
+    page.viewport_size，no_viewport 下该值恒为 None，于是抛 "Viewport size not available"。
+    这里把 viewport 设成「当前真实窗口尺寸」：既补上 viewport_size，又因尺寸等于真实窗口、
+    不缩放窗口，保持 outer>inner 的真实指纹（实测 inner/outer 不变，无 tell）。
+    仅有头需要；headless 的 viewport_size 本就有效。best-effort：取不到尺寸则维持原状。
+    """
+    page = context.pages[0] if context.pages else await context.new_page()
+    try:
+        iw = await page.evaluate("window.innerWidth")
+        ih = await page.evaluate("window.innerHeight")
+        if iw and ih:
+            await page.set_viewport_size({"width": int(iw), "height": int(ih)})
+    except Exception:
+        pass
 
 
 async def is_signed_in(page) -> bool:

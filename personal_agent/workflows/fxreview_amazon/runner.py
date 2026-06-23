@@ -25,8 +25,10 @@ _ASIN_RE = re.compile(r"[A-Za-z0-9]{10}")
 _CONFIG_TRIGGER = "评论配置"
 _LLM_KEYS = ("LLM_REASONING_API_KEY", "LLM_REASONING_BASE_URL", "LLM_REASONING_MODEL_ID")
 
-# 配置段按需安装的依赖（cloakbrowser 为 PyPI 包，首次发送【评论配置】时自动安装）
-_INSTALL_PACKAGES = ["cloakbrowser>=0.3.31"]
+# 配置段按需安装的依赖（cloakbrowser 为 PyPI 包，首次发送【评论配置】时自动安装）。
+# 锁定 ==0.4.0：有头用真实窗口（无假窗口指纹），配合 session._sync_headed_viewport 修正
+# 其拟人滚动的 viewport 缺失问题。隐身依赖必须锁版本，避免上游再发版悄悄改行为而踩雷。
+_INSTALL_PACKAGES = ["cloakbrowser==0.4.0"]
 
 # 文案（SPEC §3 / §4）
 _MSG_NO_ASIN = "⚠️ 未能识别 ASIN。请按【评论采集+10位ASIN】发送，例如：评论采集B0CWKH83WY"

@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Callable, Optional
@@ -85,6 +86,17 @@ class SchedulerDaemon:
             logger.exception("[SchedulerDaemon] WorkflowRegistry 加载失败，跳过自动注册")
             workflow_jobs = []
         all_jobs = config.cron_jobs + workflow_jobs
+
+        # 按环境禁用定时任务：读 .env 的 SCHEDULER_DISABLED_JOBS（逗号分隔 job id）。
+        # .env 每环境独立（已 gitignore），开发设置即可关掉、生产不设则不受影响。
+        disabled = {
+            s.strip() for s in os.getenv("SCHEDULER_DISABLED_JOBS", "").split(",") if s.strip()
+        }
+        if disabled:
+            skipped = [j.id for j in all_jobs if j.id in disabled]
+            all_jobs = [j for j in all_jobs if j.id not in disabled]
+            if skipped:
+                logger.info("[SchedulerDaemon] 按 SCHEDULER_DISABLED_JOBS 禁用定时任务: %s", skipped)
 
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(

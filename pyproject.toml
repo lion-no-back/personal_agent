@@ -65,8 +65,9 @@ rankbb-amazon = [
 ]
 
 # cloakbrowser 首次发送【评论配置】时由 runner 自动安装；Chromium 二进制由 cloakbrowser 下载到 fxreview_amazon/chromium/
+# 锁定 ==0.4.0（隐身依赖锁版本，避免上游发版悄改有头窗口行为；详见 runner.py / session.py 注释）
 fxreview-amazon = [
-    "cloakbrowser>=0.3.31",
+    "cloakbrowser==0.4.0",
 ]
 
 knowledge = [
