@@ -178,7 +178,9 @@ class ConversationAgent(BaseAgent):
         )
 
         if self._interaction_logger:
-            self._interaction_logger.log_session_start(session_key, event.content)
+            self._interaction_logger.log_session_start(
+                session_key, event.content, getattr(event, "sender_name", None)
+            )
 
         # ── 2. 内置指令拦截 ──────────────────────────────────
         command_response = self._handle_command(event.content, session_key, event.sender_open_id)

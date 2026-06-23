@@ -291,7 +291,9 @@ class InteractionLogger:
 
     # ── 公开日志接口 ──────────────────────────────────────────────────────────
 
-    def log_session_start(self, session_key: str, user_input: str) -> None:
+    def log_session_start(
+        self, session_key: str, user_input: str, user_name: Optional[str] = None
+    ) -> None:
         """每次用户消息开始时调用：分配 trace_id，写入分隔线，记录 agent.start。"""
         path = self._make_log_path(session_key)
         is_new_file = not path.exists()          # 文件不存在 = 本次运行首次写入
@@ -321,8 +323,9 @@ class InteractionLogger:
         handler.stream.flush()
 
         preview = _trunc(user_input, 200).replace("\n", " ")
+        user_line = f"🚀 USER【{user_name}】：{preview}" if user_name else f"🚀 USER: {preview}"
         self._log(session_key, logging.INFO, "agent.start",
-                  f"🚀 USER: {preview}", to_console=True)
+                  user_line, to_console=True)
 
     def log_llm_call(
         self, session_key: str, round_n: int, messages: List[Dict[str, Any]]

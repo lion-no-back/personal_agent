@@ -59,6 +59,7 @@ class DingTalkMessageEvent:
     chat_type: str          # "p2p" 或 "group"
     content: str            # 消息纯文本
     sender_open_id: str     # f"dingtalk_{senderStaffId}"
+    sender_name: str = ""   # 发送者昵称 senderNick，仅用于日志展示
     thread_id: Optional[str] = field(default=None)
     attached_files: list = field(default_factory=list)
     images: list = field(default_factory=list)
@@ -891,6 +892,7 @@ class DingTalkGateway(BaseGateway):
             chat_type=chat_type,
             content=content,
             sender_open_id=f"dingtalk_{incoming.sender_staff_id}",
+            sender_name=incoming.sender_nick or "异常",
         )
 
     def _compute_session_key(self, event: DingTalkMessageEvent) -> str:
