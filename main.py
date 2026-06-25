@@ -15,6 +15,7 @@ import logging
 import logging.handlers
 import os
 import queue
+import signal
 import sys
 import threading
 from pathlib import Path
@@ -454,6 +455,7 @@ def main() -> None:
     logger.info("✅ SchedulerDaemon 就绪")
 
     # ── Step 7.6: 初始化知识库 ────────────────────────────────
+    knowledge_base = None  # 暴露给退出处理器，停 watcher 用
     try:
         import personal_agent.knowledge as _kb_mod
         from personal_agent.knowledge import KnowledgeBase
@@ -466,6 +468,7 @@ def main() -> None:
         )  # embed model is read from EMBED_MODEL_ID env var inside embedder.py
         _kb_instance.start_watcher()
         _kb_mod.kb = _kb_instance
+        knowledge_base = _kb_instance
         logger.info("✅ KnowledgeBase 就绪 | 监听: %s", _kb_instance.sources_dir)
     except Exception as e:
         logger.error("❌ KnowledgeBase 初始化失败（知识库不可用）: %s", e)
@@ -503,8 +506,61 @@ def main() -> None:
     for t in gw_threads:
         t.start()
 
-    # 主线程阻塞：任一 gateway 线程退出（正常或异常）即解除阻塞
-    result = _exc_q.get()
+    # ── 优雅退出 ──────────────────────────────────────────────
+    # 背景：网关跑在 daemon 子线程里，SIGINT/KeyboardInterrupt 只投递给主线程，
+    # 子线程那个 except KeyboardInterrupt 永远等不到；主线程又卡在无超时的 queue.get
+    # （Windows 上接不住信号）→ Ctrl+C 被吞，只能关终端硬杀，atexit 收尾从未真正生效。
+    # 修复：① 主线程装信号处理器（同步收尾后 os._exit，绕开挂死的子线程/事件循环，对齐
+    #        LangBot boot.py 的 signal→dispose→os._exit）；
+    #      ② 把 queue.get 改成超时轮询，让主线程每 0.5s 回到字节码及时处理挂起的信号。
+    # 真·硬杀（关终端 / kill -9 / 断电）仍由钉钉卡片的磁盘恢复（启动时 _recover_pending_cards）兜底。
+    _shutting_down = threading.Event()
+
+    def _graceful_shutdown(signum=None, _frame=None) -> None:
+        if _shutting_down.is_set():
+            return  # 幂等：重复信号忽略
+        _shutting_down.set()
+        logger.info("收到退出信号(%s)，正在优雅退出...", signum)
+
+        # 1) 先收尾网关：钉钉卡片实时 finalize（最要紧的用户可见残留，立即处理）
+        for gw in gateways:
+            try:
+                gw.stop()
+            except Exception:
+                logger.warning("%s.stop() 失败", gw.platform, exc_info=True)
+
+        # 2) 再停后台组件：逐个尽力而为，任一失败不影响其余
+        for name, _stop in (
+            ("scheduler", lambda: scheduler.stop()),
+            ("memory", lambda: memory_module.stop()),
+            ("file_stash", lambda: file_stash.stop()),
+            ("knowledge", lambda: knowledge_base.stop_watcher() if knowledge_base else None),
+        ):
+            try:
+                _stop()
+            except Exception:
+                logger.warning("%s 停止失败", name, exc_info=True)
+
+        logger.info("✅ 优雅退出完成")
+        os._exit(0)  # 强制退出，绕开仍阻塞在 start_forever 的 daemon 子线程
+
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+    try:
+        signal.signal(signal.SIGTERM, _graceful_shutdown)  # 覆盖 kill / docker stop / systemd
+    except (ValueError, AttributeError):
+        pass  # 个别平台/线程环境不支持 SIGTERM，忽略
+
+    # 主线程超时轮询：任一 gateway 线程退出即解除阻塞；超时让信号得以及时处理
+    result = None
+    while not _shutting_down.is_set():
+        try:
+            result = _exc_q.get(timeout=0.5)
+            break
+        except queue.Empty:
+            continue
+
+    if _shutting_down.is_set():
+        return  # 信号处理器已 os._exit，理论到不了这里，兜底
     if result is None:
         logger.info("Gateway 正常退出")
         sys.exit(0)

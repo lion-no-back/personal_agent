@@ -357,6 +357,30 @@ class FeishuGateway(BaseGateway):
         print("🚀 PersonalAgent 飞书网关已启动，等待消息...", flush=True)
         self._ws_client.start()
 
+    def stop(self) -> None:
+        """优雅停止：把所有进行中的流式卡片实时收尾，避免冻结在「⚡ 生成中…」。
+
+        由 main.py 退出信号处理器在 os._exit 前调用。复用 sink 现成的 cancel()：
+        它把卡片 finalize 成「已取消」终态并关闭 streaming_mode。cancel() 非阻塞
+        （真正的 finalize HTTP 在 sink 的 daemon 线程里跑），故先全部 cancel，再逐个
+        等 _finished 事件，确保收尾请求在进程退出前真正发出。同步、幂等、不抛出。
+        """
+        with self._active_sinks_lock:
+            sinks = list(self._active_sinks.values())
+        if not sinks:
+            return
+        logger.info("飞书优雅退出：收尾 %d 张进行中的流式卡片...", len(sinks))
+        for sink in sinks:
+            try:
+                sink.cancel()
+            except Exception:
+                logger.warning("飞书卡片 cancel 失败", exc_info=True)
+        for sink in sinks:
+            try:
+                sink._finished.wait(timeout=5)
+            except Exception:
+                pass
+
     # ──────────────────────────────────────────────────────────
     #   CardKit 流式卡片（JSON 2.0 + 流式更新文本 OpenAPI）
     #   参考：https://open.feishu.cn/document/cardkit-v1/streaming-updates-openapi-overview

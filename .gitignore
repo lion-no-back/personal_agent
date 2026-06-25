@@ -23,7 +23,7 @@ personal_agent/tools/playwright_schema.json
 .search_rotation.json
 
 # Scheduler state (local SQLite, machine-specific, auto-generated)
-data/scheduler_state.sqlite
+data/
 
 logs
 

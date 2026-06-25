@@ -48,6 +48,21 @@ class FileStash:
         """回调签名：cb(chat_id, file_name)"""
         self._remind_callback = cb
 
+    def stop(self) -> None:
+        """优雅停止：取消所有挂起的提醒/过期定时器。幂等、不抛出。
+
+        每小时磁盘清理是 daemon 线程，随进程退出（os._exit）即被杀，无需显式停止；
+        此处只取消可能为非 daemon 的 Timer，避免它们在退出瞬间触发回调。
+        """
+        with self._lock:
+            for t in list(self._remind_timers.values()) + list(self._expire_timers.values()):
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            self._remind_timers.clear()
+            self._expire_timers.clear()
+
     def is_allowed(self, file_name: str) -> bool:
         ext = file_name.split(".")[-1].lower() if "." in file_name else ""
         return ext in ALLOWED_EXTENSIONS

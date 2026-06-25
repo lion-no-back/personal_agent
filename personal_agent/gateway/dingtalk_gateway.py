@@ -19,6 +19,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
 import httpx
@@ -522,6 +523,81 @@ _AI_CARD_TEMPLATE_ID = os.getenv("DINGTALK_AI_CARD_TEMPLATE_ID", "")
 # api token TTL 官方约 7200s，提前 5min 刷新
 _TOKEN_TTL_BUFFER = 300
 
+# 活跃卡片落盘登记表：进程崩溃 / kill -9 / 断电后，重启时把残留在「处理中/输出中」
+# 的卡片强制 finalize，避免永久转圈。参考 QwenPaw AICardPendingStore + _recover_active_cards。
+# 路径与项目其它状态文件一致（<项目根>/data/）。
+_ACTIVE_CARDS_FILE = Path(__file__).resolve().parents[2] / "data" / "dingtalk-active-cards.json"
+_CARD_RECOVERY_TEXT = "⚠️ 服务已重启，上次的处理已中断，请重新发送。"
+
+
+class _PendingCardStore:
+    """活跃卡片的线程安全磁盘登记表，用于跨进程重启恢复。
+
+    与内存态 `_pending_cards` 互补：
+    - 内存表持有 token getter，供本进程 atexit 优雅退出时兜底 finalize；
+    - 本表落盘 out_track_id，供新进程启动时 finalize 残留卡片，覆盖 atexit 兜不住的
+      kill -9 / 崩溃 / 断电场景。
+
+    多个 dingtalk-worker 线程并发读改写同一文件，故全程持锁；写入用 tmp + replace 原子落盘。
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._cards: dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            cards = data.get("pending_cards", []) if isinstance(data, dict) else []
+            self._cards = {
+                c["out_track_id"]: c
+                for c in cards
+                if isinstance(c, dict) and c.get("out_track_id")
+            }
+        except FileNotFoundError:
+            self._cards = {}
+        except Exception:
+            logger.warning("钉钉活跃卡片登记表读取失败，按空处理", exc_info=True)
+            self._cards = {}
+
+    def _flush_locked(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": 1,
+                "updated_at": int(time.time() * 1000),
+                "pending_cards": list(self._cards.values()),
+            }
+            tmp = self._path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            tmp.replace(self._path)
+        except Exception:
+            logger.warning("钉钉活跃卡片登记表写入失败", exc_info=True)
+
+    def add(self, out_track_id: str, ai_card_mode: bool) -> None:
+        with self._lock:
+            if out_track_id in self._cards:
+                return
+            self._cards[out_track_id] = {
+                "out_track_id": out_track_id,
+                "ai_card_mode": ai_card_mode,
+                "created_at": int(time.time() * 1000),
+            }
+            self._flush_locked()
+
+    def remove(self, out_track_id: str) -> None:
+        with self._lock:
+            if self._cards.pop(out_track_id, None) is not None:
+                self._flush_locked()
+
+    def snapshot(self) -> list[dict]:
+        with self._lock:
+            return list(self._cards.values())
+
 
 class DingTalkGateway(BaseGateway):
     """
@@ -577,10 +653,12 @@ class DingTalkGateway(BaseGateway):
         # 会话级串行锁：防止同一会话并发写共享上下文
         self._run_locks = SessionRunLocks()
 
-        # 未完成的工作流「处理中」卡片：out_track_id -> get_token 闭包。
-        # 进程退出时由 atexit 扫尾 finalize，避免卡片永远卡在「正在执行…」。
-        # 限制：start_forever() 无优雅停止钩子，仅 atexit（正常退出/Ctrl+C）兜底，kill -9 兜不住。
+        # 未完成卡片的双层兜底登记（建卡即登记，finalize 时注销）：
+        # 1) 内存表 _pending_cards：out_track_id -> get_token 闭包，供 atexit 优雅退出兜底；
+        # 2) 磁盘表 _card_store：落盘 out_track_id，供下次启动 _recover_pending_cards() 兜底，
+        #    覆盖 atexit 兜不住的 kill -9 / 崩溃 / 断电场景，避免卡片永久卡在「处理中/输出中」。
         self._pending_cards: dict[str, Callable[[], str]] = {}
+        self._card_store = _PendingCardStore(_ACTIVE_CARDS_FILE)
         # 自建 AI 卡片模式开关：配了 DINGTALK_AI_CARD_TEMPLATE_ID 才启用，否则回退社区模板。
         self._ai_card_mode = bool(_AI_CARD_TEMPLATE_ID)
         atexit.register(self._finalize_pending_cards)
@@ -616,6 +694,7 @@ class DingTalkGateway(BaseGateway):
         阻塞当前线程，启动 Stream SDK 长连接。
         连接断开后按指数退避（2→5→10→30→60s）自动重连，连接稳定超过 60s 则重置计数。
         """
+        self._recover_pending_cards()
         logger.info("🚀 PersonalAgent 钉钉网关已启动，等待消息...")
         print("🚀 PersonalAgent 钉钉网关已启动，等待消息...", flush=True)
         attempt = 0
@@ -798,20 +877,44 @@ class DingTalkGateway(BaseGateway):
                 return None
 
             logger.debug("v2 卡片已创建 | outTrackId=%s", out_track_id)
+            # 建卡即登记（覆盖普通流式回复，不止 set_processing 的工作流卡片）：
+            # 任何已建但未 finalize 的卡片，进程异常退出后都能被重启恢复。
+            self._register_pending_card(out_track_id)
             # 传递 token getter（而非静态 headers），确保长响应期间 token 自动刷新
             return DingTalkCardRenderer(
                 out_track_id,
                 self._get_api_token,
-                on_register=lambda otid: self._pending_cards.__setitem__(otid, self._get_api_token),
-                on_unregister=lambda otid: self._pending_cards.pop(otid, None),
+                on_register=self._register_pending_card,
+                on_unregister=self._unregister_pending_card,
                 ai_card_mode=self._ai_card_mode,
             )
         except Exception as e:
             logger.warning("v2 卡片创建失败，降级为文本回复: %s", e)
             return None
 
+    def stop(self) -> None:
+        """优雅停止：把所有未完成卡片实时 finalize 成中断提示。
+
+        由 main.py 的退出信号处理器调用（os._exit 前）。复用 atexit 同款收尾逻辑：
+        成功 finalize 即从磁盘表销账，失败则保留登记留给下次启动恢复。同步、幂等、不抛出。
+        """
+        self._finalize_pending_cards()
+
+    def _register_pending_card(self, out_track_id: str) -> None:
+        """登记一张未完成卡片（内存表 + 磁盘表）。幂等。"""
+        self._pending_cards[out_track_id] = self._get_api_token
+        self._card_store.add(out_track_id, self._ai_card_mode)
+
+    def _unregister_pending_card(self, out_track_id: str) -> None:
+        """卡片进入终态后注销登记（内存表 + 磁盘表）。幂等。"""
+        self._pending_cards.pop(out_track_id, None)
+        self._card_store.remove(out_track_id)
+
     def _finalize_pending_cards(self) -> None:
-        """进程退出时把所有未完成的「处理中」卡片 finalize 成中断提示。尽力而为，逐卡兜异常。"""
+        """进程优雅退出（atexit）时把所有未完成卡片 finalize 成中断提示。尽力而为，逐卡兜异常。
+
+        成功 finalize 才从磁盘表销账；失败则保留登记，留给下次启动 _recover_pending_cards() 兜底。
+        """
         for out_track_id, get_token in list(self._pending_cards.items()):
             try:
                 r = DingTalkCardRenderer(out_track_id, get_token, ai_card_mode=self._ai_card_mode)
@@ -819,9 +922,42 @@ class DingTalkGateway(BaseGateway):
                     r._push("⚠️ 处理中断，请重试。", is_error=True)
                 else:
                     r._finalize_with_status("⚠️ 处理中断，请重试。", _FLOW_FAILED)
+                self._card_store.remove(out_track_id)
             except Exception:
                 pass
         self._pending_cards.clear()
+
+    def _recover_pending_cards(self) -> None:
+        """启动时把上次进程残留的未完成卡片强制 finalize，避免永久卡在「处理中/输出中」。
+
+        覆盖 atexit 兜不住的 kill -9 / 崩溃 / 断电场景。参考 QwenPaw _recover_active_cards：
+        逐卡 finalize 后即销账（一次性，失败也不再保留——卡片多半已过期，无限重试无意义）。
+        """
+        records = self._card_store.snapshot()
+        if not records:
+            return
+        logger.info("发现 %d 张残留钉钉卡片，启动恢复 finalize...", len(records))
+        for rec in records:
+            out_track_id = rec.get("out_track_id")
+            if not out_track_id:
+                continue
+            try:
+                r = DingTalkCardRenderer(
+                    out_track_id,
+                    self._get_api_token,
+                    ai_card_mode=bool(rec.get("ai_card_mode")),
+                )
+                if r._ai_card_mode:
+                    r._push(_CARD_RECOVERY_TEXT, is_error=True)
+                else:
+                    r._finalize_with_status(_CARD_RECOVERY_TEXT, _FLOW_FAILED)
+                logger.info("已恢复 finalize 残留卡片 | outTrackId=%s", out_track_id)
+            except Exception:
+                logger.warning(
+                    "残留卡片恢复 finalize 失败 | outTrackId=%s", out_track_id, exc_info=True
+                )
+            finally:
+                self._card_store.remove(out_track_id)
 
     def _handle(
         self,

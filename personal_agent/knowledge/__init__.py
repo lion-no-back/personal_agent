@@ -134,6 +134,13 @@ class KnowledgeBase:
     def start_watcher(self) -> None:
         self._watcher.start(self._loop, self.sources_dir)
 
+    def stop_watcher(self) -> None:
+        """停止文件监听（停 watchdog observer 并 join）。幂等、不抛出。"""
+        try:
+            self._watcher.stop()
+        except Exception:
+            pass
+
     def search_sync(self, query: str, top_k: int = 5) -> "list[KBSearchResult]":
         future = asyncio.run_coroutine_threadsafe(
             self.retriever.search(query, top_k=top_k),

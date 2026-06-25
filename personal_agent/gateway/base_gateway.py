@@ -38,6 +38,13 @@ class BaseGateway(ABC):
         对 main.py 的通用启动循环完全透明。
         """
 
+    def stop(self) -> None:
+        """
+        优雅停止钩子：进程收到退出信号时由 main.py 调用，用于清理外部残留。
+        默认空实现（多数平台无需清理）；钉钉网关重写它以实时 finalize 未完成的 AI 卡片，
+        避免卡片永远卡在「处理中」。必须同步、幂等、尽力而为（不得抛出）。
+        """
+
     @abstractmethod
     def send_text(self, session_key: str, text: str) -> None:
         """
