@@ -156,6 +156,7 @@ class ConversationAgent(BaseAgent):
         stream_updates_sync_with_llm: bool = False,
         push_fn: Optional[Callable[[str], None]] = None,
         cancel_event: Optional[threading.Event] = None,
+        keep_thinking: bool = True,
     ) -> str:
         """
         处理一条消息事件的完整链路：
@@ -298,7 +299,7 @@ class ConversationAgent(BaseAgent):
             # 定义携带 buffer 的专属卡片刷入函数
             def custom_on_update(content: str, status: str) -> None:
                 if on_update:
-                    combined = ui_text_buffer + content
+                    combined = (ui_text_buffer + content) if keep_thinking else content
                     on_update(combined.strip(), status)
 
             # ── 5. 流式 LLM 调用 + 卡片更新 ─────────────────────
@@ -415,7 +416,10 @@ class ConversationAgent(BaseAgent):
                 # ── L5 Output Guard（推送给用户前脱敏）──────────
                 sanitized = sanitize_output(ui_text_buffer.strip(), session_key=session_key)
                 if on_update:
-                    on_update(sanitized, "done")
+                    done_text = sanitized if keep_thinking else sanitize_output(
+                        final_response.strip(), session_key=session_key
+                    )
+                    on_update(done_text, "done")
                 # ── 记忆异步抽取（后台，不阻塞回复） ────────────
                 if self._memory:
                     self._memory.extractor.extract_async(
@@ -429,7 +433,10 @@ class ConversationAgent(BaseAgent):
             self._interaction_logger.log_final(session_key, ui_text_buffer)
         sanitized = sanitize_output(ui_text_buffer.strip(), session_key=session_key)
         if on_update:
-            on_update(sanitized, "done")
+            done_text = sanitized if keep_thinking else sanitize_output(
+                (final_response + timeout_msg).strip(), session_key=session_key
+            )
+            on_update(done_text, "done")
         self._context.add_message(session_key, "assistant", content=timeout_msg)
         return sanitized
 
@@ -495,14 +502,14 @@ class ConversationAgent(BaseAgent):
             delivery_key = self._derive_delivery_key(event)
             ack = f"⏳ 正在执行【{meta.name}】，请稍候..."
             if on_update:
-                on_update(ack, "done")
+                on_update(ack, "processing")
 
-            self._run_ondemand_workflow_async(meta, delivery_key, content)
+            self._run_ondemand_workflow_async(meta, delivery_key, content, on_update=on_update)
             return ack
 
         return None
 
-    def _run_ondemand_workflow_async(self, meta, delivery_key: str, event_content: str = "") -> None:
+    def _run_ondemand_workflow_async(self, meta, delivery_key: str, event_content: str = "", on_update=None) -> None:
         """在后台 daemon 线程中执行按需 workflow，完成后通过 notify_fn/send_file_fn 投递结果。
 
         工作流在独立子进程里运行（见 workflows/dispatch.py）：主进程不 import 其重原生库
@@ -530,11 +537,20 @@ class ConversationAgent(BaseAgent):
                 err = result.get("error") or "未知错误"
                 message = result.get("message") or f"❌ 【{meta.name}】执行失败：{err}"
 
-            if self._notify_fn and message:
-                try:
-                    self._notify_fn(delivery_key, message)
-                except Exception:
-                    logger.exception("[ondemand:%s] 文字结果投递失败", meta.id)
+            if message:
+                # 优先把结果 finalize 到同一张「处理中」卡片；失败/无回调回退独立文字消息
+                delivered = False
+                if on_update is not None:
+                    try:
+                        on_update(message, "done")
+                        delivered = True
+                    except Exception:
+                        logger.exception("[ondemand:%s] 卡片 finalize 失败，回退文字投递", meta.id)
+                if not delivered and self._notify_fn:
+                    try:
+                        self._notify_fn(delivery_key, message)
+                    except Exception:
+                        logger.exception("[ondemand:%s] 文字结果投递失败", meta.id)
 
             if self._send_file_fn and files:
                 for fp in files:

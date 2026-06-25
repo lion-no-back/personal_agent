@@ -9,6 +9,7 @@
 卡片方案参考：github.com/soimy/openclaw-channel-dingtalk
 """
 
+import atexit
 import json
 import logging
 import os
@@ -276,13 +277,30 @@ class DingTalkCardRenderer:
     "tool" 状态静默忽略，下轮 LLM 文本继续累积。
     """
 
-    THROTTLE_S = 0.05  # flusher 已在 card_update_interval 节流，renderer 只需防暴打
+    THROTTLE_S = 0.05  # 旧社区模板：flusher 已在 card_update_interval 节流，renderer 只需防暴打
+    # 自建 AI 卡片模板：流式帧必须按 ~0.3s 节流（对齐 QwenPaw _STREAM_DELTA_MIN_INTERVAL_S=0.3 /
+    # soimy throttleMs=300）。高频帧（0.05s）会冲垮 AI流式富文本 的打字机 → 表格列宽误锁拉长 +
+    # 内容重复重渲染。这是流式渲染干净的关键。
+    AI_STREAM_THROTTLE_S = 0.3
 
-    def __init__(self, out_track_id: str, get_token: Callable[[], str]) -> None:
+    def __init__(
+        self,
+        out_track_id: str,
+        get_token: Callable[[], str],
+        on_register: Optional[Callable[[str], None]] = None,
+        on_unregister: Optional[Callable[[str], None]] = None,
+        ai_card_mode: bool = False,
+    ) -> None:
         self._out_track_id = out_track_id
         self._get_token = get_token
         self._last_push_at: float = time.monotonic()
         self._last_text: str = ""
+        # 处理中卡片登记回调（供网关停机扫尾用）；默认 no-op
+        self._on_register = on_register or (lambda otid: None)
+        self._on_unregister = on_unregister or (lambda otid: None)
+        # ai_card_mode=True：自建 AI 卡片模板（正文绑 content，状态靠流式 isFinalize/isError 驱动）。
+        # False：旧社区模板（blockList + flowStatus）。由 DINGTALK_AI_CARD_TEMPLATE_ID 是否配置决定。
+        self._ai_card_mode = ai_card_mode
 
     def on_update(self, text: str, status: str) -> None:
         try:
@@ -290,6 +308,8 @@ class DingTalkCardRenderer:
                 self._on_generating(text)
             elif status == "tool":
                 self._on_tool(text)
+            elif status == "processing":
+                self.set_processing(text)
             elif status == "done":
                 self._on_done(text)
             elif status == "error":
@@ -301,7 +321,7 @@ class DingTalkCardRenderer:
         """通知卡片进入失败终态，在已推内容后追加错误提示。"""
         try:
             error_text = self._last_text + "\n\n> ⚠️ 处理失败，请重试。"
-            self._finalize(error_text)
+            self._finalize_terminal(error_text, success=False)
         except Exception as exc:
             logger.warning("卡片 fail 通知失败: %s", exc)
 
@@ -333,13 +353,40 @@ class DingTalkCardRenderer:
         _CARD_RATE_LIMITER.acquire()
         httpx.put(url, headers=self._mk_headers(), json=payload, timeout=10).raise_for_status()
 
-    def _push(self, text: str, *, finalize: bool = False) -> None:
-        """全量推送到 streaming 端点。统一做流式安全变换：GFM 表格→纯文本、截断未完成表格。"""
-        content = _dt_tables(text)
-        content = _trim_trailing_table(content)
-        content = _strip_blockquotes(content)
-        content = _ensure_table_blank_lines(content).rstrip('\n')
-        if content == self._last_text and not finalize:
+    def _push(self, text: str, *, finalize: bool = False, is_error: bool = False) -> None:
+        """全量推送到 streaming 端点（isFull=True）。
+
+        ai_card_mode（自建模板）：对齐 QwenPaw `_stream_ai_card` —— 发**原始累积全文、零变换**，
+        渲染交给组件；关键是**靠 0.3s 节流**（见 _on_generating，对齐 QwenPaw 的
+        _STREAM_DELTA_MIN_INTERVAL_S=0.3）避免高频帧冲垮组件打字机（之前 0.05s 太快才导致
+        表格列宽误锁拉长 + 内容重复重渲染）。
+        旧社区模板：沿用表格拍平 + 裁尾部表格的老策略。
+        """
+        terminal = finalize or is_error
+        if self._ai_card_mode:
+            if terminal:
+                # 完成/失败帧：与流式帧用同一轻量变换（只补表头空行），仅不裁尾部表格（完整表格要全发出）。
+                # 这样完成帧是上一流式帧的「前缀扩展」（把流式期裁掉的表格追加上）→ 前缀单调，
+                # 消除完成瞬间的内容跳变/重绘。对齐 QwenPaw `_stream_ai_card`：流式与完成同一变换、
+                # 无差异。富文本组件渲染原始 GFM 表格正常，无需 :---: 重渲染。
+                content = _ensure_table_blank_lines(text).rstrip('\n')
+            else:
+                # 流式帧（前缀单调是硬约束，否则钉钉打字机按 delta 动画会重复文字/单元格错位）：
+                # 1) _trim_trailing_table：裁掉「正在生长的尾部表格」。AI流式富文本组件对逐帧增长的
+                #    表格会用早期不完整帧锁死列宽 → 空白/竖排(图55/57)；裁到表格完整(后跟非表格内容)
+                #    才整块发出，组件一次性按完整内容算对列宽(图56)。裁剪只动尾部、前缀安全。
+                # 2) _ensure_table_blank_lines：表头前补空行(前缀安全)，让完整表格被识别。
+                # **不重渲染表格、不转 <br>**——那会破坏前缀单调(对齐 QwenPaw 发原始累积全文；
+                # soimy 的表格重渲染只用于非流式整条消息)。完整规范化只在完成帧(terminal)做。
+                content = _ensure_table_blank_lines(_trim_trailing_table(text)).rstrip('\n')
+        elif terminal:
+            content = _ensure_table_blank_lines(text).rstrip('\n')
+        else:
+            content = _dt_tables(text)
+            content = _trim_trailing_table(content)
+            content = _strip_blockquotes(content)
+            content = _ensure_table_blank_lines(content).rstrip('\n')
+        if content == self._last_text and not terminal:
             return
         payload = {
             "outTrackId": self._out_track_id,
@@ -348,19 +395,34 @@ class DingTalkCardRenderer:
             "content": content,
             "isFull": True,
             "isFinalize": finalize,
-            "isError": False,
+            "isError": is_error,
         }
         self._put_card(_CARD_STREAM_URL, payload)
         self._last_text = content
 
+    def _set_processing_content(self, text: str) -> None:
+        """ai_card_mode：instances 更新 content + flowStatus=1（处理中），**不发流式帧**，
+        从而保持「处理中」状态（钉钉一旦收到流式帧就会切到「输出中」）。
+        前提：模板的「处理中」状态布局里有一个绑 content 的文本/富文本组件来显示该文字。"""
+        normalized = _ensure_table_blank_lines(text)
+        payload = {
+            "outTrackId": self._out_track_id,
+            "cardData": {"cardParamMap": {"content": normalized, "flowStatus": _FLOW_PROCESSING}},
+        }
+        self._put_card(_CARD_UPDATE_URL, payload)
+
     def _on_tool(self, text: str) -> None:
-        """工具执行期间立即推送状态，告知用户正在处理（不走节流）。"""
-        self._push(text)
+        """工具执行期间显示状态。新模板停在「处理中」（不抢跑到输出中）；旧模板走流式。"""
+        if self._ai_card_mode:
+            self._set_processing_content(text)
+        else:
+            self._push(text)
         self._last_push_at = time.monotonic()  # 重置节流，工具完成后首帧 generating 立即可见
 
     def _on_generating(self, text: str) -> None:
         now = time.monotonic()
-        if now - self._last_push_at < self.THROTTLE_S:
+        throttle = self.AI_STREAM_THROTTLE_S if self._ai_card_mode else self.THROTTLE_S
+        if now - self._last_push_at < throttle:
             return
         clean = text.removesuffix(" ▌")
         if clean:
@@ -368,11 +430,40 @@ class DingTalkCardRenderer:
             self._last_push_at = now
 
     def _on_done(self, text: str) -> None:
-        self._finalize(text)
+        self._finalize_terminal(text, success=True)
 
-    def _finalize(self, text: str) -> None:
-        """切换卡片到 FINISHED 终态，blockList 使用 markdown-variable-new 渲染完整 GFM。"""
-        # 终态同样插入表格空行，确保最终渲染正确
+    def _finalize_terminal(self, text: str, *, success: bool) -> None:
+        """切换卡片到终态并注销待办登记。
+
+        新模板(ai_card_mode)：发流式 isFinalize/isError 帧 → 完成/失败状态布局。
+        旧模板：instances API 置 FINISHED/FAILED（_finalize_with_status 内部已注销）。
+        """
+        if self._ai_card_mode:
+            self._push(text, finalize=success, is_error=not success)
+            self._on_unregister(self._out_track_id)
+        else:
+            self._finalize_with_status(text, _FLOW_FINISHED if success else _FLOW_FAILED)
+
+    def set_processing(self, text: str) -> None:
+        """非终态：把卡片置为「处理中」并显示提示文字，保持卡片可被后续 finalize。
+
+        新模板(ai_card_mode)：instances 更新 content + flowStatus=1，停在「处理中」状态
+        （工作流执行期间没有真实输出，不该进"输出中"）。
+        旧模板：用 flowStatus=2(INPUTING) instances 更新（PROCESSING 内置转圈会无视文字）。
+        """
+        if self._ai_card_mode:
+            self._set_processing_content(text)  # 处理中状态显示「正在执行【X】…」
+            self._on_register(self._out_track_id)
+            return
+        # INPUTING（非终态，可显示文字 + 边框动画）
+        self._last_text = self._put_blocklist(text, _FLOW_INPUTING)
+        self._on_register(self._out_track_id)
+
+    def _put_blocklist(self, text: str, flow_status: str) -> str:
+        """旧模板：instances API 用 blockList(markdown-variable-new) 渲染完整 GFM 并置 flowStatus。
+
+        表格空行同样补上，确保渲染正确。返回规范化后的文本，供调用方更新 _last_text。
+        """
         normalized = _ensure_table_blank_lines(text)
         block_list = json.dumps([{"type": 0, "markdown": normalized}], ensure_ascii=False)
         payload = {
@@ -382,11 +473,17 @@ class DingTalkCardRenderer:
                     "blockList": block_list,
                     "content": "",
                     "copy_content": normalized,
-                    "flowStatus": "3",  # FINISHED
+                    "flowStatus": flow_status,
                 }
             },
         }
         self._put_card(_CARD_UPDATE_URL, payload)
+        return normalized
+
+    def _finalize_with_status(self, text: str, flow_status: str) -> None:
+        """instances API 置终态，blockList 使用 markdown-variable-new 渲染完整 GFM。"""
+        self._put_blocklist(text, flow_status)
+        self._on_unregister(self._out_track_id)
 
 
 _API_BASE = "https://api.dingtalk.com"
@@ -398,6 +495,12 @@ _SINGLE_SEND_URL = f"{_API_BASE}/v1.0/robot/oToMessages/batchSend"
 _CARD_CREATE_URL = f"{_API_BASE}/v1.0/card/instances/createAndDeliver"
 _CARD_STREAM_URL = f"{_API_BASE}/v1.0/card/streaming"
 _CARD_UPDATE_URL = f"{_API_BASE}/v1.0/card/instances"
+
+# AI 卡片 flowStatus 五态（对齐 soimy AICardStatus；"1"/"5" 为本次新增使用）
+_FLOW_PROCESSING = "1"   # 处理中（工作流 / 工具执行）
+_FLOW_INPUTING = "2"     # 输入中（建卡 / 文本生成）
+_FLOW_FINISHED = "3"     # 完成
+_FLOW_FAILED = "5"       # 失败
 
 # 消息表情回复 API：收到调用时在用户消息上贴一个 👌（OK）表情，替代发独立贴纸消息
 # emotionType=1 为普通表情（无背景气泡）；OK 对应钉钉标准表情 emotion_023
@@ -411,6 +514,10 @@ _CARD_TEMPLATE_ID = os.getenv(
     "DINGTALK_CARD_TEMPLATE_ID",
     "675cde2f-f526-40cb-b828-f5b2b57b8b77.schema",
 )
+
+# 自建 AI 卡片模板（正文绑 content，四态彩色横幅，状态靠流式 isFinalize/isError 驱动）。
+# 配置后启用"新模式"；留空则用上面的社区模板，效果完全不变（自动回退）。
+_AI_CARD_TEMPLATE_ID = os.getenv("DINGTALK_AI_CARD_TEMPLATE_ID", "")
 
 # api token TTL 官方约 7200s，提前 5min 刷新
 _TOKEN_TTL_BUFFER = 300
@@ -469,6 +576,14 @@ class DingTalkGateway(BaseGateway):
 
         # 会话级串行锁：防止同一会话并发写共享上下文
         self._run_locks = SessionRunLocks()
+
+        # 未完成的工作流「处理中」卡片：out_track_id -> get_token 闭包。
+        # 进程退出时由 atexit 扫尾 finalize，避免卡片永远卡在「正在执行…」。
+        # 限制：start_forever() 无优雅停止钩子，仅 atexit（正常退出/Ctrl+C）兜底，kill -9 兜不住。
+        self._pending_cards: dict[str, Callable[[], str]] = {}
+        # 自建 AI 卡片模式开关：配了 DINGTALK_AI_CARD_TEMPLATE_ID 才启用，否则回退社区模板。
+        self._ai_card_mode = bool(_AI_CARD_TEMPLATE_ID)
+        atexit.register(self._finalize_pending_cards)
 
         # api.dingtalk.com token（发文件/主动消息用）
         self._api_token: str = ""
@@ -649,12 +764,14 @@ class DingTalkGateway(BaseGateway):
             )
             deliver_model = {"robotCode": self._client_id, "extension": "{}"}
             payload: dict = {
-                "cardTemplateId": _CARD_TEMPLATE_ID,
+                "cardTemplateId": _AI_CARD_TEMPLATE_ID or _CARD_TEMPLATE_ID,
                 "outTrackId": out_track_id,
                 "cardData": {
                     "cardParamMap": {
-                        "content": "",
-                        "flowStatus": "2",  # INPUTING
+                        "content": "🤔 思考中…",
+                        # 新模板从「处理中」起步（建卡即输出中是错的，会导致 输出中→处理中→输出中）；
+                        # 旧社区模板沿用 INPUTING。
+                        "flowStatus": _FLOW_PROCESSING if _AI_CARD_TEMPLATE_ID else _FLOW_INPUTING,
                     }
                 },
                 "callbackType": "STREAM",
@@ -682,10 +799,29 @@ class DingTalkGateway(BaseGateway):
 
             logger.debug("v2 卡片已创建 | outTrackId=%s", out_track_id)
             # 传递 token getter（而非静态 headers），确保长响应期间 token 自动刷新
-            return DingTalkCardRenderer(out_track_id, self._get_api_token)
+            return DingTalkCardRenderer(
+                out_track_id,
+                self._get_api_token,
+                on_register=lambda otid: self._pending_cards.__setitem__(otid, self._get_api_token),
+                on_unregister=lambda otid: self._pending_cards.pop(otid, None),
+                ai_card_mode=self._ai_card_mode,
+            )
         except Exception as e:
             logger.warning("v2 卡片创建失败，降级为文本回复: %s", e)
             return None
+
+    def _finalize_pending_cards(self) -> None:
+        """进程退出时把所有未完成的「处理中」卡片 finalize 成中断提示。尽力而为，逐卡兜异常。"""
+        for out_track_id, get_token in list(self._pending_cards.items()):
+            try:
+                r = DingTalkCardRenderer(out_track_id, get_token, ai_card_mode=self._ai_card_mode)
+                if self._ai_card_mode:
+                    r._push("⚠️ 处理中断，请重试。", is_error=True)
+                else:
+                    r._finalize_with_status("⚠️ 处理中断，请重试。", _FLOW_FAILED)
+            except Exception:
+                pass
+        self._pending_cards.clear()
 
     def _handle(
         self,
@@ -711,7 +847,7 @@ class DingTalkGateway(BaseGateway):
         """
         if renderer is not None:
             try:
-                self._agent.process(event, on_update=renderer.on_update)
+                self._agent.process(event, on_update=renderer.on_update, keep_thinking=False)
             except Exception as e:
                 logger.error(
                     "Agent 处理失败 | session_key=%s error=%s", session_key, e, exc_info=True
