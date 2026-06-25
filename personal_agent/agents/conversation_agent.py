@@ -22,6 +22,7 @@ from ..core.task_manager import TaskCancelledError, TaskManager
 from ..guardrails import sanitize_output, sanitize_tool_result
 from ..memory import MemoryModule
 from ..tools import get_all_tools, get_tools_openai_schema
+from ..tools.validation import validate_tool_args
 from ..tools.exec_tool import CommandResult
 
 logger = logging.getLogger(__name__)
@@ -361,12 +362,17 @@ class ConversationAgent(BaseAgent):
                         try:
                             kwargs_dict = repair_tool_arguments(c_func_args_str)
                             log_args = kwargs_dict.copy()
-                            # 注入上下文供支持后台通知的工具（如 exec）使用
-                            if push_fn is not None:
-                                kwargs_dict["_tool_ctx"] = {
-                                    "push_fn": self._make_exec_push_fn(push_fn),
-                                }
-                            res = c_tool.call(**kwargs_dict)
+                            # 调用前用工具自带 JSON Schema 校验参数（参考 Flue：失败回传错误让模型自纠）
+                            validation_error = validate_tool_args(c_tool, kwargs_dict)
+                            if validation_error:
+                                res = f"Error: 工具 '{c_func_name}' {validation_error}"
+                            else:
+                                # 注入上下文供支持后台通知的工具（如 exec）使用
+                                if push_fn is not None:
+                                    kwargs_dict["_tool_ctx"] = {
+                                        "push_fn": self._make_exec_push_fn(push_fn),
+                                    }
+                                res = c_tool.call(**kwargs_dict)
                         except Exception as e:
                             res = f"Error: 执行工具 '{c_func_name}' 失败: {str(e)}"
                     # ── L4 Tool Output Guard（写入 LLM context 前脱敏）─────
