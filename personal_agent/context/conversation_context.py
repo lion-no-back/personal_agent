@@ -12,7 +12,7 @@ class ConversationContext:
 
     核心职责：
     1. 以 session_key 为维度维护多路对话历史（线程安全）
-    2. 滑动窗口裁剪，防止历史消息超出 Token 限制
+    2. deque(maxlen) 作内存上限；发给模型的 token 预算裁剪由 message_truncation 负责
     3. 注入系统提示词（始终保留在消息列表首位）
     4. 消息去重（基于 message_id，防止飞书重推导致重复处理）
 
@@ -73,10 +73,15 @@ class ConversationContext:
             return self._session_locks[session_key]
 
     def _get_session(self, session_key: str) -> deque:
-        """获取（或懒创建）指定会话的消息队列。"""
+        """获取（或懒创建）指定会话的消息队列。
+
+        deque(maxlen) 仅作内存占用上限：超限自动丢最旧。发给模型的合法性
+        由发送前的 truncate_to_budget 保证（剥孤儿 tool、工具组成对进退），
+        故此处不需要、也不应该做"按条数感知工具组"的裁剪。
+        """
         with self._global_lock:
             if session_key not in self._sessions:
-                self._sessions[session_key] = deque()
+                self._sessions[session_key] = deque(maxlen=self._max_history)
             return self._sessions[session_key]
 
     # ──────────────────────────────────────────────
@@ -108,16 +113,7 @@ class ConversationContext:
                 msg["content"] = None
             
             msg.update(kwargs)
-            session.append(msg)
-
-            # 滑动窗口：超出限制时从队头删除最旧的消息
-            while len(session) > self._max_history:
-                removed = session.popleft()
-                removed_preview = str(removed.get('content', ''))[:30] if removed.get('content') else '[Tools]'
-                logger.debug(
-                    f"滑动窗口裁剪 | session={session_key} "
-                    f"已移除: [{removed.get('role')}] {removed_preview}..."
-                )
+            session.append(msg)  # deque(maxlen) 超限自动丢最旧
 
         logger.debug(
             f"消息已追加 | session={session_key} role={role} history_len={len(session)}"

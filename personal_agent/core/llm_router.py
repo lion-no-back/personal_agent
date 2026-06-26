@@ -31,6 +31,7 @@ import logging
 import os
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
+from . import model_metadata
 from .llm import PersonalAgentLLM
 
 logger = logging.getLogger(__name__)
@@ -131,3 +132,15 @@ class LLMRouter:
     def has_task_type(self, task_type: str) -> bool:
         """该任务类型是否有专属客户端（未配置 = 回退到 default，视为 False）。"""
         return task_type in self._clients
+
+    def get_prompt_budget(self, task_type: str = "default") -> int:
+        """返回该任务类型当前模型的 prompt token 预算（按模型上下文动态解析）。
+
+        slug 来源：LLM_{TASK}_OPENROUTER_SLUG > LLM_OPENROUTER_SLUG > 由模型名推断。
+        解析与缓存在 model_metadata 内完成，全程不抛出。
+        """
+        client = self._get(task_type)
+        slug = os.getenv(f"LLM_{task_type.upper()}_OPENROUTER_SLUG") or os.getenv(
+            "LLM_OPENROUTER_SLUG"
+        )
+        return model_metadata.get_prompt_budget(client.model, slug=slug)

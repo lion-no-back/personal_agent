@@ -328,7 +328,9 @@ def main() -> None:
         skill_bodies = {}
 
     context = ConversationContext(
-        max_history=int(os.getenv("AGENT_MAX_HISTORY", "20")),
+        # AGENT_MAX_HISTORY 现仅为内存保留条数上限；发给模型的真正约束是
+        # token 预算（按模型上下文动态解析），默认放宽到 200 让记忆更长。
+        max_history=int(os.getenv("AGENT_MAX_HISTORY", "200")),
         extra_system_prompt="\n\n".join(extra_prompts) if extra_prompts else None,
     )
     logger.info("✅ ConversationContext 就绪")

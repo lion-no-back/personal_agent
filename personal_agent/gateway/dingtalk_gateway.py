@@ -302,29 +302,55 @@ class DingTalkCardRenderer:
         # ai_card_mode=True：自建 AI 卡片模板（正文绑 content，状态靠流式 isFinalize/isError 驱动）。
         # False：旧社区模板（blockList + flowStatus）。由 DINGTALK_AI_CARD_TEMPLATE_ID 是否配置决定。
         self._ai_card_mode = ai_card_mode
+        # 终态守卫：卡片一旦 finalize/error，任何迟到的非终态帧（generating/tool/processing）
+        # 都必须丢弃，否则会把已完成的卡片重新翻回「输出中」并永久卡住（card-flusher 线程
+        # 可能在 done 之后才挤出迟到帧）。锁保证「判断终态 + 推送」原子化，杜绝中途竞态。
+        self._finalized = False
+        self._render_lock = threading.Lock()
+
+    _TERMINAL_STATUSES = ("done", "error")
 
     def on_update(self, text: str, status: str) -> None:
-        try:
-            if status == "generating":
-                self._on_generating(text)
-            elif status == "tool":
-                self._on_tool(text)
-            elif status == "processing":
-                self.set_processing(text)
-            elif status == "done":
-                self._on_done(text)
-            elif status == "error":
-                self.fail()
-        except Exception as exc:
-            logger.error("AI 卡片更新失败 | status=%s error=%s", status, exc)
+        with self._render_lock:
+            if self._finalized and status not in self._TERMINAL_STATUSES:
+                logger.info("卡片已终态，丢弃迟到的 %s 帧（防止翻回输出中）| otid=%s",
+                            status, self._out_track_id)
+                return
+            try:
+                self._dispatch(text, status)
+                if status in self._TERMINAL_STATUSES:
+                    self._finalized = True
+            except Exception as exc:
+                logger.error("AI 卡片更新失败 | status=%s error=%s", status, exc)
+
+    def _dispatch(self, text: str, status: str) -> None:
+        """按状态分发（持 _render_lock 调用；异常由 on_update 统一兜底）。"""
+        if status == "generating":
+            self._on_generating(text)
+        elif status == "tool":
+            self._on_tool(text)
+        elif status == "processing":
+            self.set_processing(text)
+        elif status == "done":
+            self._on_done(text)
+        elif status == "error":
+            self._finalize_error()
+
+    def _finalize_error(self) -> None:
+        """失败终态（持 _render_lock 调用）：在已推内容后追加错误提示。"""
+        error_text = self._last_text + "\n\n> ⚠️ 处理失败，请重试。"
+        self._finalize_terminal(error_text, success=False)
 
     def fail(self) -> None:
-        """通知卡片进入失败终态，在已推内容后追加错误提示。"""
-        try:
-            error_text = self._last_text + "\n\n> ⚠️ 处理失败，请重试。"
-            self._finalize_terminal(error_text, success=False)
-        except Exception as exc:
-            logger.warning("卡片 fail 通知失败: %s", exc)
+        """外部直接调用的失败入口：与 on_update 共用终态守卫，幂等、加锁。"""
+        with self._render_lock:
+            if self._finalized:
+                return
+            try:
+                self._finalize_error()
+                self._finalized = True
+            except Exception as exc:
+                logger.warning("卡片 fail 通知失败: %s", exc)
 
     def _mk_headers(self) -> dict:
         """每次调用现取 token，token 过期由 _get_api_token() 内部自动刷新。"""

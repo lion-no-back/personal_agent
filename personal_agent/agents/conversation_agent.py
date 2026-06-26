@@ -15,6 +15,7 @@ from openai import APIStatusError, AuthenticationError
 
 from ..agents.base_agent import BaseAgent
 from ..context.conversation_context import ConversationContext
+from ..context.message_truncation import truncate_to_budget
 from ..core.interaction_logger import InteractionLogger
 from ..core.llm_router import LLMRouter
 from ..core.request_scorer import RequestScorer
@@ -317,6 +318,12 @@ class ConversationAgent(BaseAgent):
                         user_text=event.content,  # 用原始消息评分，避免瞬态注入干扰
                     )
                     task_type = _score_result.task_type
+            # ── 5.5. 发送前按 token 预算裁剪（单一收口点）──────────
+            # 保护 system、工具调用组成对进退、剥除孤儿 tool，彻底避免
+            # OpenAI 400 "tool must be a response to a preceding tool_calls"。
+            # 预算按当前 task_type 的模型上下文动态解析。
+            messages = truncate_to_budget(messages, self._llm.get_prompt_budget(task_type))
+
             if self._interaction_logger:
                 self._interaction_logger.log_llm_call(session_key, i, messages)
             full_response, tool_calls = self._stream_and_update(
@@ -1049,31 +1056,21 @@ class ConversationAgent(BaseAgent):
                     llm_done = _stop.is_set()
                     avail = len(full_text)
 
-                    if avail > display_idx:
-                        step = self._stream_chars_per_tick
-                        if llm_done:
-                            # LLM 已结束：加速步长，剩余字符 ≤5 帧内揭完
-                            remaining = avail - display_idx
-                            step = max(step, (remaining + 4) // 5)
-
-                        display_idx = min(display_idx + step, avail)
-                        visible = full_text[:display_idx]
-                        caught_up = display_idx >= avail
-
-                        if llm_done and caught_up:
-                            # Always "generating" here — the definitive "done" is sent
-                            # by process() after appending routing_suggestion, preventing
-                            # a double _on_done() call that duplicates content in DingTalk.
-                            on_update(visible, "generating")
-                            return
-                        else:
-                            on_update(visible + " ▌", "generating")
-
-                    elif llm_done:
-                        # display_idx 已追上 buffer 且 LLM 已结束
+                    # ── 写完即停手 ──────────────────────────────────
+                    # LLM 一结束就立刻把完整全文推一帧后退出，不再逐帧"补动画"。
+                    # 这样打字线程在 done 之后的存活窗口≈0，join 立即返回，
+                    # 上层 process() 紧随其后发的 "done" 收尾天然串行在最后一帧之后，
+                    # 不会再出现"收尾后迟到 generating 帧把卡片翻回输出中"。
+                    # 此处仍发 "generating"（而非 "done"）：权威的 "done" 由 process()
+                    # 追加路由提示后统一发送，避免重复 _on_done 导致内容重复。
+                    if llm_done:
                         on_update(full_text, "generating")
                         return
-                    # else: LLM 仍在生成，buffer 暂无新内容，等下一帧
+
+                    # LLM 仍在生成：按节奏逐步揭字，做打字机动画
+                    if avail > display_idx:
+                        display_idx = min(display_idx + self._stream_chars_per_tick, avail)
+                        on_update(full_text[:display_idx] + " ▌", "generating")
 
                     time.sleep(self._card_update_interval)
 
