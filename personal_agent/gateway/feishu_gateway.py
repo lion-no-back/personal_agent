@@ -1124,9 +1124,18 @@ class FeishuGateway(BaseGateway):
             thread_id=event.thread_id,
         )
 
+        # ── 绑定当前用户到 contextvar（每请求作用域，供用量记账归属到发送人）──
+        from ..core.usage_tracker import set_current_user, reset_current_user
+        _user_token = set_current_user(
+            f"feishu:{event.sender_open_id}", getattr(event, "sender_name", "") or ""
+        )
+
         # ── 会话串行锁：同 session 并发请求排队，防止上下文消息交错 ──
-        with self._run_locks.get(session_key):
-            self._handle_async_body(event, session_key)
+        try:
+            with self._run_locks.get(session_key):
+                self._handle_async_body(event, session_key)
+        finally:
+            reset_current_user(_user_token)
 
     def _handle_async_body(self, event: "MessageEvent", session_key: str) -> None:
         """_handle_async 的实际执行体，在会话串行锁保护下运行。"""

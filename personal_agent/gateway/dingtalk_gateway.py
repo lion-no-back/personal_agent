@@ -77,24 +77,40 @@ _RECONNECT_DELAYS = [2, 5, 10, 30, 60]
 #   Markdown → 钉钉 markdown 子集转换器
 # ──────────────────────────────────────────────────────────────
 
-def _fmt_for_dingtalk(text: str) -> str:
-    """
-    将标准 Markdown 转换为钉钉机器人官方支持的 markdown 子集。
+def _paragraph_breaks(text: str) -> str:
+    """单 \n → \n\n（钉钉 Markdown 单换行等同于空格，需双换行才成段落/换行）。
 
-    钉钉官方支持（来源：open.dingtalk.com/document/group/custom-robot-access）：
-        标题 H1-H6、引用 >、加粗 **、斜体 *、链接 []()、图片 ![]()
-    不支持：围栏代码块 ``` 、GFM 表格、内联代码 `
-
-    转换策略：
-    - 单个 \n → \n\n（钉钉 Markdown 单换行等同于空格，需双换行才成段落）
-    - 代码块 → > 引用块（官方支持，视觉上与正文区分）
-    - 表格   → 首行加粗 + 竖线分隔文本行
+    这是钉钉 Markdown 自身属性，对所有渠道（webhook / AI 卡片 / 旧模板）通用，
+    是排版正确的根本一层。**表格感知 + 代码块感知**：GFM 表格块与围栏代码块
+    内部的单换行不扩展，否则会被插空行打散（实测）；仅普通文本行之间扩展。
+    幂等：已是 \n\n 的不重复扩展。
     """
-    # 单 \n → \n\n，已是 \n\n 的不重复扩展
-    text = re.sub(r'(?<!\n)\n(?!\n)', '\n\n', text)
-    text = _dt_code_blocks(text)
-    text = _dt_tables(text)
-    return text
+    lines = text.split("\n")
+    n = len(lines)
+
+    # 标记受保护行：围栏代码块内、GFM 表格行（其内部换行保持单 \n）
+    protected = [False] * n
+    in_fence = False
+    for i, ln in enumerate(lines):
+        s = ln.lstrip()
+        if s.startswith("```"):
+            protected[i] = True
+            in_fence = not in_fence
+            continue
+        if in_fence or s.startswith("|"):
+            protected[i] = True
+
+    parts: list[str] = []
+    for i, ln in enumerate(lines):
+        parts.append(ln)
+        if i == n - 1:
+            break
+        # 任一侧空行（已是段落边界）或两侧同在受保护块内 → 保持单 \n；否则补成 \n\n
+        if not ln.strip() or not lines[i + 1].strip() or (protected[i] and protected[i + 1]):
+            parts.append("\n")
+        else:
+            parts.append("\n\n")
+    return "".join(parts)
 
 
 def _dt_code_blocks(text: str) -> str:
@@ -183,6 +199,38 @@ def _dt_tables(text: str) -> str:
 
     table_re = r"(?m)^\|.+\|\s*\n\|[\s\-|:]+\|\s*\n(?:\|.+\|\s*\n?)+"
     return re.sub(table_re, replacer, text)
+
+
+def render_for_dingtalk(text: str, *, target: str, streaming: bool = False) -> str:
+    """钉钉出站文本统一归一化边界——所有回复路径（卡片/webhook）都走这里，杜绝漂移。
+
+    分层（可组合、各管一摊）：
+      L0 段落换行（通用·表格/代码感知）：_paragraph_breaks —— 真正修排版的一层
+      L1 渠道能力：webhook 拍平 GFM（受限子集）；card 保留完整 GFM
+      L2 流式守卫：非终态帧裁掉生长中的尾部表格（防 content 字段列宽误锁）；
+                  旧模板流式额外拍平表格、去引用前缀
+
+    Args:
+        target:    "webhook" | "card_ai"（自建 AI 卡片）| "card_legacy"（旧社区模板）
+        streaming: True=非终态流式帧；False=终态/处理中（保留完整 GFM）
+    """
+    text = _paragraph_breaks(text)  # L0 通用
+
+    if target == "webhook":
+        text = _dt_code_blocks(text)  # 代码块 → 引用
+        text = _dt_tables(text)       # GFM 表格 → 竖线文本
+        text = re.sub(r"\n{3,}", "\n\n", text)  # 收敛多余空行（拍平表格会叠出 3+ 换行）
+        return text.rstrip("\n")
+
+    # card_ai / card_legacy：终态保留完整 GFM（钉钉卡片组件可原生渲染）
+    if streaming:  # L2 流式守卫
+        if target == "card_legacy":
+            text = _dt_tables(text)        # 旧模板流式帧拍平表格，防列宽误锁
+        text = _trim_trailing_table(text)  # 裁掉正在生长的尾部表格
+        if target == "card_legacy":
+            text = _strip_blockquotes(text)
+    text = _ensure_table_blank_lines(text)  # L1：表前补空行，保证 GFM 表格被识别
+    return text.rstrip("\n")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -383,36 +431,14 @@ class DingTalkCardRenderer:
     def _push(self, text: str, *, finalize: bool = False, is_error: bool = False) -> None:
         """全量推送到 streaming 端点（isFull=True）。
 
-        ai_card_mode（自建模板）：对齐 QwenPaw `_stream_ai_card` —— 发**原始累积全文、零变换**，
-        渲染交给组件；关键是**靠 0.3s 节流**（见 _on_generating，对齐 QwenPaw 的
-        _STREAM_DELTA_MIN_INTERVAL_S=0.3）避免高频帧冲垮组件打字机（之前 0.05s 太快才导致
-        表格列宽误锁拉长 + 内容重复重渲染）。
-        旧社区模板：沿用表格拍平 + 裁尾部表格的老策略。
+        归一化统一收口到 render_for_dingtalk：
+        - L0 表格感知段落换行对所有帧生效（修结构化短消息挤一坨）。
+        - 流式帧（非终态）裁生长中的尾部表格、靠 0.3s 节流防打字机被冲垮（见 _on_generating）。
+        - 终态帧保留完整 GFM。前缀单调由 L0/L2 的确定性逐帧变换保证。
         """
         terminal = finalize or is_error
-        if self._ai_card_mode:
-            if terminal:
-                # 完成/失败帧：与流式帧用同一轻量变换（只补表头空行），仅不裁尾部表格（完整表格要全发出）。
-                # 这样完成帧是上一流式帧的「前缀扩展」（把流式期裁掉的表格追加上）→ 前缀单调，
-                # 消除完成瞬间的内容跳变/重绘。对齐 QwenPaw `_stream_ai_card`：流式与完成同一变换、
-                # 无差异。富文本组件渲染原始 GFM 表格正常，无需 :---: 重渲染。
-                content = _ensure_table_blank_lines(text).rstrip('\n')
-            else:
-                # 流式帧（前缀单调是硬约束，否则钉钉打字机按 delta 动画会重复文字/单元格错位）：
-                # 1) _trim_trailing_table：裁掉「正在生长的尾部表格」。AI流式富文本组件对逐帧增长的
-                #    表格会用早期不完整帧锁死列宽 → 空白/竖排(图55/57)；裁到表格完整(后跟非表格内容)
-                #    才整块发出，组件一次性按完整内容算对列宽(图56)。裁剪只动尾部、前缀安全。
-                # 2) _ensure_table_blank_lines：表头前补空行(前缀安全)，让完整表格被识别。
-                # **不重渲染表格、不转 <br>**——那会破坏前缀单调(对齐 QwenPaw 发原始累积全文；
-                # soimy 的表格重渲染只用于非流式整条消息)。完整规范化只在完成帧(terminal)做。
-                content = _ensure_table_blank_lines(_trim_trailing_table(text)).rstrip('\n')
-        elif terminal:
-            content = _ensure_table_blank_lines(text).rstrip('\n')
-        else:
-            content = _dt_tables(text)
-            content = _trim_trailing_table(content)
-            content = _strip_blockquotes(content)
-            content = _ensure_table_blank_lines(content).rstrip('\n')
+        target = "card_ai" if self._ai_card_mode else "card_legacy"
+        content = render_for_dingtalk(text, target=target, streaming=not terminal)
         if content == self._last_text and not terminal:
             return
         payload = {
@@ -431,7 +457,7 @@ class DingTalkCardRenderer:
         """ai_card_mode：instances 更新 content + flowStatus=1（处理中），**不发流式帧**，
         从而保持「处理中」状态（钉钉一旦收到流式帧就会切到「输出中」）。
         前提：模板的「处理中」状态布局里有一个绑 content 的文本/富文本组件来显示该文字。"""
-        normalized = _ensure_table_blank_lines(text)
+        normalized = render_for_dingtalk(text, target="card_ai", streaming=False)
         payload = {
             "outTrackId": self._out_track_id,
             "cardData": {"cardParamMap": {"content": normalized, "flowStatus": _FLOW_PROCESSING}},
@@ -491,7 +517,7 @@ class DingTalkCardRenderer:
 
         表格空行同样补上，确保渲染正确。返回规范化后的文本，供调用方更新 _last_text。
         """
-        normalized = _ensure_table_blank_lines(text)
+        normalized = render_for_dingtalk(text, target="card_legacy", streaming=False)
         block_list = json.dumps([{"type": 0, "markdown": normalized}], ensure_ascii=False)
         payload = {
             "outTrackId": self._out_track_id,
@@ -993,8 +1019,16 @@ class DingTalkGateway(BaseGateway):
         lock: threading.Lock,
         renderer: "DingTalkCardRenderer | None",
     ) -> None:
-        with lock:
-            self._process(event, incoming, session_key, renderer)
+        # 绑定当前用户到 contextvar（每请求作用域，供用量记账归属到发送人）
+        from ..core.usage_tracker import set_current_user, reset_current_user
+        _user_token = set_current_user(
+            f"dingtalk:{incoming.sender_staff_id}", incoming.sender_nick or ""
+        )
+        try:
+            with lock:
+                self._process(event, incoming, session_key, renderer)
+        finally:
+            reset_current_user(_user_token)
 
     def _process(
         self,
@@ -1051,7 +1085,7 @@ class DingTalkGateway(BaseGateway):
             "msgtype": "markdown",
             "markdown": {
                 "title": "回复",
-                "text": _fmt_for_dingtalk(text),
+                "text": render_for_dingtalk(text, target="webhook"),
             },
         }
         try:
@@ -1097,7 +1131,7 @@ class DingTalkGateway(BaseGateway):
         token = self._get_api_token()
         payload = {
             "msgKey": "sampleMarkdown",
-            "msgParam": json.dumps({"title": "消息", "text": _fmt_for_dingtalk(text)}, ensure_ascii=False),
+            "msgParam": json.dumps({"title": "消息", "text": render_for_dingtalk(text, target="webhook")}, ensure_ascii=False),
             "robotCode": self._client_id,
         }
         if id_type == "group":

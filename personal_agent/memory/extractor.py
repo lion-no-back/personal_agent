@@ -9,6 +9,7 @@
 合并检查：每次 append 后检查 timeline 条数，超过阈值时触发合并。
 """
 
+import contextvars
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -63,8 +64,13 @@ class MemoryExtractor:
     # ── 公开接口 ───────────────────────────────────────────────────
 
     def extract_async(self, user_id: str, conversation: list[dict]) -> None:
-        """对话结束后异步触发，不阻塞飞书回复链路。"""
-        self._executor.submit(self._safe_extract, user_id, conversation)
+        """对话结束后异步触发，不阻塞飞书回复链路。
+
+        用 copy_context() 把当前请求的 usage 归属（current_user/source）带进后台线程，
+        否则线程池 submit 不会继承 contextvar，记忆抽取的 token 将无法归账到发送人。
+        """
+        ctx = contextvars.copy_context()
+        self._executor.submit(ctx.run, self._safe_extract, user_id, conversation)
 
     def save_direct(self, user_id: str, content: str, memory_type: str = "experience") -> None:
         """
@@ -81,8 +87,10 @@ class MemoryExtractor:
     # ── 内部抽取 ───────────────────────────────────────────────────
 
     def _safe_extract(self, user_id: str, conversation: list[dict]) -> None:
+        from ..core.usage_tracker import usage_source
         try:
-            self._extract(user_id, conversation)
+            with usage_source("memory"):  # 标记本块内 LLM 调用归到 memory 来源
+                self._extract(user_id, conversation)
         except Exception as e:
             logger.warning("MemoryExtractor: 抽取失败 | user=%s err=%s", user_id, e)
 

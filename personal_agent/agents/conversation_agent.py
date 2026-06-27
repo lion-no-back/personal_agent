@@ -4,6 +4,7 @@ import re
 import threading
 import time
 import json
+import contextvars
 import concurrent.futures
 from typing import Callable, Optional
 
@@ -42,6 +43,7 @@ _BUILTIN_COMMANDS = {
     "/tasks": "查看后台任务处理状态",
     "/remember": "主动记住某件事：/remember <内容>（默认写入经验记忆）",
     "/memories": "查看当前用户的记忆内容",
+    "/用量": "查看本人本月至今与上月的 token 用量和费用（别名 /usage）",
 }
 
 _HELP_TEXT = (
@@ -393,7 +395,12 @@ class ConversationAgent(BaseAgent):
                 
                 results_collected = []
                 with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tool_calls), 5)) as executor:
-                    futures = [executor.submit(execute_single_tool, tc) for tc in tool_calls]
+                    # copy_context：把当前 usage 归属（current_user/source）带进工具线程，
+                    # 否则工具触发的 LLM 调用（如 knowledge_search）会丢失归账。
+                    futures = [
+                        executor.submit(contextvars.copy_context().run, execute_single_tool, tc)
+                        for tc in tool_calls
+                    ]
                     for fut in concurrent.futures.as_completed(futures):
                         results_collected.append(fut.result())
 
@@ -517,12 +524,17 @@ class ConversationAgent(BaseAgent):
             if on_update:
                 on_update(ack, "processing")
 
-            self._run_ondemand_workflow_async(meta, delivery_key, content, on_update=on_update)
+            # 捕获触发者（当前 worker 线程的 contextvar），供工作流 usage 回传后归账
+            from ..core.usage_tracker import current_user
+            usage_user = current_user.get()
+            self._run_ondemand_workflow_async(
+                meta, delivery_key, content, on_update=on_update, usage_user=usage_user
+            )
             return ack
 
         return None
 
-    def _run_ondemand_workflow_async(self, meta, delivery_key: str, event_content: str = "", on_update=None) -> None:
+    def _run_ondemand_workflow_async(self, meta, delivery_key: str, event_content: str = "", on_update=None, usage_user=None) -> None:
         """在后台 daemon 线程中执行按需 workflow，完成后通过 notify_fn/send_file_fn 投递结果。
 
         工作流在独立子进程里运行（见 workflows/dispatch.py）：主进程不 import 其重原生库
@@ -539,6 +551,23 @@ class ConversationAgent(BaseAgent):
                 # 按需入口无外层超时，硬总额 = 执行超时 + 装包宽限（首次现装大依赖用）
                 timeout=(base_timeout + INSTALL_GRACE_SECONDS) if base_timeout else None,
             )
+            # 工作流子进程回传的 LLM usage，按触发者记账（source=workflow）
+            if usage_user is not None:
+                try:
+                    from ..core.usage_tracker import get_tracker
+                    _uid, _name = usage_user
+                    _tracker = get_tracker()
+                    for u in result.get("usage", []) or []:
+                        _tracker.record(
+                            user_id=_uid, display_name=_name, source="workflow",
+                            model=u.get("model", ""),
+                            in_tokens=u.get("in_tokens", 0),
+                            out_tokens=u.get("out_tokens", 0),
+                            cache_read_tokens=u.get("cache_read_tokens", 0),
+                            slug=os.getenv("LLM_REASONING_OPENROUTER_SLUG") or os.getenv("LLM_OPENROUTER_SLUG"),
+                        )
+                except Exception as _e:
+                    logger.warning("[ondemand:%s] 工作流 usage 记账失败 | %s", meta.id, _e)
             success = result.get("ok", False)
             files = result.get("files", [])
             segments = result.get("segments", [])
@@ -555,7 +584,12 @@ class ConversationAgent(BaseAgent):
                 delivered = False
                 if on_update is not None:
                     try:
-                        on_update(message, "done")
+                        # 卡片成功终态自带「✅完成」徽标，去掉正文重复的成功 emoji 前缀。
+                        # 只剥成功标记（✅✔️☑️）；失败的 ❌/⚠️ 必须保留——否则卡片仍显示
+                        # 「完成」徽标、正文又没了失败标记，用户将无法分辨成功还是失败。
+                        # 文字降级路径（notify_fn）无徽标，仍用带前缀的原 message。
+                        card_message = re.sub(r"^[\s✅✔️☑️]+", "", message)
+                        on_update(card_message, "done")
                         delivered = True
                     except Exception:
                         logger.exception("[ondemand:%s] 卡片 finalize 失败，回退文字投递", meta.id)
@@ -709,7 +743,24 @@ class ConversationAgent(BaseAgent):
         if cmd == "/memories":
             return self._cmd_memories(sender_open_id)
 
+        # ── /用量 /usage ──────────────────────────────────────
+        if cmd in ("/用量", "/usage"):
+            return self._cmd_usage()
+
         return None  # 不是内置指令，正常走 LLM
+
+    def _cmd_usage(self) -> str:
+        """返回当前发送人的本月至今 + 上月完整用量与费用。"""
+        from ..core.usage_tracker import current_user, get_tracker
+        cu = current_user.get()
+        if cu is None:
+            return "📊 暂无法识别当前用户的用量。"
+        user_id, name = cu
+        try:
+            return get_tracker().format_report(user_id, name)
+        except Exception as e:
+            logger.warning("用量查询失败 | user=%s err=%s", user_id, e)
+            return "📊 用量查询失败，请稍后再试。"
 
     # ──────────────────────────────────────────────────────────
     #   /resume 实现

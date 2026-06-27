@@ -73,7 +73,7 @@ def main() -> int:
         _setup_child_logging(args.log_file)
     logger = logging.getLogger(__name__)
 
-    payload = {"ok": False, "message": "", "files": [], "segments": [], "error": None}
+    payload = {"ok": False, "message": "", "files": [], "segments": [], "error": None, "usage": []}
     try:
         mod = importlib.import_module(args.module)
         fn = getattr(mod, args.function)
@@ -88,6 +88,13 @@ def main() -> int:
         logger.exception("[subprocess] 工作流执行失败 | module=%s", args.module)
         payload["error"] = f"{type(exc).__name__}: {exc}"
         payload["ok"] = False
+
+    # 回传子进程内收集的 LLM usage（即使失败也回传已发生的调用），主进程统一记账
+    try:
+        from personal_agent.core.usage_tracker import drain_collected
+        payload["usage"] = drain_collected()
+    except Exception:
+        payload["usage"] = []
 
     try:
         Path(args.result_file).write_text(

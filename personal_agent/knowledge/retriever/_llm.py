@@ -13,7 +13,11 @@ async def llm_json_array(
     temperature: float,
 ) -> list | None:
     """Call LLM and parse the first JSON array from the response. Returns None on any failure."""
-    result = await asyncio.to_thread(llm.think, messages, temperature)
+    from personal_agent.core.usage_tracker import usage_source
+
+    # 标记检索来源；asyncio.to_thread 会把含 current_source 的 context 一起 copy 到工作线程
+    with usage_source("retrieval"):
+        result = await asyncio.to_thread(llm.think, messages, temperature)
     if not result:
         return None
     m = re.search(r"\[.*?\]", result, re.DOTALL)

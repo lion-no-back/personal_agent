@@ -32,6 +32,24 @@ async def _call_llm(system_prompt: str, user_message: str) -> str:
             max_tokens=10000
         )
 
+        # 收集 usage，由子进程结果回传主进程记账（归到工作流触发者，source=workflow）
+        try:
+            from personal_agent.core.usage_tracker import collect_usage
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                cache_read = 0
+                details = getattr(usage, "prompt_tokens_details", None)
+                if details is not None:
+                    cache_read = getattr(details, "cached_tokens", 0) or 0
+                collect_usage(
+                    model=model_id,
+                    in_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                    out_tokens=getattr(usage, "completion_tokens", 0) or 0,
+                    cache_read_tokens=cache_read,
+                )
+        except Exception as _e:
+            print(f"[usage 收集失败] {_e}")
+
         return response.choices[0].message.content
 
     except Exception as e:

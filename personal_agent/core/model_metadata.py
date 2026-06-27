@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import httpx
@@ -45,14 +46,60 @@ _MODEL_CONTEXT_TABLE = {
 _meta_cache: Dict[str, Optional[dict]] = {}     # model_id -> 解析出的元数据（含 None 表示不可用）
 _budget_cache: Dict[str, int] = {}              # model_id -> prompt 预算
 
+# 拉到的元数据落盘缓存：OpenRouter 不可达时按 model_id 兜底（含 pricing/context_length）
+_DISK_CACHE_PATH = Path(__file__).resolve().parents[2] / "data" / "model_meta_cache.json"
+_disk_cache: Optional[Dict[str, dict]] = None   # 懒加载
+
+# 模型名 → OpenRouter 厂商(author) 推断表（子串匹配，命中即用 author/model_id 作 slug）。
+# OpenRouter 单模型 API 形如 GET /api/v1/model/{author}/{model}。
+_VENDOR_PATTERNS = [
+    ("deepseek", "deepseek"),
+    ("gpt", "openai"), ("o1", "openai"), ("o3", "openai"), ("o4", "openai"),
+    ("claude", "anthropic"),
+    ("gemini", "google"), ("gemma", "google"),
+    ("qwen", "qwen"),
+    ("llama", "meta-llama"),
+    ("mistral", "mistralai"), ("mixtral", "mistralai"),
+    ("grok", "x-ai"),
+]
+
 
 def _slug_for(model_id: str, slug: Optional[str]) -> str:
-    """推断 OpenRouter slug：显式 slug 优先；含 / 直接用；否则补 deepseek/ 前缀按需匹配。"""
+    """解析 OpenRouter slug（author/model）：显式 slug 优先；含 / 直接用；
+    否则按模型名推断厂商 author，拼成 author/model_id；厂商未知则原样返回。"""
     if slug:
         return slug
     if "/" in model_id:
         return model_id
-    return f"deepseek/{model_id}"
+    low = model_id.lower()
+    for pat, author in _VENDOR_PATTERNS:
+        if pat in low:
+            return f"{author}/{model_id}"
+    return model_id  # 厂商未知，交给 API 自行判定（多半 404 → 走缓存/unpriced）
+
+
+def _load_disk_cache() -> Dict[str, dict]:
+    global _disk_cache
+    if _disk_cache is None:
+        try:
+            import json
+            _disk_cache = json.loads(_DISK_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            _disk_cache = {}
+    return _disk_cache
+
+
+def _save_disk_cache(model_id: str, meta: dict) -> None:
+    try:
+        import json
+        cache = _load_disk_cache()
+        cache[model_id] = meta
+        _DISK_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _DISK_CACHE_PATH.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning("模型元数据落盘失败 | model=%s err=%s", model_id, e)
 
 
 def _fetch_openrouter(slug: str) -> Optional[dict]:
@@ -75,7 +122,10 @@ def _fetch_openrouter(slug: str) -> Optional[dict]:
 
 
 def _resolve_meta(model_id: str, slug: Optional[str]) -> Optional[dict]:
-    """解析并缓存模型元数据：{context_length, max_completion_tokens, pricing}。"""
+    """解析并缓存模型元数据：{context_length, max_completion_tokens, pricing}。
+
+    优先 OpenRouter 实时拉取（成功即落盘缓存）；拉不到时回退磁盘缓存（上次拉到的值）。
+    """
     if model_id in _meta_cache:
         return _meta_cache[model_id]
 
@@ -90,8 +140,18 @@ def _resolve_meta(model_id: str, slug: Optional[str]) -> Optional[dict]:
                 "max_completion_tokens": top.get("max_completion_tokens"),
                 "pricing": data.get("pricing"),
             }
-    _meta_cache[model_id] = meta
-    return meta
+
+    if meta is not None:
+        _meta_cache[model_id] = meta
+        _save_disk_cache(model_id, meta)  # 成功拉取 → 落盘，供日后离线兜底
+        return meta
+
+    # 拉取失败 → 回退磁盘缓存（上次成功拉到的值）
+    cached = _load_disk_cache().get(model_id)
+    if cached is not None:
+        logger.info("OpenRouter 不可达，使用磁盘缓存价格 | model=%s", model_id)
+    _meta_cache[model_id] = cached
+    return cached
 
 
 def _context_from_table(model_id: str) -> Optional[int]:

@@ -140,8 +140,36 @@ class PersonalAgentLLM:
                 f"✅ 流式响应完成 | 共 {len(accumulated)} 字符 "
                 f"| tokens in={last_usage.prompt_tokens} out={last_usage.completion_tokens}"
             )
+            self._record_usage(last_usage)
         else:
             logger.info(f"✅ 流式响应完成 | 共 {len(accumulated)} 字符")
+
+    def _record_usage(self, usage) -> None:
+        """从 usage 提取 token/缓存，按 contextvar 归账（费用由 OpenRouter 单价算）。全程不抛。
+
+        - 输出 token 直接信任 completion_tokens（已含 reasoning），不另加 reasoning_tokens 避免双算。
+        - 缓存输入取 prompt_tokens_details.cached_tokens（不可得则 0），仅记录不折价。
+        """
+        try:
+            from .usage_tracker import get_tracker
+
+            in_tokens = getattr(usage, "prompt_tokens", 0) or 0
+            out_tokens = getattr(usage, "completion_tokens", 0) or 0
+
+            cache_read = 0
+            details = getattr(usage, "prompt_tokens_details", None)
+            if details is not None:
+                cache_read = getattr(details, "cached_tokens", 0) or 0
+
+            get_tracker().record_from_context(
+                model=self.model,
+                in_tokens=in_tokens,
+                out_tokens=out_tokens,
+                cache_read_tokens=cache_read,
+                slug=os.getenv("LLM_OPENROUTER_SLUG"),
+            )
+        except Exception as e:
+            logger.warning("记账失败（不影响主流程）| err=%s", e)
 
     def think(
         self,
