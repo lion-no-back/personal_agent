@@ -91,6 +91,13 @@ SITE_DE = Site(
 SITES = [SITE_US, SITE_DE]
 
 PAGES = [1, 2]  # 每个榜单抓 2 页 (top ~100)
+_DELIVERY_POSTAL_BY_SITE_ORDER = {SITE_DE.order: "12057"}
+_DELIVERY_SOLD_BY_ASINS_BY_SITE_ORDER = {SITE_DE.order: {"B0FDKKWMXF"}}
+
+_CATEGORY_NAME_BY_ID = {
+    SITE_US.category_id: "Smartwatch Bands",
+    SITE_DE.category_id: "Smartwatch Replacement Bands",
+}
 
 # ---------------------------------------------------------------- 路径 / 日志
 # 统一存到项目根 artifact/rankbb_<日期>/<时间>/：日志在 logs/ 子目录，截图直接放该目录。
@@ -305,25 +312,88 @@ def brand_matches(target, resolved):
 def _extract_bsr_rank(page, full_text, category_id):
     """从详情页取本类目 (Smartwatch Bands) 的销量榜排名数字; 取不到返回 None。
 
-    用 href 含类目 id 的链接文字作为类目名, 再在全页文本 (full_text) 里匹配
-    "#<数字> in <类目名>", 兼容 detailBullets 与 productDetails 两种版式。
+    优先用 href 含类目 id 的链接文字作为类目名, 若页面没有类目链接则回退到站点配置的
+    英文类目名; 再在全页文本 (full_text) 里匹配 "[#]<数字> in <类目名>"。
     """
-    cat_name = None
+    cat_names = []
     for a in page.css(f'a[href*="{category_id}"]'):
         href = a.attrib.get("href", "")
         if "bestsellers" in href or "/zg" in href or "hrsr" in href:
             cat_name = a.get_all_text(strip=True)
+            if cat_name:
+                cat_names.append(cat_name)
             break
-    if not cat_name:
-        return None
-    m = re.search(r"#\s*([\d,]+)\s+in\s+" + re.escape(cat_name), full_text)
-    return m.group(1).replace(",", "") if m else None
+
+    fallback_name = _CATEGORY_NAME_BY_ID.get(category_id)
+    if fallback_name and fallback_name not in cat_names:
+        cat_names.append(fallback_name)
+
+    for cat_name in cat_names:
+        m = re.search(r"#?\s*([\d,]+)\s+in\s+" + re.escape(cat_name), full_text)
+        if m:
+            return m.group(1).replace(",", "")
+    return None
 
 
 def _extract_sold_by(page):
     """从详情页买盒取 "Sold by" 卖家名 (`#sellerProfileTriggerId`); 取不到返回 None。"""
     el = page.css("#sellerProfileTriggerId").first
     return el.get_all_text(strip=True) if el else None
+
+
+def _resolve_sold_by_with_delivery_location(asin, site):
+    """浏览器兜底：德国站未定位配送地时买盒不展示 Sold by，设置邮编后再读。
+
+    仅在 HTTP 详情页已确认商品存在但 `#sellerProfileTriggerId` 缺失时调用，避免把
+    所有商品都走慢速浏览器路径。德国站邮编 12057 对应 Berlin，可让此类商品展示买盒。
+    """
+    postal_code = _DELIVERY_POSTAL_BY_SITE_ORDER.get(site.order)
+    if not postal_code:
+        return None
+
+    result = {}
+
+    def _action(page):
+        page.locator("#contextualIngressPtLink").first.click(timeout=8000)
+        page.locator("#GLUXZipUpdateInput").first.fill(postal_code, timeout=8000)
+        page.locator("#GLUXZipUpdate").first.click(timeout=8000)
+        try:
+            page.locator("button[name=glowDoneButton], #GLUXConfirmClose").first.click(timeout=5000)
+        except Exception:
+            pass
+        page.wait_for_load_state("domcontentloaded", timeout=10000)
+        page.reload(wait_until="domcontentloaded")
+        page.wait_for_selector("#sellerProfileTriggerId", timeout=15000)
+        result["sold_by"] = page.locator("#sellerProfileTriggerId").first.inner_text(timeout=5000).strip()
+
+    try:
+        with DynamicSession(
+            headless=True,
+            network_idle=False,
+            block_ads=True,
+            blocked_domains=_BLOCKED_DOMAINS,
+            wait_selector="#productTitle",
+            wait_selector_state="attached",
+            timeout=60000,
+        ) as session:
+            session.fetch(f"{site.dp_base}{asin}?language=en_GB", page_action=_action)
+    except Exception as e:
+        logger.warning("配送地兜底解析 Sold by 失败 asin=%s postal=%s: %s", asin, postal_code, e)
+        return None
+
+    sold_by = result.get("sold_by") or None
+    if sold_by:
+        logger.info("配送地兜底解析 Sold by 成功 asin=%s postal=%s Sold by=%s", asin, postal_code, sold_by)
+    return sold_by
+
+
+def _needs_delivery_location_sold_by(asin, site):
+    """是否需要通过设置配送地来兜底解析 Sold by。
+
+    目前只有德国站 BXUXOHS 的 B0FDKKWMXF 在默认美国配送地时不展示买盒卖家;
+    其他品牌都有固定店铺映射，不需要为它们启动慢速浏览器兜底。
+    """
+    return asin in _DELIVERY_SOLD_BY_ASINS_BY_SITE_ORDER.get(site.order, set())
 
 
 _BLOCK_MARKERS = ("Enter the characters you see", "Robot Check", "api-services-support@amazon.com",
@@ -412,6 +482,8 @@ def resolve_product(asin, site, attempts=3):
     brand = _extract_brand(page, full_text)
     bsr_rank = _extract_bsr_rank(page, full_text, site.category_id)
     sold_by = _extract_sold_by(page)
+    if sold_by is None and _needs_delivery_location_sold_by(asin, site):
+        sold_by = _resolve_sold_by_with_delivery_location(asin, site)
     logger.debug("详情页 asin=%s 品牌=%s 销量榜排名=%s Sold by=%s", asin, brand, bsr_rank, sold_by)
     return {"brand": brand, "bsr_rank": bsr_rank, "sold_by": sold_by}
 
@@ -439,7 +511,7 @@ def resolve_all(asins, site, workers=8):
     return result
 
 
-def resolve_shop_name(brand, shops, item):
+def resolve_shop_name(brand, shops, item, board_label=""):
     """得到该商品应显示的店铺名。
 
     多店铺品牌 (见 SOLD_BY_MAP) 按详情页 "Sold by" 细分; 其余品牌沿用固定映射。
@@ -451,12 +523,21 @@ def resolve_shop_name(brand, shops, item):
     sold_by = item.get("sold_by")
     shop = mapping.get(sold_by)
     if shop is None:
-        logger.error("[%s] 未知 Sold by=%r, 无法判定店铺, asin=%s", brand, sold_by, item.get("asin"))
-        print(f"  ⚠ [{brand}] 未知 Sold by={sold_by!r}, 无法判定店铺 (asin={item.get('asin')}), 跳过此条")
+        rank_text = f"{board_label}排名：{item.get('rank')}" if board_label and item.get("rank") else ""
+        logger.error("[%s] 未知 Sold by=%r, 无法判定店铺, asin=%s, %s",
+                     brand, sold_by, item.get("asin"), rank_text or "排名未知")
+        suffix = f"，{rank_text}" if rank_text else ""
+        print(
+            f"  ⚠ [{brand}] 未知 Sold by={sold_by!r}, 无法判定店铺 "
+            f"(asin={item.get('asin')}{suffix}), 跳过此条"
+        )
     return shop
 
 
-def _make_result(brand, asin, image_url, shop_str, sort_key, rank_lines, board_url, list_rank, site_order):
+def _make_result(
+    brand, asin, image_url, shop_str, sort_key, rank_lines,
+    board_url, list_rank, site_order, board_ranks=None,
+):
     """组装一条命中记录 (结构化)。图片行延后到截图阶段再生成 (见 _result_lines)。
 
     board_url / list_rank 用于截图回放: 确定去哪个榜单页、翻到第几页定位卡片。
@@ -473,6 +554,7 @@ def _make_result(brand, asin, image_url, shop_str, sort_key, rank_lines, board_u
         "rank_lines": rank_lines,
         "board_url": board_url,
         "list_rank": list_rank,
+        "board_ranks": board_ranks or {},
     }
 
 
@@ -625,63 +707,74 @@ def _match_brands(site, bestseller_items, new_release_items):
     for brand, shops in BRANDS.items():
         bs_hits = [it for it in bestseller_items if brand_matches(brand, it.get("brand"))]
         nr_hits = [it for it in new_release_items if brand_matches(brand, it.get("brand"))]
+        bs_asins = {it["asin"] for it in bs_hits}
 
         if bs_hits:
-            # 销量榜命中: 用榜单排名, 新品榜排名按同 ASIN 关联
+            # 销量榜命中: 用榜单排名, 仅在同一 ASIN 也出现在新品榜时关联新品榜排名
             for item in bs_hits:
-                shop_str = resolve_shop_name(brand, shops, item)
+                shop_str = resolve_shop_name(brand, shops, item, "销量榜")
                 if shop_str is None:
                     continue
-                nr_item = nr_by_asin.get(item["asin"]) or (nr_hits[0] if nr_hits else None)
+                nr_item = nr_by_asin.get(item["asin"])
                 logger.info("[%s/%s] 销量榜命中 #%s 新品榜#%s asin=%s 店铺=%s",
                             site.name_cn, brand, item["rank"], nr_item["rank"] if nr_item else "-",
                             item["asin"], shop_str)
                 rank_lines = [f"销量榜排名：{item['rank']}"]
+                board_ranks = {"bs": int(item["rank"])}
                 if nr_item:
                     rank_lines.append(f"新品榜排名：{nr_item['rank']}")
+                    board_ranks["nr"] = int(nr_item["rank"])
                 # 既命中销量榜(又可能命中新品榜)→ 统一按销量榜列表页截图
                 results.append(_make_result(brand, item["asin"], item["image_url"], shop_str,
-                                            int(item["rank"]), rank_lines,
-                                            site.bestsellers_url, int(item["rank"]), site.order))
+                                             int(item["rank"]), rank_lines,
+                                             site.bestsellers_url, int(item["rank"]), site.order,
+                                             board_ranks))
 
-        elif nr_hits:
-            # 仅新品榜命中: 销量榜排名取详情页 BSR
-            for nr_item in nr_hits:
-                shop_str = resolve_shop_name(brand, shops, nr_item)
-                if shop_str is None:
-                    continue
-                bsr = nr_item.get("bsr_rank")
-                if not bsr:
-                    logger.error("[%s/%s] 仅新品榜命中但详情页未取到销量榜排名 asin=%s",
-                                 site.name_cn, brand, nr_item["asin"])
-                    print(f"\n品牌: {brand}  ⚠ 详情页未取到销量榜排名 (asin={nr_item['asin']})")
-                    continue
-                logger.info("[%s/%s] 仅新品榜命中 新品榜#%s 销量榜#%s asin=%s 店铺=%s",
-                            site.name_cn, brand, nr_item["rank"], bsr, nr_item["asin"], shop_str)
-                # 仅新品榜命中: 排序键用 BSR, 但截图翻页要用新品榜列表排名
-                results.append(_make_result(
-                    brand, nr_item["asin"], nr_item["image_url"], shop_str, int(bsr),
-                    [f"今日销量榜：{bsr}名", f"新品榜：{nr_item['rank']}名"],
-                    site.new_releases_url, int(nr_item["rank"]), site.order))
+        # 仅新品榜命中: 销量榜排名取详情页 BSR。即使同品牌已有销量榜商品,
+        # 新品榜里的不同 ASIN 也应作为独立商品播报。
+        for nr_item in nr_hits:
+            if nr_item["asin"] in bs_asins:
+                continue
+            shop_str = resolve_shop_name(brand, shops, nr_item, "新品榜")
+            if shop_str is None:
+                continue
+            bsr = nr_item.get("bsr_rank")
+            if not bsr:
+                logger.error("[%s/%s] 仅新品榜命中但详情页未取到销量榜排名 asin=%s",
+                             site.name_cn, brand, nr_item["asin"])
+                print(f"\n品牌: {brand}  ⚠ 详情页未取到销量榜排名 (asin={nr_item['asin']})")
+                continue
+            logger.info("[%s/%s] 仅新品榜命中 新品榜#%s 销量榜#%s asin=%s 店铺=%s",
+                        site.name_cn, brand, nr_item["rank"], bsr, nr_item["asin"], shop_str)
+            # 仅新品榜命中: 排序键用 BSR, 但截图翻页要用新品榜列表排名
+            results.append(_make_result(
+                brand, nr_item["asin"], nr_item["image_url"], shop_str, int(bsr),
+                [f"今日销量榜：{bsr}名", f"新品榜：{nr_item['rank']}名"],
+                site.new_releases_url, int(nr_item["rank"]), site.order,
+                {"nr": int(nr_item["rank"])}))
 
-        else:
+        if not bs_hits and not nr_hits:
             logger.debug("[%s/%s] 销量榜/新品榜均未上榜", site.name_cn, brand)
     return results
 
 
-def _board_stats(bestseller_items, new_release_items):
-    """单站头部"占X席"统计：按榜分别计、双榜各计（同一商品同时上两榜则两边各算一席）。"""
-    def _matches_any(b):
-        return any(brand_matches(k, b) for k in BRANDS)
+def _board_stats_from_results(results):
+    """单站头部"占X席"统计：只统计最终可播报结果里实际关联的榜单席位。"""
+    stats = {"bs_top50": 0, "bs_next50": 0, "nr_top50": 0, "nr_next50": 0}
 
-    def _counts(items):
-        ranks = [int(it["rank"]) for it in items if _matches_any(it.get("brand")) and it["rank"].isdigit()]
-        return sum(1 for r in ranks if r <= 50), sum(1 for r in ranks if 51 <= r <= 100)
+    def add(prefix, rank):
+        if rank is None:
+            return
+        if rank <= 50:
+            stats[f"{prefix}_top50"] += 1
+        elif rank <= 100:
+            stats[f"{prefix}_next50"] += 1
 
-    bs_top50, bs_next50 = _counts(bestseller_items)
-    nr_top50, nr_next50 = _counts(new_release_items)
-    return {"bs_top50": bs_top50, "bs_next50": bs_next50,
-            "nr_top50": nr_top50, "nr_next50": nr_next50}
+    for item in results:
+        board_ranks = item.get("board_ranks") or {}
+        add("bs", board_ranks.get("bs"))
+        add("nr", board_ranks.get("nr"))
+    return stats
 
 
 def _collect_site(site):
@@ -715,7 +808,7 @@ def _collect_site(site):
 
     # 3) 按品牌匹配 + 统计
     results = _match_brands(site, bestseller_items, new_release_items)
-    stats = _board_stats(bestseller_items, new_release_items)
+    stats = _board_stats_from_results(results)
     return results, stats
 
 
