@@ -7,6 +7,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import lark_oapi as lark
@@ -115,6 +116,24 @@ def _strip_stream_cursor(text: str) -> str:
     return text
 
 
+def _infer_feishu_file_type(filename: str) -> str:
+    """将本地文件扩展名映射到飞书 IM 文件上传的 file_type。"""
+    ext = Path(filename).suffix.lower()
+    if ext in {".mp3", ".wav", ".m4a", ".aac", ".amr", ".opus"}:
+        return "opus"
+    if ext in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
+        return "mp4"
+    if ext == ".pdf":
+        return "pdf"
+    if ext in {".doc", ".docx"}:
+        return "doc"
+    if ext in {".xls", ".xlsx", ".csv"}:
+        return "xls"
+    if ext in {".ppt", ".pptx"}:
+        return "ppt"
+    return "stream"
+
+
 class _CardStreamAsyncSink:
     """
     将 CardKit 流式更新放到独立线程：LLM 的 on_update(generating) 立即返回，不再被
@@ -138,7 +157,7 @@ class _CardStreamAsyncSink:
     def feed(self, content: str, status: str) -> None:
         text = _strip_stream_cursor(content)
         with self._cv:
-            if status in ("generating", "tool"):
+            if status in ("generating", "tool", "processing"):
                 if text:
                     self._latest = text
             elif status == "done":
@@ -783,7 +802,7 @@ class FeishuGateway(BaseGateway):
         status: str,
     ) -> None:
         text = _strip_stream_cursor(content)
-        if status in ("generating", "tool"):
+        if status in ("generating", "tool", "processing"):
             if text and text != session.last_pushed_markdown:
                 self._card_stream_push_markdown(session, text)
             return
@@ -919,10 +938,163 @@ class FeishuGateway(BaseGateway):
         self._send_text_message(raw_id, text, receive_id_type=receive_id_type)
 
     def send_file(self, session_key: str, file_path: str, filename: str) -> None:
-        raise NotImplementedError("FeishuGateway.send_file 尚未实现，计划 Phase 2 支持")
+        """
+        向指定飞书会话发送文件。
+
+        飞书 IM 文件消息需要两步：
+          1. 上传本地文件到 /im/v1/files，拿到 file_key
+          2. 通过 /im/v1/messages 发送 msg_type=file 的消息
+        """
+        if session_key.startswith("dingtalk:") or (
+            ":" in session_key and not session_key.startswith("feishu:")
+        ):
+            return
+
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"文件不存在: {file_path}")
+
+        raw_id = session_key.split(":")[-1] if session_key.startswith("feishu:") else session_key
+        receive_id_type = "open_id" if raw_id.startswith("ou_") else "chat_id"
+        display_name = filename or path.name
+
+        try:
+            from lark_oapi.api.im.v1 import (
+                CreateFileRequest,
+                CreateFileRequestBody,
+                CreateMessageRequest,
+                CreateMessageRequestBody,
+            )
+
+            with open(path, "rb") as file_obj:
+                upload_req = (
+                    CreateFileRequest.builder()
+                    .request_body(
+                        CreateFileRequestBody.builder()
+                        .file_type(_infer_feishu_file_type(display_name))
+                        .file_name(display_name)
+                        .file(file_obj)
+                        .build()
+                    )
+                    .build()
+                )
+                upload_resp = self._api_client.im.v1.file.create(upload_req)
+
+            if not upload_resp.success():
+                raise RuntimeError(
+                    "上传飞书文件失败 | "
+                    f"code={upload_resp.code} msg={upload_resp.msg} "
+                    f"log_id={upload_resp.get_log_id()}"
+                )
+
+            file_key = getattr(upload_resp.data, "file_key", "") if upload_resp.data else ""
+            if not file_key:
+                raise RuntimeError("上传飞书文件失败：响应缺少 file_key")
+
+            req = (
+                CreateMessageRequest.builder()
+                .receive_id_type(receive_id_type)
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(raw_id)
+                    .msg_type("file")
+                    .content(json.dumps({"file_key": file_key}, ensure_ascii=False))
+                    .build()
+                )
+                .build()
+            )
+            resp = self._api_client.im.v1.message.create(req)
+            if not resp.success():
+                raise RuntimeError(
+                    "发送飞书文件消息失败 | "
+                    f"code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}"
+                )
+            logger.info(
+                "飞书文件消息发送成功 | filename=%s receive_id=%s type=%s",
+                display_name,
+                raw_id,
+                receive_id_type,
+            )
+        except Exception as exc:
+            logger.error(
+                "send_file 失败 | session_key=%s file=%s error=%s",
+                session_key,
+                file_path,
+                exc,
+            )
+            raise
 
     def send_image_text(self, session_key: str, image_path: str, text: str) -> None:
-        raise NotImplementedError("FeishuGateway.send_image_text 尚未实现，计划 Phase 2 支持")
+        if session_key.startswith("dingtalk:") or (
+            ":" in session_key and not session_key.startswith("feishu:")
+        ):
+            return
+
+        raw_id = session_key.split(":")[-1] if session_key.startswith("feishu:") else session_key
+        receive_id_type = "open_id" if raw_id.startswith("ou_") else "chat_id"
+
+        try:
+            from lark_oapi.api.im.v1 import (
+                CreateImageRequest,
+                CreateImageRequestBody,
+                CreateMessageRequest,
+                CreateMessageRequestBody,
+            )
+
+            with open(image_path, "rb") as image_file:
+                upload_req = (
+                    CreateImageRequest.builder()
+                    .request_body(
+                        CreateImageRequestBody.builder()
+                        .image_type("message")
+                        .image(image_file)
+                        .build()
+                    )
+                    .build()
+                )
+                upload_resp = self._api_client.im.v1.image.create(upload_req)
+            if not upload_resp.success():
+                raise RuntimeError(
+                    "上传飞书图片失败 | "
+                    f"code={upload_resp.code} msg={upload_resp.msg} "
+                    f"log_id={upload_resp.get_log_id()}"
+                )
+
+            image_key = getattr(upload_resp.data, "image_key", "") if upload_resp.data else ""
+            if not image_key:
+                raise RuntimeError("上传飞书图片失败：响应缺少 image_key")
+
+            rows = [[{"tag": "img", "image_key": image_key}]]
+            for line in (text or "").splitlines():
+                rows.append([{"tag": "text", "text": line}])
+            content = {"zh_cn": {"content": rows}}
+
+            req = (
+                CreateMessageRequest.builder()
+                .receive_id_type(receive_id_type)
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(raw_id)
+                    .msg_type("post")
+                    .content(json.dumps(content, ensure_ascii=False))
+                    .build()
+                )
+                .build()
+            )
+            resp = self._api_client.im.v1.message.create(req)
+            if not resp.success():
+                raise RuntimeError(
+                    "发送飞书图文消息失败 | "
+                    f"code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}"
+                )
+        except Exception as exc:
+            logger.error(
+                "send_image_text 失败 | session_key=%s image=%s error=%s",
+                session_key,
+                image_path,
+                exc,
+            )
+            raise
 
     def send_stash_remind_card(self, chat_id: str, file_name: str) -> None:
         """发送超时卡片提醒"""

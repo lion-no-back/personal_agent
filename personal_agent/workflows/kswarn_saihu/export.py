@@ -118,37 +118,47 @@ class SellFoxExporter:
             return int(time.time() * 1000)
 
     def login(self):
-        vcode = self._get_captcha()
-        if not vcode:
-            raise RuntimeError("验证码识别失败，已重试 3 次")
+        last_result = None
+        for attempt in range(3):
+            vcode = self._get_captcha()
+            if not vcode:
+                raise RuntimeError("验证码识别失败，已重试 3 次")
 
-        ts = int(time.time() * 1000)
-        enc_password = aes_ecb_encrypt(f"{self.password}:::{ts}")
+            ts = int(time.time() * 1000)
+            enc_password = aes_ecb_encrypt(f"{self.password}:::{ts}")
 
-        payload_dict = {
-            "sf_u": self.username,
-            "sf_c": vcode,
-            "sf_p": enc_password,
-            "sf_t": 7200,
-            "sf_pz": "20230310",
-            "time": self._get_system_time(),
-        }
-        enc_payload = aes_ecb_encrypt(json.dumps(payload_dict, separators=(",", ":")))
+            payload_dict = {
+                "sf_u": self.username,
+                "sf_c": vcode,
+                "sf_p": enc_password,
+                "sf_t": 7200,
+                "sf_pz": "20230310",
+                "time": self._get_system_time(),
+            }
+            enc_payload = aes_ecb_encrypt(json.dumps(payload_dict, separators=(",", ":")))
 
-        resp = self.session.post(
-            f"{BASE_URL}/api/loginEncrypt.json",
-            data=f'"{enc_payload}"',
-            timeout=10,
-        )
-        result = resp.json()
-        print(f"[*] 登录响应: {result}")
+            resp = self.session.post(
+                f"{BASE_URL}/api/loginEncrypt.json",
+                data=f'"{enc_payload}"',
+                timeout=10,
+            )
+            result = resp.json()
+            last_result = result
+            print(f"[*] 登录响应: {result}")
 
-        code = result.get("code")
-        msg = str(result.get("msg") or "")
-        if code in (0, 200) or "成功" in msg:
-            print("[+] 登录成功")
-        else:
+            code = result.get("code")
+            msg = str(result.get("msg") or "")
+            if code in (0, 200) or "成功" in msg:
+                print("[+] 登录成功")
+                return
+            if code == -4 or "验证码" in msg:
+                if attempt < 2:
+                    print(f"[*] 验证码被服务端拒绝，刷新后重试登录（第 {attempt + 2}/3 次）")
+                    time.sleep(1)
+                    continue
             raise RuntimeError(f"登录失败: {result}")
+
+        raise RuntimeError(f"登录失败: {last_result}")
 
     # ── 店铺列表 ──────────────────────────────────────────────────────────────
 
