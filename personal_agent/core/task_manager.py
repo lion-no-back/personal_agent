@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
 
+from .telemetry import emit_event, set_trace_context
+
 logger = logging.getLogger(__name__)
 
 
@@ -87,6 +89,14 @@ class TaskManager:
                 session_key=session_key,
                 description=description,
             )
+            set_trace_context(task_id=task_id, session_key=session_key)
+            emit_event(
+                "task.started",
+                source="task_manager",
+                status="ok",
+                task_id=task_id,
+                session_key=session_key,
+            )
             logger.debug(f"📌 任务已创建 | {task_id} session={session_key}")
             return task_id
 
@@ -97,6 +107,13 @@ class TaskManager:
                 task = self._tasks[task_id]
                 task.status = TaskStatus.DONE
                 task.finished_at = time.monotonic()
+                emit_event(
+                    "task.completed",
+                    source="task_manager",
+                    status="ok",
+                    task_id=task_id,
+                    duration_ms=int(task.elapsed * 1000),
+                )
                 logger.debug(f"✅ 任务完成 | {task_id} elapsed={task.elapsed:.1f}s")
             self._trim()
 
@@ -108,6 +125,14 @@ class TaskManager:
                 task.status = TaskStatus.ERROR
                 task.error = error[:200]  # 截断过长的错误信息
                 task.finished_at = time.monotonic()
+                emit_event(
+                    "task.failed",
+                    source="task_manager",
+                    status="error",
+                    task_id=task_id,
+                    duration_ms=int(task.elapsed * 1000),
+                    attrs={"error_type": "TaskError"},
+                )
                 logger.debug(f"❌ 任务失败 | {task_id} error={error[:50]}")
             self._trim()
 
@@ -118,6 +143,13 @@ class TaskManager:
                 task = self._tasks[task_id]
                 task.status = TaskStatus.CANCELLED
                 task.finished_at = time.monotonic()
+                emit_event(
+                    "task.cancelled",
+                    source="task_manager",
+                    status="cancelled",
+                    task_id=task_id,
+                    duration_ms=int(task.elapsed * 1000),
+                )
                 logger.debug("⛔ 任务已取消 | %s", task_id)
             self._trim()
 

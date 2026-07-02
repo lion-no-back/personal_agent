@@ -6,6 +6,7 @@ import time
 import json
 import contextvars
 import concurrent.futures
+from datetime import datetime
 from typing import Callable, Optional
 
 from ..core.json_repair import repair_tool_arguments
@@ -61,6 +62,40 @@ _LLM_AUTH_USER_MESSAGE = (
     "<text_tag color='neutral'>LLM_BASE_URL</text_tag> 是否属于同一服务商且填写正确，"
     "修改后需重启服务。"
 )
+
+_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+
+def _build_runtime_context_block(now: datetime | None = None) -> str:
+    current = now or datetime.now().astimezone()
+    if current.tzinfo is None:
+        current = current.astimezone()
+    timezone_name = getattr(current.tzinfo, "key", None) or current.tzname() or "local"
+    return (
+        "[Runtime context]\n"
+        f"Current date: {current:%Y-%m-%d}\n"
+        f"Current weekday: {_WEEKDAYS[current.weekday()]}\n"
+        f"Current time: {current:%H:%M:%S}\n"
+        f"Current timezone: {timezone_name}\n"
+        "Interpret relative time words such as today, tomorrow, yesterday, this week, "
+        "last week, this year, recently, and their Chinese equivalents against this date.\n"
+        "For time-sensitive current-world facts such as sports events, odds, schedules, "
+        "prices, laws, rankings, releases, or public roles, do not rely on stale model "
+        "memory. Use available search or knowledge tools when current precision matters; "
+        "if no current source is available, say what is uncertain."
+    )
+
+
+def _inject_runtime_context(
+    messages: list[dict],
+    now: datetime | None = None,
+) -> list[dict]:
+    block = _build_runtime_context_block(now)
+    copied = [dict(message) for message in messages]
+    if copied and copied[0].get("role") == "system":
+        copied[0]["content"] = f"{copied[0].get('content') or ''}\n\n{block}"
+        return copied
+    return [{"role": "system", "content": block}, *copied]
 
 
 def _is_llm_auth_error(exc: BaseException) -> bool:
@@ -239,6 +274,7 @@ class ConversationAgent(BaseAgent):
         while remaining > 0 and i < turns_hard:
             # ── 4. 组装完整 messages（含历史） ───────────────────
             messages = self._context.get_messages(session_key)
+            messages = _inject_runtime_context(messages)
             
             # ── 4.5. 瞬态注入记忆块到 system message ────────────
             if memory_block and messages:

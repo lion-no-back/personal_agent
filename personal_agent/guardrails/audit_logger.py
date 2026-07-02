@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from personal_agent.core.telemetry import emit_event
+
 from .types import Action, AuditEvent, Confidence
 
 logger = logging.getLogger(__name__)
@@ -141,6 +143,20 @@ class GuardrailAuditLogger:
             sanitized_preview=sanitized_preview[:120],
         )
         self.log(event)
+        if str(action).upper() == "BLOCKED":
+            emit_event(
+                "guardrail.blocked",
+                source="guardrail_audit",
+                status="blocked",
+                session_key=session_key,
+                attrs={
+                    "layer": layer,
+                    "rule": rule,
+                    "action": action,
+                    "confidence": confidence,
+                    "sanitized_preview": sanitized_preview,
+                },
+            )
 
     def emit_blocked(
         self,

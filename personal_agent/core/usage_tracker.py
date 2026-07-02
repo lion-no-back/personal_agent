@@ -26,6 +26,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from . import model_metadata
+from .telemetry import emit_event
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +259,20 @@ class UsageTracker:
                     ),
                 )
                 self._conn.commit()
+            emit_event(
+                "usage.recorded",
+                source="usage_tracker",
+                status="ok",
+                attrs={
+                    "model": model,
+                    "source": source,
+                    "in_tokens": in_tokens or 0,
+                    "out_tokens": out_tokens or 0,
+                    "cache_read_tokens": cache_read_tokens or 0,
+                    "cost_usd": cost_usd,
+                    "unpriced": bool(unpriced),
+                },
+            )
         except Exception as e:
             logger.warning("UsageTracker.record 失败 | user=%s model=%s err=%s", user_id, model, e)
 
