@@ -210,12 +210,7 @@ class ConversationAgent(BaseAgent):
             AI 生成的完整回复文本；指令场景直接返回指令响应文本
         """
         # ── 1. 计算会话 Key ──────────────────────────────────
-        session_key = ConversationContext.build_session_key(
-            chat_type=event.chat_type,
-            sender_open_id=event.sender_open_id,
-            chat_id=event.chat_id,
-            thread_id=event.thread_id,
-        )
+        session_key = self._build_session_key(event)
 
         if self._interaction_logger:
             self._interaction_logger.log_session_start(
@@ -501,17 +496,45 @@ class ConversationAgent(BaseAgent):
     # ──────────────────────────────────────────────────────────
 
     @staticmethod
+    def _build_session_key(event) -> str:
+        """生成 Agent 感知的会话 key，避免多机器人/多 Agent 共享历史。"""
+        base_key = ConversationContext.build_session_key(
+            chat_type=event.chat_type,
+            sender_open_id=event.sender_open_id,
+            chat_id=event.chat_id,
+            thread_id=event.thread_id,
+        )
+        account_id = getattr(event, "account_id", "")
+        agent_id = getattr(event, "agent_id", "")
+        if account_id and agent_id:
+            return f"agent_{agent_id}_dingtalk_{account_id}_{base_key}"
+        if agent_id:
+            return f"agent_{agent_id}_{base_key}"
+        return base_key
+
+    @staticmethod
     def _derive_delivery_key(event) -> str:
         """从任意平台的 event 推导 gateway-compatible 投递 key。"""
         chat_id = getattr(event, "chat_id", "")
         sender_id = getattr(event, "sender_open_id", "")
         chat_type = getattr(event, "chat_type", "p2p")
+        account_id = getattr(event, "account_id", "")
 
         if chat_id.startswith("dingtalk_"):
             if chat_type == "group":
-                return f"dingtalk:group:{chat_id[len('dingtalk_'):]}"
+                raw_id = chat_id[len("dingtalk_"):]
+                return (
+                    f"dingtalk:{account_id}:group:{raw_id}"
+                    if account_id
+                    else f"dingtalk:group:{raw_id}"
+                )
             else:
-                return f"dingtalk:user:{sender_id[len('dingtalk_'):]}"
+                raw_id = sender_id[len("dingtalk_"):]
+                return (
+                    f"dingtalk:{account_id}:user:{raw_id}"
+                    if account_id
+                    else f"dingtalk:user:{raw_id}"
+                )
         else:
             # 飞书：raw ID 兼容 send_text
             return chat_id if chat_type == "group" else sender_id

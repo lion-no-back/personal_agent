@@ -162,7 +162,14 @@ def _load_channels_config(project_root: Path) -> dict:
         return {"feishu": {"enabled": True}}
 
 
-def _build_gateways(project_root, agent, context, task_manager, file_stash) -> list:
+def _build_gateways(
+    project_root,
+    agents: dict,
+    contexts: dict,
+    task_manager,
+    file_stash,
+    binding_config,
+) -> list:
     """
     按 channels.yaml 的启用配置，逐个实例化 gateway。
     初始化失败时记录错误并跳过（不中断其他 gateway 的启动）。
@@ -171,6 +178,8 @@ def _build_gateways(project_root, agent, context, task_manager, file_stash) -> l
 
     channels = _load_channels_config(project_root)
     gateways: list[BaseGateway] = []
+    default_agent = agents["default"]
+    default_context = contexts["default"]
 
     if channels.get("feishu", {}).get("enabled", False):
         # 飞书首次配置向导
@@ -180,23 +189,45 @@ def _build_gateways(project_root, agent, context, task_manager, file_stash) -> l
             if not run_feishu_setup_wizard():
                 logger.error("❌ 飞书配置未完成，跳过飞书 gateway")
             else:
-                _try_add_feishu(gateways, agent, context, task_manager, file_stash)
+                _try_add_feishu(gateways, default_agent, default_context, task_manager, file_stash)
         else:
-            _try_add_feishu(gateways, agent, context, task_manager, file_stash)
+            _try_add_feishu(gateways, default_agent, default_context, task_manager, file_stash)
 
     if channels.get("dingtalk", {}).get("enabled", False):
-        try:
-            from personal_agent.gateway.dingtalk_gateway import DingTalkGateway
-            gw = DingTalkGateway(
-                agent=agent,
-                context=context,
-                task_manager=task_manager,
-                file_stash=file_stash,
-            )
-            gateways.append(gw)
-            logger.info("✅ DingTalkGateway 就绪")
-        except Exception as e:
-            logger.error("❌ 钉钉网关初始化失败: %s", e)
+        from personal_agent.gateway.dingtalk_gateway import DingTalkGateway
+
+        for account in binding_config.dingtalk_accounts:
+            client_id = account.client_id
+            client_secret = account.client_secret
+            if not client_id or not client_secret:
+                logger.error(
+                    "❌ 钉钉账号 %s 缺少凭证，跳过 | client_id_env=%s client_secret_env=%s",
+                    account.account_id,
+                    account.client_id_env,
+                    account.client_secret_env,
+                )
+                continue
+            try:
+                agent = agents.get(account.agent_id) or default_agent
+                context = contexts.get(account.agent_id) or default_context
+                gw = DingTalkGateway(
+                    agent=agent,
+                    context=context,
+                    task_manager=task_manager,
+                    file_stash=file_stash,
+                    account_id=account.account_id,
+                    agent_id=account.agent_id,
+                    client_id=client_id,
+                    client_secret=client_secret,
+                )
+                gateways.append(gw)
+                logger.info(
+                    "✅ DingTalkGateway 就绪 | account=%s agent=%s",
+                    account.account_id,
+                    account.agent_id,
+                )
+            except Exception as e:
+                logger.error("❌ 钉钉网关初始化失败 | account=%s error=%s", account.account_id, e)
 
     return gateways
 
@@ -275,9 +306,17 @@ def main() -> None:
     # max_history 读取 .env 中的 AGENT_MAX_HISTORY，默认 20 条
     # 自动融合读取 .env 中的 AGENT_SYSTEM_PROMPT 以及项目的 AGENTS.md 约束
     from personal_agent.context.conversation_context import ConversationContext
+    from personal_agent.routing import load_agent_binding_config
     import re
 
     import platform
+
+    binding_config = load_agent_binding_config(_PROJECT_ROOT)
+    logger.info(
+        "✅ Agent 绑定配置就绪 | agents=%s dingtalk_accounts=%s",
+        ",".join(binding_config.agents.keys()),
+        ",".join(a.account_id for a in binding_config.dingtalk_accounts) or "-",
+    )
 
     extra_prompts = []
 
@@ -327,13 +366,7 @@ def main() -> None:
         logger.info("未发现任何 SKILL.md，技能列表为空")
         skill_bodies = {}
 
-    context = ConversationContext(
-        # AGENT_MAX_HISTORY 现仅为内存保留条数上限；发给模型的真正约束是
-        # token 预算（按模型上下文动态解析），默认放宽到 200 让记忆更长。
-        max_history=int(os.getenv("AGENT_MAX_HISTORY", "200")),
-        extra_system_prompt="\n\n".join(extra_prompts) if extra_prompts else None,
-    )
-    logger.info("✅ ConversationContext 就绪")
+    base_extra_system_prompt = "\n\n".join(extra_prompts) if extra_prompts else None
 
     # ── Step 5: 初始化后台任务管理器 ─────────────────────────
     from personal_agent.core.task_manager import TaskManager
@@ -353,7 +386,7 @@ def main() -> None:
     logger.info("✅ GuardrailAuditLogger 就绪 | path=%s", logs_dir / "guardrail_audit.jsonl")
 
     # ── Step 6: 初始化对话 Agent ─────────────────────────────
-    # card_update_interval 读取 .env 中的 CARD_UPDATE_INTERVAL，默认 0.5s
+    # 为每个配置 Agent 创建独立 ConversationContext，从会话历史层面隔离。
     from personal_agent.agents.conversation_agent import ConversationAgent
     from personal_agent.core.request_scorer import RequestScorer
 
@@ -363,16 +396,31 @@ def main() -> None:
     )
     scorer = RequestScorer(strategy=_routing_mode, threshold_override=_routing_threshold)
 
-    agent = ConversationAgent(
-        llm=llm,
-        context=context,
-        card_update_interval=float(os.getenv("CARD_UPDATE_INTERVAL", "0.5")),
-        task_manager=task_manager,
-        interaction_logger=interaction_logger,
-        skill_bodies=skill_bodies,
-        scorer=scorer,
-    )
-    logger.info("✅ ConversationAgent 就绪")
+    contexts: dict[str, ConversationContext] = {}
+    agents: dict[str, ConversationAgent] = {}
+    for agent_id, agent_cfg in binding_config.agents.items():
+        prompt_parts = [p for p in (base_extra_system_prompt, agent_cfg.resolved_system_prompt) if p]
+        context = ConversationContext(
+            # AGENT_MAX_HISTORY 现仅为内存保留条数上限；发给模型的真正约束是
+            # token 预算（按模型上下文动态解析），默认放宽到 200 让记忆更长。
+            max_history=int(os.getenv("AGENT_MAX_HISTORY", "200")),
+            extra_system_prompt="\n\n".join(prompt_parts) if prompt_parts else None,
+        )
+        agent = ConversationAgent(
+            llm=llm,
+            context=context,
+            card_update_interval=float(os.getenv("CARD_UPDATE_INTERVAL", "0.5")),
+            task_manager=task_manager,
+            interaction_logger=interaction_logger,
+            skill_bodies=skill_bodies,
+            scorer=scorer,
+        )
+        contexts[agent_id] = context
+        agents[agent_id] = agent
+        logger.info("✅ ConversationAgent 就绪 | agent=%s name=%s", agent_id, agent_cfg.name)
+
+    context = contexts["default"]
+    agent = agents["default"]
 
     # ── Step 6.5: 初始化记忆模块 ─────────────────────────────
     from personal_agent.memory import MemoryModule
@@ -380,7 +428,8 @@ def main() -> None:
     memory_store_dir = _PROJECT_ROOT / os.getenv("MEMORY_STORE_DIR", "memory_store")
     memory_module = MemoryModule(store_dir=memory_store_dir, llm=llm)
     memory_module.start()
-    agent.set_memory(memory_module)
+    for agent_instance in agents.values():
+        agent_instance.set_memory(memory_module)
     logger.info("✅ MemoryModule 就绪 | 存储目录: %s", memory_store_dir)
 
     # ── Step 6.6: 初始化文件暂存管理器 ───────────────────────
@@ -397,7 +446,7 @@ def main() -> None:
     from personal_agent.gateway.base_gateway import BaseGateway
 
     gateways: list[BaseGateway] = _build_gateways(
-        _PROJECT_ROOT, agent, context, task_manager, file_stash
+        _PROJECT_ROOT, agents, contexts, task_manager, file_stash, binding_config
     )
     if not gateways:
         logger.error("❌ 没有任何 gateway 启用，请检查 config/channels.yaml")
@@ -439,10 +488,11 @@ def main() -> None:
             except Exception as exc:
                 logger.error("%s.send_image_text 失败: %s", gw.platform, exc)
 
-    agent._notify_fn = _broadcast_notify
-    agent._send_file_fn = _broadcast_send_file
-    agent._send_image_text_fn = _broadcast_send_image_text
-    logger.info("✅ 按需 workflow 投递回调已注入 Agent")
+    for agent_instance in agents.values():
+        agent_instance._notify_fn = _broadcast_notify
+        agent_instance._send_file_fn = _broadcast_send_file
+        agent_instance._send_image_text_fn = _broadcast_send_image_text
+    logger.info("✅ 按需 workflow 投递回调已注入 Agent | count=%d", len(agents))
 
     scheduler = SchedulerDaemon(
         config_path=_PROJECT_ROOT / "config" / "scheduler.yaml"

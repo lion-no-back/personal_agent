@@ -66,6 +66,8 @@ class DingTalkMessageEvent:
     attached_files: list = field(default_factory=list)
     images: list = field(default_factory=list)
     is_scheduled: bool = field(default=False)
+    account_id: str = "default"
+    agent_id: str = "default"
 
 logger = logging.getLogger(__name__)
 
@@ -671,15 +673,22 @@ class DingTalkGateway(BaseGateway):
         context: "ConversationContext",
         task_manager: Optional["TaskManager"] = None,
         file_stash=None,
+        *,
+        account_id: str = "default",
+        agent_id: str = "default",
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
     ) -> None:
-        client_id = os.getenv("DINGTALK_CLIENT_ID", "")
-        client_secret = os.getenv("DINGTALK_CLIENT_SECRET", "")
+        client_id = client_id if client_id is not None else os.getenv("DINGTALK_CLIENT_ID", "")
+        client_secret = client_secret if client_secret is not None else os.getenv("DINGTALK_CLIENT_SECRET", "")
         if not client_id or not client_secret:
             raise ValueError(
-                "DINGTALK_CLIENT_ID 和 DINGTALK_CLIENT_SECRET 为必填项，"
-                "请在 .env 文件中定义。"
+                f"钉钉账号 {account_id} 缺少 client_id/client_secret，"
+                "请检查 config/channels.yaml 与 .env。"
             )
 
+        self._account_id = account_id or "default"
+        self._agent_id = agent_id or "default"
         self._client_id = client_id
         self._client_secret = client_secret
         self._agent = agent
@@ -693,13 +702,16 @@ class DingTalkGateway(BaseGateway):
         if self._access.is_open:
             logger.warning(
                 "DINGTALK_ALLOWED_USERS 未配置，任何人均可触发机器人。"
-                "建议在 .env 中设置白名单。"
+                "建议在 .env 中设置白名单。 | account=%s agent=%s",
+                self._account_id,
+                self._agent_id,
             )
 
         max_workers = int(os.getenv("DINGTALK_MAX_WORKERS", "10"))
+        safe_account_id = self._safe_log_token(self._account_id)
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
-            thread_name_prefix="dingtalk-worker",
+            thread_name_prefix=f"dingtalk-{safe_account_id}-worker",
         )
 
         # 会话级串行锁：防止同一会话并发写共享上下文
@@ -710,7 +722,7 @@ class DingTalkGateway(BaseGateway):
         # 2) 磁盘表 _card_store：落盘 out_track_id，供下次启动 _recover_pending_cards() 兜底，
         #    覆盖 atexit 兜不住的 kill -9 / 崩溃 / 断电场景，避免卡片永久卡在「处理中/输出中」。
         self._pending_cards: dict[str, Callable[[], str]] = {}
-        self._card_store = _PendingCardStore(_ACTIVE_CARDS_FILE)
+        self._card_store = _PendingCardStore(self._active_cards_file())
         # 自建 AI 卡片模式开关：配了 DINGTALK_AI_CARD_TEMPLATE_ID 才启用，否则回退社区模板。
         self._ai_card_mode = bool(_AI_CARD_TEMPLATE_ID)
         atexit.register(self._finalize_pending_cards)
@@ -731,7 +743,12 @@ class DingTalkGateway(BaseGateway):
         self._stream_client.register_callback_handler(
             dingtalk_stream.chatbot.ChatbotMessage.TOPIC, handler
         )
-        logger.info("DingTalkGateway 初始化完成 | client_id=%s", client_id[:8] + "***")
+        logger.info(
+            "DingTalkGateway 初始化完成 | account=%s agent=%s client_id=%s",
+            self._account_id,
+            self._agent_id,
+            client_id[:8] + "***",
+        )
 
     # ──────────────────────────────────────────────────────────
     #   BaseGateway 接口实现
@@ -739,7 +756,7 @@ class DingTalkGateway(BaseGateway):
 
     @property
     def platform(self) -> str:
-        return "dingtalk"
+        return f"dingtalk:{self._account_id}"
 
     def start(self) -> None:
         """
@@ -747,16 +764,32 @@ class DingTalkGateway(BaseGateway):
         连接断开后按指数退避（2→5→10→30→60s）自动重连，连接稳定超过 60s 则重置计数。
         """
         self._recover_pending_cards()
-        logger.info("🚀 PersonalAgent 钉钉网关已启动，等待消息...")
-        print("🚀 PersonalAgent 钉钉网关已启动，等待消息...", flush=True)
+        logger.info(
+            "🚀 PersonalAgent 钉钉网关已启动，等待消息 | account=%s agent=%s",
+            self._account_id,
+            self._agent_id,
+        )
+        print(
+            f"🚀 PersonalAgent 钉钉网关已启动，等待消息 | account={self._account_id} agent={self._agent_id}",
+            flush=True,
+        )
         attempt = 0
         while True:
             connect_start = time.monotonic()
             try:
                 self._stream_client.start_forever()
-                logger.warning("钉钉 start_forever() 意外返回，将自动重连")
+                logger.warning(
+                    "钉钉 start_forever() 意外返回，将自动重连 | account=%s agent=%s",
+                    self._account_id,
+                    self._agent_id,
+                )
             except Exception as exc:
-                logger.error("钉钉连接断开: %s", exc)
+                logger.error(
+                    "钉钉连接断开 | account=%s agent=%s error=%s",
+                    self._account_id,
+                    self._agent_id,
+                    exc,
+                )
 
             # 连接稳定超过 60s，视为正常断线，重置退避计数
             if time.monotonic() - connect_start > 60:
@@ -764,7 +797,13 @@ class DingTalkGateway(BaseGateway):
 
             delay = _RECONNECT_DELAYS[min(attempt, len(_RECONNECT_DELAYS) - 1)]
             attempt += 1
-            logger.info("第 %d 次重连，%ds 后重试...", attempt, delay)
+            logger.info(
+                "钉钉第 %d 次重连，%ds 后重试 | account=%s agent=%s",
+                attempt,
+                delay,
+                self._account_id,
+                self._agent_id,
+            )
             time.sleep(delay)
             self._recreate_stream_client()
 
@@ -778,17 +817,20 @@ class DingTalkGateway(BaseGateway):
           - 其他前缀（feishu:* 等）        → 跳过，多网关广播时的非本平台 key
           - 原始 ID（无 : 或非 dingtalk:） → 跳过（飞书原始 ID 传入时不处理）
         """
-        if not session_key.startswith("dingtalk:"):
+        parsed = self._parse_delivery_key(session_key)
+        if parsed is None:
             return
-        parts = session_key.split(":", 2)
-        if len(parts) != 3:
-            logger.warning("send_text: 无效 session_key=%s", session_key)
-            return
-        _, id_type, raw_id = parts
+        id_type, raw_id = parsed
         try:
             self._send_markdown_via_api(id_type, raw_id, text)
         except Exception as e:
-            logger.error("send_text 失败 | session_key=%s error=%s", session_key, e)
+            logger.error(
+                "send_text 失败 | account=%s agent=%s session_key=%s error=%s",
+                self._account_id,
+                self._agent_id,
+                session_key,
+                e,
+            )
 
     def send_file(self, session_key: str, file_path: str, filename: str) -> None:
         """
@@ -798,18 +840,22 @@ class DingTalkGateway(BaseGateway):
 
         session_key 路由同 send_text，非 dingtalk: 前缀直接跳过。
         """
-        if not session_key.startswith("dingtalk:"):
+        parsed = self._parse_delivery_key(session_key)
+        if parsed is None:
             return
-        parts = session_key.split(":", 2)
-        if len(parts) != 3:
-            logger.warning("send_file: 无效 session_key=%s", session_key)
-            return
-        _, id_type, raw_id = parts
+        id_type, raw_id = parsed
         try:
             media_id = self._media_client.upload(file_path)
             self._send_file_via_api(id_type, raw_id, media_id, filename)
         except Exception as e:
-            logger.error("send_file 失败 | session_key=%s error=%s", session_key, e)
+            logger.error(
+                "send_file 失败 | account=%s agent=%s session_key=%s filename=%s error=%s",
+                self._account_id,
+                self._agent_id,
+                session_key,
+                filename,
+                e,
+            )
 
     def send_image_text(self, session_key: str, image_path: str, text: str) -> None:
         """
@@ -822,19 +868,23 @@ class DingTalkGateway(BaseGateway):
 
         session_key 路由同 send_text，非 dingtalk: 前缀直接跳过。
         """
-        if not session_key.startswith("dingtalk:"):
+        parsed = self._parse_delivery_key(session_key)
+        if parsed is None:
             return
-        parts = session_key.split(":", 2)
-        if len(parts) != 3:
-            logger.warning("send_image_text: 无效 session_key=%s", session_key)
-            return
-        _, id_type, raw_id = parts
+        id_type, raw_id = parsed
         try:
             media_id = self._media_client.upload(image_path)
             markdown = f"![]({media_id})\n\n{text}" if text else f"![]({media_id})"
             self._send_markdown_via_api(id_type, raw_id, markdown)
         except Exception as e:
-            logger.error("send_image_text 失败 | session_key=%s error=%s", session_key, e)
+            logger.error(
+                "send_image_text 失败 | account=%s agent=%s session_key=%s image=%s error=%s",
+                self._account_id,
+                self._agent_id,
+                session_key,
+                image_path,
+                e,
+            )
 
     # ──────────────────────────────────────────────────────────
     #   消息派发（由 _MessageHandler 调用）
@@ -846,15 +896,23 @@ class DingTalkGateway(BaseGateway):
         卡片创建（POST createAndDeliver）在回调里同步完成，用户立即看到占位卡片。
         """
         if self._context.is_processed(incoming.message_id):
-            logger.debug("重复消息，跳过 | message_id=%s", incoming.message_id)
+            logger.debug(
+                "重复消息，跳过 | account=%s agent=%s message_id=%s",
+                self._account_id,
+                self._agent_id,
+                incoming.message_id,
+            )
             return
         self._context.mark_processed(incoming.message_id)
 
         # 白名单检查：配置了 DINGTALK_ALLOWED_USERS 时，不在列表中的用户静默拒绝
         if not self._access.is_allowed(incoming.sender_staff_id):
             logger.warning(
-                "拒绝未授权用户 | staffId=%s nick=%s",
-                incoming.sender_staff_id, incoming.sender_nick,
+                "拒绝未授权用户 | account=%s agent=%s staffId=%s nick=%s",
+                self._account_id,
+                self._agent_id,
+                incoming.sender_staff_id,
+                incoming.sender_nick,
             )
             return
 
@@ -869,6 +927,16 @@ class DingTalkGateway(BaseGateway):
 
         session_key = self._compute_session_key(event)
         lock = self._run_locks.get(session_key)
+        logger.info(
+            "钉钉消息入队 | account=%s agent=%s session=%s message_id=%s chat_type=%s sender=%s renderer=%s",
+            self._account_id,
+            self._agent_id,
+            session_key,
+            incoming.message_id,
+            event.chat_type,
+            incoming.sender_staff_id,
+            "card" if renderer else "webhook",
+        )
         self._executor.submit(self._handle, event, incoming, session_key, lock, renderer)
 
     def _try_create_renderer(self, incoming: "ChatbotMessage") -> "DingTalkCardRenderer | None":
@@ -1026,7 +1094,22 @@ class DingTalkGateway(BaseGateway):
         )
         try:
             with lock:
+                logger.info(
+                    "钉钉消息开始处理 | account=%s agent=%s session=%s message_id=%s thread=%s",
+                    self._account_id,
+                    self._agent_id,
+                    session_key,
+                    incoming.message_id,
+                    threading.current_thread().name,
+                )
                 self._process(event, incoming, session_key, renderer)
+                logger.info(
+                    "钉钉消息处理完成 | account=%s agent=%s session=%s message_id=%s",
+                    self._account_id,
+                    self._agent_id,
+                    session_key,
+                    incoming.message_id,
+                )
         finally:
             reset_current_user(_user_token)
 
@@ -1046,7 +1129,13 @@ class DingTalkGateway(BaseGateway):
                 self._agent.process(event, on_update=renderer.on_update, keep_thinking=False)
             except Exception as e:
                 logger.error(
-                    "Agent 处理失败 | session_key=%s error=%s", session_key, e, exc_info=True
+                    "Agent 处理失败 | account=%s agent=%s session=%s message_id=%s error=%s",
+                    self._account_id,
+                    self._agent_id,
+                    session_key,
+                    incoming.message_id,
+                    e,
+                    exc_info=True,
                 )
                 renderer.fail()
         else:
@@ -1061,7 +1150,13 @@ class DingTalkGateway(BaseGateway):
                 self._agent.process(event, on_update=on_update)
             except Exception as e:
                 logger.error(
-                    "Agent 处理失败 | session_key=%s error=%s", session_key, e, exc_info=True
+                    "Agent 处理失败 | account=%s agent=%s session=%s message_id=%s error=%s",
+                    self._account_id,
+                    self._agent_id,
+                    session_key,
+                    incoming.message_id,
+                    e,
+                    exc_info=True,
                 )
                 self._reply_markdown(incoming, f"处理出错：{e}")
                 return
@@ -1077,7 +1172,12 @@ class DingTalkGateway(BaseGateway):
     def _reply_markdown(self, incoming: "ChatbotMessage", text: str) -> None:
         """通过 sessionWebhook 直接回复，无需 token，群/单聊统一。"""
         if not incoming.session_webhook:
-            logger.warning("session_webhook 为空，无法回复")
+            logger.warning(
+                "session_webhook 为空，无法回复 | account=%s agent=%s message_id=%s",
+                self._account_id,
+                self._agent_id,
+                incoming.message_id,
+            )
             return
         # sessionWebhook 有过期时间（通常 1 小时），正常情况处理完毕前不会过期
         # sessionWebhook markdown 与卡片旧版变量同等限制，统一格式化后发送
@@ -1097,9 +1197,21 @@ class DingTalkGateway(BaseGateway):
             resp.raise_for_status()
             result = resp.json()
             if result.get("errcode", 0) != 0:
-                logger.error("sessionWebhook 回复失败: %s", result)
+                logger.error(
+                    "sessionWebhook 回复失败 | account=%s agent=%s message_id=%s result=%s",
+                    self._account_id,
+                    self._agent_id,
+                    incoming.message_id,
+                    result,
+                )
         except Exception as e:
-            logger.error("sessionWebhook 发送异常: %s", e)
+            logger.error(
+                "sessionWebhook 发送异常 | account=%s agent=%s message_id=%s error=%s",
+                self._account_id,
+                self._agent_id,
+                incoming.message_id,
+                e,
+            )
 
     def _react(self, incoming: "ChatbotMessage") -> None:
         """
@@ -1124,7 +1236,13 @@ class DingTalkGateway(BaseGateway):
             )
             resp.raise_for_status()
         except Exception as e:
-            logger.warning("表情回复失败 | error=%s", e)
+            logger.warning(
+                "表情回复失败 | account=%s agent=%s message_id=%s error=%s",
+                self._account_id,
+                self._agent_id,
+                incoming.message_id,
+                e,
+            )
 
     def _send_markdown_via_api(self, id_type: str, raw_id: str, text: str) -> None:
         """通过 OpenAPI 主动发 Markdown 消息（send_text 后端，需 api token）。"""
@@ -1151,6 +1269,13 @@ class DingTalkGateway(BaseGateway):
         data = resp.json()
         if "processQueryKey" not in data and data.get("code"):
             raise RuntimeError(f"API 发消息失败: {data}")
+        logger.info(
+            "文本消息发送成功 | account=%s agent=%s id_type=%s raw_id=%s",
+            self._account_id,
+            self._agent_id,
+            id_type,
+            raw_id,
+        )
 
     def _send_file_via_api(
         self, id_type: str, raw_id: str, media_id: str, filename: str
@@ -1181,7 +1306,14 @@ class DingTalkGateway(BaseGateway):
         data = resp.json()
         if "processQueryKey" not in data and data.get("code"):
             raise RuntimeError(f"API 发文件失败: {data}")
-        logger.info("文件消息发送成功 | filename=%s id_type=%s", filename, id_type)
+        logger.info(
+            "文件消息发送成功 | account=%s agent=%s filename=%s id_type=%s raw_id=%s",
+            self._account_id,
+            self._agent_id,
+            filename,
+            id_type,
+            raw_id,
+        )
 
     # ──────────────────────────────────────────────────────────
     #   api token 管理（api.dingtalk.com，独立于 oapi token）
@@ -1225,17 +1357,51 @@ class DingTalkGateway(BaseGateway):
             content=content,
             sender_open_id=f"dingtalk_{incoming.sender_staff_id}",
             sender_name=incoming.sender_nick or "异常",
+            account_id=self._account_id,
+            agent_id=self._agent_id,
         )
 
     def _compute_session_key(self, event: DingTalkMessageEvent) -> str:
         """与 ConversationAgent 内部保持一致，用同一套 build_session_key 计算。"""
         from ..context.conversation_context import ConversationContext
-        return ConversationContext.build_session_key(
+        base_key = ConversationContext.build_session_key(
             chat_type=event.chat_type,
             sender_open_id=event.sender_open_id,
             chat_id=event.chat_id,
             thread_id=event.thread_id,
         )
+        return f"agent_{event.agent_id}_dingtalk_{event.account_id}_{base_key}"
+
+    def _parse_delivery_key(self, session_key: str) -> tuple[str, str] | None:
+        """解析主动投递 key，确保多钉钉账号只由绑定的 Gateway 发送。"""
+        if not session_key.startswith("dingtalk:"):
+            return None
+        parts = session_key.split(":", 3)
+        if len(parts) == 3:
+            if self._account_id != "default":
+                return None
+            _, id_type, raw_id = parts
+        elif len(parts) == 4:
+            _, account_id, id_type, raw_id = parts
+            if account_id != self._account_id:
+                return None
+        else:
+            logger.warning("无效 dingtalk 投递 key=%s", session_key)
+            return None
+        if id_type not in {"group", "user"} or not raw_id:
+            logger.warning("无效 dingtalk 投递 key=%s", session_key)
+            return None
+        return id_type, raw_id
+
+    def _active_cards_file(self) -> Path:
+        if self._account_id == "default":
+            return _ACTIVE_CARDS_FILE
+        safe = self._safe_log_token(self._account_id)
+        return _ACTIVE_CARDS_FILE.with_name(f"dingtalk-{safe}-active-cards.json")
+
+    @staticmethod
+    def _safe_log_token(value: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", value or "default")
 
     def _recreate_stream_client(self) -> None:
         """重连前重建 SDK 客户端（旧客户端状态不可复用）。"""
@@ -1267,5 +1433,11 @@ class _MessageHandler(dingtalk_stream.ChatbotHandler):
             incoming = ChatbotMessage.from_dict(callback.data)
             self._gw.dispatch(incoming)
         except Exception as e:
-            logger.error("消息解析/派发失败: %s", e, exc_info=True)
+            logger.error(
+                "消息解析/派发失败 | account=%s agent=%s error=%s",
+                self._gw._account_id,
+                self._gw._agent_id,
+                e,
+                exc_info=True,
+            )
         return dingtalk_stream.AckMessage.STATUS_OK, "OK"
