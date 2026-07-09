@@ -71,6 +71,11 @@ fxreview-amazon = [
     "cloakbrowser==0.4.0",
 ]
 
+asinfc-h10 = [
+    "DrissionPage>=4.1.0",
+    "Pillow>=10.0.0",
+]
+
 knowledge = [
     "opendataloader-pdf",
     "markitdown",

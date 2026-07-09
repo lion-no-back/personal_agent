@@ -47,3 +47,6 @@ personal_agent/workflows/rankbb_amazon/chromium/
 
 # 跨进程装包锁（运行时产物）
 .install.lock
+
+personal_agent/workflows/asinfc_h10/auth_state.json
+personal_agent/workflows/asinfc_h10/cookies.json
