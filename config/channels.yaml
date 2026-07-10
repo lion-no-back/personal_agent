@@ -4,27 +4,27 @@ channels:
 
   dingtalk:
     enabled: true
-    accounts:
-      oop:
-        client_id_env: DINGTALK_OOP_CLIENT_ID
-        client_secret_env: DINGTALK_OOP_CLIENT_SECRET
-      amz:
-        client_id_env: DINGTALK_AMZ_CLIENT_ID
-        client_secret_env: DINGTALK_AMZ_CLIENT_SECRET
+    # accounts:
+    #   oop:
+    #     client_id_env: DINGTALK_OOP_CLIENT_ID
+    #     client_secret_env: DINGTALK_OOP_CLIENT_SECRET
+    #   amz:
+    #     client_id_env: DINGTALK_AMZ_CLIENT_ID
+    #     client_secret_env: DINGTALK_AMZ_CLIENT_SECRET
 
-agents:
-  list:
-    - id: oop
-    - id: amz
+# agents:
+#   list:
+#     - id: oop
+#     - id: amz
 
-bindings:
-  - type: route
-    agent_id: oop
-    match:
-      channel: dingtalk
-      account_id: oop
-  - type: route
-    agent_id: amz
-    match:
-      channel: dingtalk
-      account_id: amz
+# bindings:
+#   - type: route
+#     agent_id: oop
+#     match:
+#       channel: dingtalk
+#       account_id: oop
+#   - type: route
+#     agent_id: amz
+#     match:
+#       channel: dingtalk
+#       account_id: amz

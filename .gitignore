@@ -50,3 +50,6 @@ personal_agent/workflows/rankbb_amazon/chromium/
 
 personal_agent/workflows/asinfc_h10/auth_state.json
 personal_agent/workflows/asinfc_h10/cookies.json
+
+.agents/
+skills-lock.json
