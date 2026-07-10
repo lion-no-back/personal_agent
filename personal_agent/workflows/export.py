@@ -15,6 +15,8 @@ from pathlib import Path
 
 import requests
 
+from .retry import RETRYABLE_STATUS_CODES, retry_step
+
 BASE_URL = "https://private.mabangerp.com"
 AMZ_URL  = "https://private-amz.mabangerp.com"
 
@@ -43,6 +45,25 @@ ajax_headers = {
     "X-Requested-With": "XMLHttpRequest",
     "Accept": "application/json, text/javascript, */*; q=0.01",
 }
+
+
+def _request_with_retry(
+    s: requests.Session,
+    method: str,
+    url: str,
+    *,
+    label: str,
+    raise_for_status: bool = False,
+    retry_statuses: bool = False,
+    **kwargs,
+) -> requests.Response:
+    def _request() -> requests.Response:
+        resp = getattr(s, method)(url, **kwargs)
+        if raise_for_status or (retry_statuses and resp.status_code in RETRYABLE_STATUS_CODES):
+            resp.raise_for_status()
+        return resp
+
+    return retry_step(_request, label=label)
 
 EXPORT_FIELDS = [
     ("店铺名称",        "uq101"),
@@ -77,11 +98,21 @@ def login() -> tuple:
     password = os.environ["MABANG_PASSWORD"]
     print("[1/3] 初始化会话并登录...")
     s = requests.Session()
-    s.get(f"{BASE_URL}/", headers=base_headers, timeout=10)
+    _request_with_retry(
+        s,
+        "get",
+        f"{BASE_URL}/",
+        label="mabang login home",
+        headers=base_headers,
+        timeout=10,
+    )
     time.sleep(0.5)
 
-    r = s.post(
+    r = _request_with_retry(
+        s,
+        "post",
         f"{BASE_URL}/index.php?mod=main.doLogin&lang=undefined",
+        label="mabang login",
         headers={**ajax_headers, "Origin": BASE_URL, "Referer": f"{BASE_URL}/"},
         data={"username": username, "password": password, "verifyType": "1"},
         timeout=10,
@@ -94,7 +125,14 @@ def login() -> tuple:
     if res_json.get("success") is not True:
         raise RuntimeError(f"[ERR] 登录失败: {res_json.get('message', r.text[:200])}")
 
-    s.get(f"{BASE_URL}/index.htm", headers=base_headers, timeout=10)
+    _request_with_retry(
+        s,
+        "get",
+        f"{BASE_URL}/index.htm",
+        label="mabang login landing",
+        headers=base_headers,
+        timeout=10,
+    )
     time.sleep(0.5)
 
     cm_key = s.cookies.get("MABANG_ERP_PRO_MEMBERINFO_LOGIN_COOKIE", "")
@@ -116,8 +154,11 @@ def activate_amz(s: requests.Session, cm_key: str) -> str:
         f"{AMZ_URL}/index.php?mod=fbanew.list&platform=amazon&version=1"
         f"&cMKey={cm_key}&fromTest=111&lang=cn&tz=UTC%2B8&DOMAIN=private.mabangerp.com"
     )
-    s.get(
+    _request_with_retry(
+        s,
+        "get",
         iframe_url,
+        label="mabang activate amz",
         headers={**base_headers,
                  "Referer": f"{BASE_URL}/index.php?mod=fbanew.list&platform=amazon&version=1"},
         timeout=15,
@@ -127,8 +168,11 @@ def activate_amz(s: requests.Session, cm_key: str) -> str:
 
 def _fetch_page(s: requests.Session, search_url: str, search_headers: dict,
                 site_code: str, page: int) -> tuple:
-    resp = s.post(
+    resp = _request_with_retry(
+        s,
+        "post",
         search_url,
+        label=f"{site_code} page {page} fetch",
         headers=search_headers,
         data={
             "shopId": "", "status": "1", "ispair": "1", "isChange": "1",
@@ -216,8 +260,11 @@ def export_and_download(s: requests.Session, cm_key: str,
         ("tableBase", ""), ("isMerage", "2"), ("showRmbColumn", "2"),
     ]
 
-    export_res = s.post(
+    export_res = _request_with_retry(
+        s,
+        "post",
         f"{BASE_URL}/index.php?mod=export.doFbaExportFile",
+        label=f"{site_name} export request",
         headers={**ajax_headers, "Origin": BASE_URL, "Referer": f"{BASE_URL}/index.php"},
         data=export_params,
         timeout=120,
@@ -235,8 +282,16 @@ def export_and_download(s: requests.Session, cm_key: str,
     download_url = export_json["gourl"]
     local_path   = os.path.join(output_dir, f"{site_name}_{download_url.split('/')[-1]}")
 
-    dl = s.get(download_url, headers=base_headers, timeout=60)
-    dl.raise_for_status()
+    dl = _request_with_retry(
+        s,
+        "get",
+        download_url,
+        label=f"{site_name} export download",
+        raise_for_status=True,
+        retry_statuses=True,
+        headers=base_headers,
+        timeout=60,
+    )
     with open(local_path, "wb") as f:
         f.write(dl.content)
 
@@ -245,17 +300,21 @@ def export_and_download(s: requests.Session, cm_key: str,
 
 def process_site(main_session: requests.Session, cm_key: str,
                  site_code: str, site_name: str, output_dir: str) -> tuple:
-    s = clone_session(main_session)
-    ids = fetch_ids_for_site(s, cm_key, site_code, site_name)
-    if not ids:
-        print(f"[SKIP] {site_name} 无符合条件的记录")
-        return site_name, None
+    try:
+        s = clone_session(main_session)
+        ids = fetch_ids_for_site(s, cm_key, site_code, site_name)
+        if not ids:
+            print(f"[SKIP] {site_name} no matched records")
+            return site_name, None
 
-    print(f"[OK] {site_name} 共 {len(ids)} 条，提交导出...")
-    path = export_and_download(s, cm_key, ids, site_name, output_dir)
-    if path:
-        print(f"[OK] {site_name} -> {os.path.basename(path)}")
-    return site_name, path
+        print(f"[OK] {site_name} total {len(ids)} records, submitting export...")
+        path = export_and_download(s, cm_key, ids, site_name, output_dir)
+        if path:
+            print(f"[OK] {site_name} -> {os.path.basename(path)}")
+        return site_name, path
+    except Exception as exc:
+        print(f"[ERR] {site_name} export failed after retries: {type(exc).__name__}: {exc}")
+        return site_name, ""
 
 
 def run(output_dir=None) -> tuple:
@@ -285,7 +344,13 @@ def run(output_dir=None) -> tuple:
             for code, name in SITES.items()
         }
         for fut in as_completed(futs):
-            name, path = fut.result()
+            try:
+                name, path = fut.result()
+            except Exception as exc:
+                name = futs[fut]
+                print(f"[ERR] {name} export worker crashed: {type(exc).__name__}: {exc}")
+                failures.append(name)
+                continue
             if path is None:
                 pass
             elif path == "":

@@ -86,7 +86,14 @@ def main() -> int:
         payload["ok"] = True
     except Exception as exc:
         logger.exception("[subprocess] 工作流执行失败 | module=%s", args.module)
-        payload["error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            from personal_agent.workflows.errors import WorkflowBusinessError
+        except Exception:
+            WorkflowBusinessError = None
+        if WorkflowBusinessError is not None and isinstance(exc, WorkflowBusinessError):
+            payload.update(exc.to_payload())
+        else:
+            payload["error"] = f"{type(exc).__name__}: {exc}"
         payload["ok"] = False
 
     # 回传子进程内收集的 LLM usage（即使失败也回传已发生的调用），主进程统一记账

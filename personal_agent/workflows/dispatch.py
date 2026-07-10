@@ -14,9 +14,12 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from .retry import WORKFLOW_RETRY_DELAYS
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +33,12 @@ INSTALL_GRACE_SECONDS = 1200
 
 # 超时后温和终止与强杀之间的宽限秒数。
 _KILL_GRACE_SECONDS = 5
+
+_WORKFLOW_RETRY_MODULES = {
+    "personal_agent.workflows.bhwarn_mabang.runner",
+    "personal_agent.workflows.qhwarn_mabang.runner",
+    "personal_agent.workflows.zxwarn_mabang.runner",
+}
 
 
 def _new_log_file(module: str) -> Path:
@@ -85,7 +94,7 @@ def _append_child_output(log_file: Path, stdout: Optional[str], stderr: Optional
         logger.exception("[dispatch] 写入子进程捕获输出失败 | log=%s", log_file)
 
 
-def run_in_subprocess(
+def _run_in_subprocess_once(
     module: str,
     function: str = "run",
     content: str | None = None,
@@ -148,6 +157,59 @@ def run_in_subprocess(
         if seg.get("image"):
             seg["image"] = Path(seg["image"])
     return payload
+
+
+def _should_retry_workflow(module: str, payload: dict) -> bool:
+    return (
+        module in _WORKFLOW_RETRY_MODULES
+        and not payload.get("ok")
+        and payload.get("retryable") is True
+    )
+
+
+def _finalize_failure_message(payload: dict, workflow_retry_count: int) -> dict:
+    if payload.get("ok"):
+        return payload
+    message = payload.get("user_message") or payload.get("message")
+    if not message:
+        error = payload.get("error") or "未知错误"
+        message = f"❌ 工作流执行失败：{error}"
+    if workflow_retry_count:
+        message = (
+            f"{message}\n"
+            f"系统已处理：workflow 级已整体重试 {workflow_retry_count} 次，仍未成功。"
+        )
+    payload["message"] = message
+    payload["user_message"] = message
+    return payload
+
+
+def run_in_subprocess(
+    module: str,
+    function: str = "run",
+    content: str | None = None,
+    timeout: int | None = None,
+) -> dict:
+    """Run a workflow subprocess, with configured workflow-level retry."""
+    max_workflow_retries = len(WORKFLOW_RETRY_DELAYS) if module in _WORKFLOW_RETRY_MODULES else 0
+    for attempt in range(max_workflow_retries + 1):
+        payload = _run_in_subprocess_once(module, function=function, content=content, timeout=timeout)
+        payload["workflow_attempt"] = attempt + 1
+        payload["workflow_max_attempts"] = max_workflow_retries + 1
+        if payload.get("ok") or attempt >= max_workflow_retries or not _should_retry_workflow(module, payload):
+            return _finalize_failure_message(payload, attempt)
+        delay = WORKFLOW_RETRY_DELAYS[attempt]
+        logger.warning(
+            "[dispatch] workflow failed with retryable business error; retrying | module=%s attempt=%s/%s delay=%ss error=%s",
+            module,
+            attempt + 1,
+            max_workflow_retries + 1,
+            delay,
+            payload.get("error") or payload.get("message"),
+        )
+        time.sleep(delay)
+
+    return _finalize_failure_message(payload, max_workflow_retries)
 
 
 def _cleanup(path: str) -> None:

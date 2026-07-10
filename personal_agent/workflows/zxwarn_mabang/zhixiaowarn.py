@@ -19,16 +19,22 @@ def run(output_dir: Optional[Path] = None) -> dict:
         {"message": str, "files": [Path]}
     """
     from ..export import run as export_run
+    from ..errors import mabang_export_failed_error, mabang_network_failed_error
+    from ..retry import is_retryable_request_error
     from .filter_slow_moving import run as filter_run
 
     logger.info("=" * 50)
     logger.info("Step 1 / 2  导出各站点 MSKU 数据")
     logger.info("=" * 50)
 
-    results, failures, artifact_dir = export_run(output_dir=output_dir)
-
+    try:
+        results, failures, artifact_dir = export_run(output_dir=output_dir)
+    except Exception as exc:
+        if is_retryable_request_error(exc):
+            raise mabang_network_failed_error("马帮滞销预警", exc) from exc
+        raise
     if failures:
-        raise RuntimeError(f"以下站点导出失败: {', '.join(failures)}")
+        raise mabang_export_failed_error("马帮滞销预警", failures)
 
     logger.info("=" * 50)
     logger.info("Step 2 / 2  筛选滞销预警数据")
