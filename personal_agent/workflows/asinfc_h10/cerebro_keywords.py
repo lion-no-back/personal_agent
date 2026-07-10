@@ -158,6 +158,28 @@ MANUAL_EXPORT_FIELDS = [
     "Organic Rank",
 ]
 
+MANUAL_EXPORT_FIELD_LABELS = {
+    "Keyword Phrase": "关键词词组",
+    "ABA Total Click Share": "ABA总计 点击份额",
+    "ABA Total Conv. Share": "ABA总计 转化份额",
+    "Cerebro IQ Score": "Cerebro IQ得分",
+    "Search Volume": "搜索量",
+    "Search Volume Trend": "搜索量趋势",
+    "H10 PPC Sugg. Bid": "H10 PPC建议竞价",
+    "H10 PPC Sugg. Min Bid": "H10 PPC建议最低竞价",
+    "H10 PPC Sugg. Max Bid": "H10 PPC建议最高竞价",
+    "Sponsored ASINs": "广告推广ASIN",
+    "Competing Products": "竞品数",
+    "CPR": "CPR",
+    "Title Density": "标题密度",
+    "Amazon Recommended": "亚马逊推荐",
+    "Sponsored": "广告推广",
+    "Organic": "自然",
+    "Amazon Rec. Rank": "亚马逊推荐广告排名",
+    "Sponsored Rank": "广告排名",
+    "Organic Rank": "自然排名",
+}
+
 MANUAL_EXPORT_MARKET_PREFIXES = {
     "com": "US_AMAZON",
     "ca": "CA_AMAZON",
@@ -523,7 +545,7 @@ def write_keywords_csv(rows: list[dict[str, Any]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8-sig") as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow(MANUAL_EXPORT_FIELDS)
+        writer.writerow([MANUAL_EXPORT_FIELD_LABELS[field] for field in MANUAL_EXPORT_FIELDS])
         for row in rows:
             export_row = manual_export_row(row)
             writer.writerow([export_row[field] for field in MANUAL_EXPORT_FIELDS])

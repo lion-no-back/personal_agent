@@ -16,6 +16,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,24 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         logger.exception("[dispatch] 杀进程树失败 | pid=%s", proc.pid)
 
 
+def _append_child_output(log_file: Path, stdout: Optional[str], stderr: Optional[str]) -> None:
+    chunks = []
+    if stdout:
+        chunks.append("----- captured stdout -----\n" + stdout.rstrip())
+    if stderr:
+        chunks.append("----- captured stderr -----\n" + stderr.rstrip())
+    if not chunks:
+        return
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        with log_file.open("a", encoding="utf-8", errors="replace") as fp:
+            fp.write("\n[dispatch] 子进程未能写入标准结果，补充捕获输出：\n")
+            fp.write("\n".join(chunks))
+            fp.write("\n")
+    except Exception:
+        logger.exception("[dispatch] 写入子进程捕获输出失败 | log=%s", log_file)
+
+
 def run_in_subprocess(
     module: str,
     function: str = "run",
@@ -93,23 +112,34 @@ def run_in_subprocess(
     proc = subprocess.Popen(
         cmd, cwd=str(_PROJECT_ROOT), env=env,
         stdin=subprocess.DEVNULL, creationflags=creationflags,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
     )
     try:
-        proc.wait(timeout=total_timeout)
+        stdout, stderr = proc.communicate(timeout=total_timeout)
     except subprocess.TimeoutExpired:
         logger.error("[dispatch] 工作流超时，强制中止 | module=%s pid=%s", module, proc.pid)
         _kill_tree(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=2)
+        except Exception:
+            stdout, stderr = "", ""
+        _append_child_output(log_file, stdout, stderr)
         _cleanup(result_path)
         return {"ok": False, "message": "❌ 执行超时，已强制中止",
                 "files": [], "segments": [], "error": "timeout"}
 
     try:
-        payload = json.loads(Path(result_path).read_text(encoding="utf-8"))
+        raw_result = Path(result_path).read_text(encoding="utf-8")
+        if not raw_result.strip():
+            raise ValueError(f"子进程结果文件为空，退出码 {proc.returncode}")
+        payload = json.loads(raw_result)
     except Exception as exc:
+        _append_child_output(log_file, stdout, stderr)
         logger.error("[dispatch] 读取子进程结果失败 | module=%s rc=%s err=%s",
                      module, proc.returncode, exc)
-        return {"ok": False, "message": f"❌ 执行失败：无法读取子进程结果（{exc}），详见日志 {log_file}",
-                "files": [], "segments": [], "error": str(exc)}
+        return {"ok": False, "message": f"❌ 执行失败：无法读取子进程结果（退出码 {proc.returncode}，{exc}），详见日志 {log_file}",
+                "files": [], "segments": [], "error": f"rc={proc.returncode}; {exc}"}
     finally:
         _cleanup(result_path)
 

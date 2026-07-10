@@ -32,7 +32,7 @@ BROWSER_PATH_ENV_KEY = "H10_BROWSER_PATH"
 
 # ---------- 登录配置 ----------
 BASE_URL = "https://members.helium10.com"
-LOGIN_URL = "https://members.helium10.com/user/signin"
+LOGIN_URL = "https://members.helium10.com/user/signin?language=zh-CN"
 DASHBOARD_URL = "https://members.helium10.com/dashboard"
 LOGIN_TIMEOUT = 60  # 等待跳转到 dashboard 的超时秒数
 

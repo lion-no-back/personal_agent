@@ -10,8 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-KEYWORD_COLUMN = "Keyword Phrase"
-SEARCH_VOLUME_COLUMN = "Search Volume"
+KEYWORD_COLUMN_ALIASES = ("Keyword Phrase", "关键词词组")
+SEARCH_VOLUME_COLUMN_ALIASES = ("Search Volume", "搜索量")
 MIN_SEARCH_VOLUME = 50
 
 APPLE_TERMS = ("apple", "iwatch")
@@ -167,6 +167,13 @@ def parse_search_volume(value: str) -> int | None:
     return int(float(stripped))
 
 
+def first_existing_column(fieldnames: list[str], aliases: tuple[str, ...]) -> str | None:
+    for alias in aliases:
+        if alias in fieldnames:
+            return alias
+    return None
+
+
 def matching_attribute_rank(keyword: str, attributes: list[AttributeTerm]) -> int | None:
     for attribute in attributes:
         if contains_term(keyword, attribute.aliases):
@@ -174,9 +181,15 @@ def matching_attribute_rank(keyword: str, attributes: list[AttributeTerm]) -> in
     return None
 
 
-def should_color_row(row: dict[str, str], attributes: list[AttributeTerm]) -> int | None:
-    keyword = row.get(KEYWORD_COLUMN, "")
-    search_volume = parse_search_volume(row.get(SEARCH_VOLUME_COLUMN, ""))
+def should_color_row(
+    row: dict[str, str],
+    attributes: list[AttributeTerm],
+    *,
+    keyword_column: str,
+    search_volume_column: str,
+) -> int | None:
+    keyword = row.get(keyword_column, "")
+    search_volume = parse_search_volume(row.get(search_volume_column, ""))
     if search_volume is None or search_volume <= MIN_SEARCH_VOLUME:
         return None
     if not contains_term(keyword, APPLE_TERMS):
@@ -384,7 +397,13 @@ def process_csv(csv_path: Path, markdown_path: Path, output_path: Path) -> tuple
         if reader.fieldnames is None:
             raise ValueError("CSV 文件为空或缺少表头。")
         fieldnames = list(reader.fieldnames)
-        missing_columns = [column for column in (KEYWORD_COLUMN, SEARCH_VOLUME_COLUMN) if column not in fieldnames]
+        keyword_column = first_existing_column(fieldnames, KEYWORD_COLUMN_ALIASES)
+        search_volume_column = first_existing_column(fieldnames, SEARCH_VOLUME_COLUMN_ALIASES)
+        missing_columns = []
+        if keyword_column is None:
+            missing_columns.append("/".join(KEYWORD_COLUMN_ALIASES))
+        if search_volume_column is None:
+            missing_columns.append("/".join(SEARCH_VOLUME_COLUMN_ALIASES))
         if missing_columns:
             raise ValueError(f"CSV 缺少必要列: {', '.join(missing_columns)}")
         rows = list(reader)
@@ -392,7 +411,12 @@ def process_csv(csv_path: Path, markdown_path: Path, output_path: Path) -> tuple
     color_by_row: dict[int, int] = {}
     counts_by_rank = {1: 0, 2: 0, 3: 0}
     for data_index, row in enumerate(rows, start=2):
-        rank = should_color_row(row, attributes)
+        rank = should_color_row(
+            row,
+            attributes,
+            keyword_column=keyword_column,
+            search_volume_column=search_volume_column,
+        )
         if rank is None:
             continue
         color_by_row[data_index] = rank
