@@ -4,29 +4,19 @@ import re
 import threading
 import time
 import json
-import contextvars
-import concurrent.futures
-from datetime import datetime
 from typing import Callable, Optional
-
-from ..core.json_repair import repair_tool_arguments
-
-import personal_agent.knowledge as _kb_mod
-
-from openai import APIStatusError, AuthenticationError
 
 from ..agents.base_agent import BaseAgent
 from ..context.conversation_context import ConversationContext
-from ..context.message_truncation import truncate_to_budget
 from ..core.interaction_logger import InteractionLogger
 from ..core.llm_router import LLMRouter
 from ..core.request_scorer import RequestScorer
-from ..core.task_manager import TaskCancelledError, TaskManager
-from ..guardrails import sanitize_output, sanitize_tool_result
+from ..core.task_manager import TaskManager
 from ..memory import MemoryModule
 from ..tools import get_all_tools, get_tools_openai_schema
-from ..tools.validation import validate_tool_args
 from ..tools.exec_tool import CommandResult
+from .conversation_runtime import is_llm_auth_error as _is_llm_auth_error
+from .pipeline import MessagePipeline, PipelineContext
 
 logger = logging.getLogger(__name__)
 
@@ -53,58 +43,12 @@ _HELP_TEXT = (
     + "\n\n> 直接发送消息即可与 AI 对话，无需任何指令。"
 )
 
-# 触发"强制使用推理模型"的自然语言短语（须明确表达切换意图，避免误触发）
-_FORCE_REASONING_PATTERNS = ("换推理模型", "用推理模型", "切换推理模型", "重新推理", "深度思考")
-
 _LLM_AUTH_USER_MESSAGE = (
     "⚠️ **无法调用 AI 服务**：接口密钥未通过验证。\n\n"
     "请检查环境变量 <text_tag color='neutral'>LLM_API_KEY</text_tag> 与 "
     "<text_tag color='neutral'>LLM_BASE_URL</text_tag> 是否属于同一服务商且填写正确，"
     "修改后需重启服务。"
 )
-
-_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
-
-
-def _build_runtime_context_block(now: datetime | None = None) -> str:
-    current = now or datetime.now().astimezone()
-    if current.tzinfo is None:
-        current = current.astimezone()
-    timezone_name = getattr(current.tzinfo, "key", None) or current.tzname() or "local"
-    return (
-        "[Runtime context]\n"
-        f"Current date: {current:%Y-%m-%d}\n"
-        f"Current weekday: {_WEEKDAYS[current.weekday()]}\n"
-        f"Current time: {current:%H:%M:%S}\n"
-        f"Current timezone: {timezone_name}\n"
-        "Interpret relative time words such as today, tomorrow, yesterday, this week, "
-        "last week, this year, recently, and their Chinese equivalents against this date.\n"
-        "For time-sensitive current-world facts such as sports events, odds, schedules, "
-        "prices, laws, rankings, releases, or public roles, do not rely on stale model "
-        "memory. Use available search or knowledge tools when current precision matters; "
-        "if no current source is available, say what is uncertain."
-    )
-
-
-def _inject_runtime_context(
-    messages: list[dict],
-    now: datetime | None = None,
-) -> list[dict]:
-    block = _build_runtime_context_block(now)
-    copied = [dict(message) for message in messages]
-    if copied and copied[0].get("role") == "system":
-        copied[0]["content"] = f"{copied[0].get('content') or ''}\n\n{block}"
-        return copied
-    return [{"role": "system", "content": block}, *copied]
-
-
-def _is_llm_auth_error(exc: BaseException) -> bool:
-    """OpenAI SDK：401 通常为 AuthenticationError（亦为 APIStatusError 子类）。"""
-    if isinstance(exc, AuthenticationError):
-        return True
-    if isinstance(exc, APIStatusError):
-        return getattr(exc, "status_code", None) == 401
-    return False
 
 
 class ConversationAgent(BaseAgent):
@@ -209,287 +153,15 @@ class ConversationAgent(BaseAgent):
         Returns:
             AI 生成的完整回复文本；指令场景直接返回指令响应文本
         """
-        # ── 1. 计算会话 Key ──────────────────────────────────
-        session_key = self._build_session_key(event)
-
-        if self._interaction_logger:
-            self._interaction_logger.log_session_start(
-                session_key, event.content, getattr(event, "sender_name", None)
-            )
-
-        # ── 2. 内置指令拦截 ──────────────────────────────────
-        command_response = self._handle_command(event.content, session_key, event.sender_open_id)
-        if command_response is not None:
-            # 指令直接返回，不走 LLM，也不写入上下文历史
-            if on_update:
-                on_update(command_response, "done")
-            return command_response
-
-        # ── 2.5. 按需 Workflow 意图匹配 ──────────────────────
-        ondemand_ack = self._check_ondemand_workflow(event, session_key, on_update)
-        if ondemand_ack is not None:
-            return ondemand_ack
-
-        # ── 3. 写入用户消息到上下文 ──────────────────────────
-        self._context.add_message(session_key, "user", event.content)
-
-        # ── 3.5. 预取记忆块（仅读文件，不阻塞） ─────────────
-        user_id = event.sender_open_id
-        memory_block = ""
-        if self._memory:
-            memory_block = self._memory.retriever.build_memory_block(user_id)
-
-        # ── 3.6. KB 预检索（无 LLM，关键词+向量，注入 system context） ─
-        kb_context_block = ""
-        if _kb_mod.kb is not None and not getattr(event, "is_scheduled", False):
-            try:
-                kb_hits = _kb_mod.kb.quick_search_sync(event.content, top_k=3)
-                if kb_hits:
-                    lines = []
-                    for r in kb_hits:
-                        body = (r.chunk.compiled or r.chunk.content)[:300]
-                        lines.append(f"- 【{r.chunk.title}】{body}")
-                    kb_context_block = "【知识库相关内容，优先参考】\n" + "\n".join(lines)
-            except Exception:
-                logger.debug("KB 预检索失败，跳过", exc_info=True)
-
-        final_response = ""
-        ui_text_buffer = ""  # UI历史累计区，确保多轮迭代输出不会覆写先前的文字
-
-        # 路由状态（在循环外初始化，首轮决策后保持不变）
-        _force_reasoning = any(p in event.content for p in _FORCE_REASONING_PATTERNS)
-        _score_result = None
-        task_type = "default"
-
-        turns_base = int(os.getenv("AGENT_MAX_TURNS_BASE", "5"))
-        turns_per_tool = int(os.getenv("AGENT_TURNS_PER_TOOL", "2"))
-        turns_hard = int(os.getenv("AGENT_MAX_TURNS_HARD", "30"))
-        remaining = turns_base
-        i = 0
-        while remaining > 0 and i < turns_hard:
-            # ── 4. 组装完整 messages（含历史） ───────────────────
-            messages = self._context.get_messages(session_key)
-            messages = _inject_runtime_context(messages)
-            
-            # ── 4.5. 瞬态注入记忆块到 system message ────────────
-            if memory_block and messages:
-                messages[0] = {
-                    "role": "system",
-                    "content": messages[0]["content"] + "\n\n" + memory_block,
-                }
-
-            # ── 4.5.5. 瞬态注入 KB 预检索结果（仅首轮）────────────
-            # 只在第一轮注入：后续轮次 tool result 已携带完整 KB 内容，
-            # 重复注入会导致 LLM 上下文里同一段内容出现多次，引发循环输出。
-            if kb_context_block and messages and i == 0:
-                messages[0] = {
-                    "role": "system",
-                    "content": (
-                        messages[0]["content"]
-                        + "\n\n"
-                        + "【知识库预取摘要，如已足够请直接作答，"
-                        + "如需详情可调用 knowledge_search（每次提问仅调用一次）】\n"
-                        + kb_context_block.removeprefix("【知识库相关内容，优先参考】\n")
-                    ),
-                }
-
-            # ── 4.6. 瞬态注入文件上下文 ─────
-            file_ctx = getattr(event, "file_context", None)
-            if file_ctx and messages and messages[-1]["role"] == "user":
-                last_msg = dict(messages[-1])
-                last_msg["content"] = f"{file_ctx}\n\n[用户请求]\n{last_msg['content']}"
-                messages[-1] = last_msg
-
-            # ── 4.7. 瞬态注入技能完整文档（仅首轮、非定时任务时触发一次）─────
-            # i==0：工具调用后续轮不重复识别；is_scheduled：定时任务 prompt 已知，跳过
-            skill_body = (
-                self._resolve_skill_body(event.content)
-                if i == 0 and not getattr(event, "is_scheduled", False)
-                else ""
-            )
-            if skill_body and messages and messages[-1]["role"] == "user":
-                last_msg = dict(messages[-1])
-                last_msg["content"] = f"【当前技能完整文档】\n{skill_body}\n\n{last_msg['content']}"
-                messages[-1] = last_msg
-
-            # ── 4.8. 瞬态注入图片（首轮有图时转为多模态消息格式）─────
-            # 图片不写入上下文历史，仅在当前轮携带，避免 token 膨胀
-            event_images = getattr(event, "images", None)
-            if i == 0 and event_images and messages and messages[-1]["role"] == "user":
-                last_msg = dict(messages[-1])
-                text = last_msg.get("content") or "请描述这张图片"
-                last_msg["content"] = [
-                    {"type": "text", "text": text},
-                    *[
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                        for b64 in event_images
-                    ],
-                ]
-                messages[-1] = last_msg
-
-            i += 1
-            remaining -= 1
-            logger.debug(f"LLM 输入 | session={session_key} 轮次={i} 剩余={remaining} messages_count={len(messages)}")
-
-            # 定义携带 buffer 的专属卡片刷入函数
-            def custom_on_update(content: str, status: str) -> None:
-                if on_update:
-                    combined = (ui_text_buffer + content) if keep_thinking else content
-                    on_update(combined.strip(), status)
-
-            # ── 5. 流式 LLM 调用 + 卡片更新 ─────────────────────
-            # 首轮决定 task_type，后续轮复用（工具调用中间轮不重新评分）
-            if i == 1:
-                if event_images:
-                    task_type = "vision"
-                elif _force_reasoning:
-                    task_type = "reasoning"
-                elif self._scorer:
-                    _score_result = self._scorer.score(
-                        messages,
-                        tools=self._tools_schema,
-                        user_text=event.content,  # 用原始消息评分，避免瞬态注入干扰
-                    )
-                    task_type = _score_result.task_type
-            # ── 5.5. 发送前按 token 预算裁剪（单一收口点）──────────
-            # 保护 system、工具调用组成对进退、剥除孤儿 tool，彻底避免
-            # OpenAI 400 "tool must be a response to a preceding tool_calls"。
-            # 预算按当前 task_type 的模型上下文动态解析。
-            messages = truncate_to_budget(messages, self._llm.get_prompt_budget(task_type))
-
-            if self._interaction_logger:
-                self._interaction_logger.log_llm_call(session_key, i, messages)
-            full_response, tool_calls = self._stream_and_update(
-                messages, custom_on_update, stream_updates_sync_with_llm,
-                tools=self._tools_schema,
-                task_type=task_type,
-                cancel_event=cancel_event,
-            )
-            if cancel_event and cancel_event.is_set():
-                raise TaskCancelledError("任务已被用户取消")
-            if self._interaction_logger:
-                self._interaction_logger.log_llm_response(session_key, i, full_response, tool_calls)
-
-            # ── 6. 写入 AI 回复到上下文 ──────────────────────────
-            if full_response or tool_calls:
-                self._context.add_message(
-                    session_key, 
-                    "assistant", 
-                    content=full_response, 
-                    tool_calls=tool_calls if tool_calls else None
-                )
-            else:
-                logger.warning(f"⚠️  LLM 返回空响应 | session={session_key}")
-                return ""
-                
-            final_response = full_response or ""
-
-            if tool_calls:
-                # 产生工具调用了，在此轮思考末尾做一点格式美化和保留
-                additional_ui_text = (final_response + "\n\n") if final_response else ""
-                
-                # 并发执行的子例程
-                def execute_single_tool(tc: dict) -> dict:
-                    c_func_name = tc.get("function", {}).get("name", "")
-                    c_func_args_str = tc.get("function", {}).get("arguments", "{}")
-                    c_tc_id = tc.get("id", "")
-                    log_args: dict = {}
-
-                    c_tool = self._tool_map.get(c_func_name)
-                    if not c_tool:
-                        res = f"Error: 找不到工具 '{c_func_name}'"
-                    else:
-                        try:
-                            kwargs_dict = repair_tool_arguments(c_func_args_str)
-                            log_args = kwargs_dict.copy()
-                            # 调用前用工具自带 JSON Schema 校验参数（参考 Flue：失败回传错误让模型自纠）
-                            validation_error = validate_tool_args(c_tool, kwargs_dict)
-                            if validation_error:
-                                res = f"Error: 工具 '{c_func_name}' {validation_error}"
-                            else:
-                                # 注入上下文供支持后台通知的工具（如 exec）使用
-                                if push_fn is not None:
-                                    kwargs_dict["_tool_ctx"] = {
-                                        "push_fn": self._make_exec_push_fn(push_fn),
-                                    }
-                                res = c_tool.call(**kwargs_dict)
-                        except Exception as e:
-                            res = f"Error: 执行工具 '{c_func_name}' 失败: {str(e)}"
-                    # ── L4 Tool Output Guard（写入 LLM context 前脱敏）─────
-                    res = sanitize_tool_result(c_func_name, res, session_key=session_key)
-                    return {"name": c_func_name, "id": c_tc_id, "result": res, "args": log_args}
-
-                # 拼接并发提示
-                func_names = [tc.get("function", {}).get("name", "") for tc in tool_calls]
-                status_text = f"{additional_ui_text}> 🛠️ 正在执行工具：`{', '.join(func_names)}`..."
-                custom_on_update(status_text, "tool")
-                
-                results_collected = []
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tool_calls), 5)) as executor:
-                    # copy_context：把当前 usage 归属（current_user/source）带进工具线程，
-                    # 否则工具触发的 LLM 调用（如 knowledge_search）会丢失归账。
-                    futures = [
-                        executor.submit(contextvars.copy_context().run, execute_single_tool, tc)
-                        for tc in tool_calls
-                    ]
-                    for fut in concurrent.futures.as_completed(futures):
-                        results_collected.append(fut.result())
-
-                if cancel_event and cancel_event.is_set():
-                    raise TaskCancelledError("任务已被用户取消")
-
-                for res in results_collected:
-                    self._context.add_message(session_key, "tool", content=res["result"], tool_call_id=res["id"], name=res["name"])
-                    logger.info(f"🛠️ 工具执行完成 | {res['name']} -> {res['result'][:30]}...")
-                    if self._interaction_logger:
-                        self._interaction_logger.log_tool_result(session_key, res["name"], res.get("args", {}), res["result"])
-
-                # 每个工具调用追加预算，但受硬上限约束
-                bonus = turns_per_tool * len(tool_calls)
-                remaining = min(remaining + bonus, turns_hard - i)
-                logger.debug(f"工具调用追加预算 +{bonus} | 剩余={remaining} | i={i} hard={turns_hard}")
-
-                ui_text_buffer += additional_ui_text
-                continue  # 进入下一轮思考
-                
-            else:
-                logger.info(f"✅ 回复完成 | session={session_key} response_len={len(final_response)}")
-                ui_text_buffer += final_response
-                # 边界区且用了主力模型 → 附加"换推理模型"提示
-                suggestion = self._routing_suggestion(
-                    _score_result,
-                    is_scheduled=getattr(event, "is_scheduled", False),
-                )
-                if suggestion:
-                    ui_text_buffer += suggestion
-                if self._interaction_logger:
-                    self._interaction_logger.log_final(session_key, ui_text_buffer)
-                # ── L5 Output Guard（推送给用户前脱敏）──────────
-                sanitized = sanitize_output(ui_text_buffer.strip(), session_key=session_key)
-                if on_update:
-                    done_text = sanitized if keep_thinking else sanitize_output(
-                        final_response.strip(), session_key=session_key
-                    )
-                    on_update(done_text, "done")
-                # ── 记忆异步抽取（后台，不阻塞回复） ────────────
-                if self._memory:
-                    self._memory.extractor.extract_async(
-                        user_id, self._context.get_messages(session_key)
-                    )
-                return sanitized
-
-        timeout_msg = "\n\n> ⏰ 抱歉，经过多次尝试未能完成请求，请尝试重组您的问题。"
-        ui_text_buffer += final_response + timeout_msg
-        if self._interaction_logger:
-            self._interaction_logger.log_final(session_key, ui_text_buffer)
-        sanitized = sanitize_output(ui_text_buffer.strip(), session_key=session_key)
-        if on_update:
-            done_text = sanitized if keep_thinking else sanitize_output(
-                (final_response + timeout_msg).strip(), session_key=session_key
-            )
-            on_update(done_text, "done")
-        self._context.add_message(session_key, "assistant", content=timeout_msg)
-        return sanitized
+        ctx = PipelineContext(
+            event=event,
+            on_update=on_update,
+            stream_updates_sync_with_llm=stream_updates_sync_with_llm,
+            push_fn=push_fn,
+            cancel_event=cancel_event,
+            keep_thinking=keep_thinking,
+        )
+        return MessagePipeline(self).run(ctx)
 
     # ──────────────────────────────────────────────────────────
     #   按需 Workflow 意图触发
