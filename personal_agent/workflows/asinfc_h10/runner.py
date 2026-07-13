@@ -2,7 +2,7 @@
 
 由 ConversationAgent 按需触发：
   - 含「反查配置」：安装 DrissionPage / Pillow，检查 Chrome，并登录生成认证态
-  - 含「ASIN反查」：解析 1 个 ASIN 和站点，执行 Cerebro 导出、LLM 分析、XLSX 标注
+  - 含「ASIN反查」：按「ASIN反查+站点+ASIN」解析 1 个 ASIN 和站点，执行 Cerebro 导出、LLM 分析、XLSX 标注
 
 运行段不静默安装依赖；如果 cookies/auth_state 失效，底层会自动重新登录。
 返回时 PNG 走 segments.image 作为图片消息发送，XLSX 走 files 作为文件发送。
@@ -29,7 +29,7 @@ _CHECK_PACKAGES = {
 }
 
 _MSG_NEED_CONFIG = "⚠️ 尚未完成反查配置，请先发送【反查配置】"
-_MSG_BAD_FORMAT = "⚠️ 未能识别站点或 ASIN。请按【ASIN反查 美国B0FDKNWJS5】发送，一次只支持 1 个 ASIN"
+_MSG_BAD_FORMAT = "⚠️ 未能识别站点或 ASIN。请按【ASIN反查+美国+B0FDKNWJS5】发送，一次只支持 1 个 ASIN"
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _ARTIFACT_ROOT = _PROJECT_ROOT / "artifact"
@@ -66,7 +66,7 @@ def _parse_request(content: str) -> tuple[str, str] | None:
     raw_asin = matches[0]
     asin = raw_asin.upper()
     site = content.replace(_LOOKUP_TRIGGER, "").replace(raw_asin, "")
-    site = re.sub(r"[\s:：,，;；]+", "", site).strip()
+    site = re.sub(r"[\s+＋:：,，;；]+", "", site).strip()
     if not site:
         return None
 
@@ -87,7 +87,7 @@ def _run_config() -> dict:
         logger.exception("[asinfc_h10] 反查配置失败")
         return {"message": f"❌ 反查配置失败：{exc}", "files": []}
 
-    return {"message": "✅ 反查配置完成，现在可发送【ASIN反查 美国B0FDKNWJS5】", "files": []}
+    return {"message": "✅ 反查配置完成，现在可发送【ASIN反查+美国+B0FDKNWJS5】", "files": []}
 
 
 def _run_lookup(content: str) -> dict:

@@ -7,4 +7,5 @@ WORKFLOW_META = WorkflowMeta(
     schedule=None,
     timeout=1800,
     intent_triggers=["评论采集", "评论配置"],
+    usage_examples=["评论采集+ASIN"],
 )

@@ -25,5 +25,7 @@ class WorkflowMeta:
     retry_delay: float = 60.0       # 每次重试前等待秒数
     # 按需执行（预留，定时类型无需填写）
     intent_triggers: list[str] = field(default_factory=list)
+    # 展示给用户和 LLM 的推荐使用格式；为空时回退到 intent_triggers。
+    usage_examples: list[str] = field(default_factory=list)
     # 按需触发成功后，将投递目标（群/用户 key）持久化，供下次定时运行使用
     persist_delivery: bool = False

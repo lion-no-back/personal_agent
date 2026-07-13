@@ -91,7 +91,11 @@ def build_web_fetch_tool() -> ToolDef:
 
     return ToolDef(
         name="web_fetch",
-        description="抓取指定 URL 的网页内容，并提取为纯净的 Markdown 文本返回。当用户发送网页链接并期望你提取网页内容、总结文章或搜索信息时，务必调用此工具。",
+        description=(
+            "抓取指定 URL 的网页内容，并提取为纯净的 Markdown 文本返回。"
+            "当用户发送网页链接并明确期望你提取网页内容、总结文章或搜索信息时调用此工具。"
+            "如果用户意图不清楚，必须先调用 clarify 澄清。"
+        ),
         parameters={
             "type": "object",
             "properties": {

@@ -40,6 +40,12 @@ from lark_oapi.api.im.v1 import (
 from ..bus import InboundMessage, MessageBus
 from ..core.task_manager import TaskManager
 from ..guardrails import check_input
+from ..routing.clarification_gateway import (
+    cancel_pending_clarification,
+    has_pending_clarification,
+    resolve_text_response_for_session,
+)
+from ..routing.control_messages import is_control_message
 from ..routing import AccessPolicy, SessionRunLocks
 from .base_gateway import BaseGateway
 
@@ -1355,6 +1361,20 @@ class FeishuGateway(BaseGateway):
             chat_id=event.chat_id,
             thread_id=event.thread_id,
         )
+
+        if has_pending_clarification(session_key):
+            if is_control_message(event.content):
+                cancel_pending_clarification(
+                    session_key,
+                    reason="new_control_message",
+                )
+            elif resolve_text_response_for_session(session_key, event.content):
+                logger.info(
+                    "飞书消息作为澄清回复处理 | session=%s message_id=%s",
+                    session_key,
+                    event.message_id,
+                )
+                return
 
         # ── 绑定当前用户到 contextvar（每请求作用域，供用量记账归属到发送人）──
         from ..core.usage_tracker import set_current_user, reset_current_user

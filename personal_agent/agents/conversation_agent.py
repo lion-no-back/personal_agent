@@ -21,6 +21,7 @@ from ..core.llm_router import LLMRouter
 from ..core.request_scorer import RequestScorer
 from ..core.task_manager import TaskManager
 from ..memory import MemoryModule
+from ..routing.control_messages import is_workflow_help_request
 from ..tools import get_all_tools, get_tools_openai_schema
 from ..tools.exec_tool import CommandResult
 from .pipeline import MessagePipeline, PipelineContext
@@ -337,17 +338,18 @@ class ConversationAgent(BaseAgent):
         """
         content = event.content
 
-        if "工作流使用说明" in content:
+        if self._is_workflow_help_request(content):
             workflows = self._get_ondemand_workflows()
             if not workflows:
                 return "当前没有可用的按需工作流。"
             lines = [
-                "| 工作流 | 触发词 |",
+                "| 工作流 | 使用方式 |",
                 "|:---|:---|",
             ]
             for m in workflows:
-                triggers = " / ".join(f"**{t}**" for t in m.intent_triggers)
-                lines.append(f"| {m.name} | {triggers} |")
+                usage_items = getattr(m, "usage_examples", None) or m.intent_triggers
+                usage = " / ".join(f"**{item}**" for item in usage_items)
+                lines.append(f"| {m.name} | {usage} |")
             help_text = "\n".join(lines)
             if progress_publisher:
                 progress_publisher(help_text, "done")
@@ -371,6 +373,10 @@ class ConversationAgent(BaseAgent):
             return ack
 
         return None
+
+    @staticmethod
+    def _is_workflow_help_request(content: str) -> bool:
+        return is_workflow_help_request(content)
 
     def _run_ondemand_workflow_async(self, meta, delivery_key: str, event_content: str = "", progress_publisher=None, usage_user=None) -> None:
         """在后台 daemon 线程中执行按需 workflow，完成后通过 MessageBus 投递结果。

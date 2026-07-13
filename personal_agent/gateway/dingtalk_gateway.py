@@ -33,6 +33,12 @@ except ImportError as _e:
     ) from _e
 
 from ..bus import InboundMessage, MessageBus
+from ..routing.clarification_gateway import (
+    cancel_pending_clarification,
+    has_pending_clarification,
+    resolve_text_response_for_session,
+)
+from ..routing.control_messages import is_control_message
 from ..routing import AccessPolicy, SessionRunLocks
 from .base_gateway import BaseGateway
 from .dingtalk_media import DingTalkMediaClient
@@ -972,9 +978,25 @@ class DingTalkGateway(BaseGateway):
         # 收到调用：在用户消息上贴一个 👌 表情回复（替代发送独立的「收到」贴纸消息）
         threading.Thread(target=self._react, args=(incoming,), daemon=True).start()
 
+        session_key = self._compute_session_key(event)
+        if has_pending_clarification(session_key):
+            if is_control_message(event.content):
+                cancel_pending_clarification(
+                    session_key,
+                    reason="new_control_message",
+                )
+            elif resolve_text_response_for_session(session_key, event.content):
+                logger.info(
+                    "钉钉消息作为澄清回复处理 | account=%s agent=%s session=%s message_id=%s",
+                    self._account_id,
+                    self._agent_id,
+                    session_key,
+                    incoming.message_id,
+                )
+                return
+
         renderer = self._try_create_renderer(incoming)
 
-        session_key = self._compute_session_key(event)
         lock = self._run_locks.get(session_key)
         logger.info(
             "钉钉消息入队 | account=%s agent=%s session=%s message_id=%s chat_type=%s sender=%s renderer=%s",

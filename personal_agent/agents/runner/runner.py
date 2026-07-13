@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextvars
+import json
 import logging
 import os
 import time
@@ -10,6 +11,7 @@ from ...context.message_truncation import truncate_to_budget
 from ...core.json_repair import repair_tool_arguments
 from ...core.task_manager import TaskCancelledError
 from ...guardrails import sanitize_tool_result
+from ...routing.clarification_gateway import ask_clarification
 from ...tools.validation import validate_tool_args
 from ..conversation_runtime import FORCE_REASONING_PATTERNS, inject_runtime_context
 from .runtime import AgentRuntime
@@ -18,6 +20,8 @@ from .tracing import emit_runner_event, event_attrs, tool_call_attrs
 from .types import AgentRunResult, AgentRunSpec
 
 logger = logging.getLogger(__name__)
+
+_CLARIFY_TOOL_NAME = "clarify"
 
 
 class AgentRunner:
@@ -60,6 +64,7 @@ class AgentRunner:
     ) -> AgentRunResult:
         event = spec.event
         force_reasoning = any(p in event.content for p in FORCE_REASONING_PATTERNS)
+        history_len_at_start = self.runtime.get_history_length(spec.session_key)
 
         turns_base = int(os.getenv("AGENT_MAX_TURNS_BASE", "5"))
         turns_per_tool = int(os.getenv("AGENT_TURNS_PER_TOOL", "2"))
@@ -192,6 +197,16 @@ class AgentRunner:
                 tool_calls,
             )
 
+            clarify_call = self._get_clarify_tool_call(tool_calls)
+            if clarify_call is not None and tool_calls:
+                if len(tool_calls) > 1:
+                    logger.warning(
+                        "clarify 与其他工具同时出现，仅执行 clarify | session=%s tools=%s",
+                        spec.session_key,
+                        [tc.get("function", {}).get("name", "") for tc in tool_calls],
+                    )
+                tool_calls = [clarify_call]
+
             if full_response or tool_calls:
                 self.runtime.add_message(
                     spec.session_key,
@@ -234,6 +249,38 @@ class AgentRunner:
                 result.tools_used.extend(
                     item["name"] for item in tool_results if item.get("name")
                 )
+
+                clarify_stop = self._get_clarify_stop_status(tool_results)
+                if clarify_stop:
+                    rollback_target = max(0, history_len_at_start - 1)
+                    self.runtime.rollback_to_length(spec.session_key, rollback_target)
+                    if clarify_stop == "timeout":
+                        result.final_response = (
+                            "等待补充信息超时，本次请求已结束。你可以重新发送更完整的问题。"
+                        )
+                        result.stop_reason = "clarification_timeout"
+                        result.delivery_kind = "clarification_timeout"
+                        emit_status = "timeout"
+                    else:
+                        result.final_response = "已取消本次澄清，正在处理你的新请求。"
+                        result.stop_reason = "clarification_cancelled"
+                        result.delivery_kind = "cancelled"
+                        emit_status = "cancelled"
+                    result.ui_text_buffer += result.final_response
+                    emit_runner_event(
+                        "runner.completed",
+                        status=emit_status,
+                        duration_ms=int((time.perf_counter() - run_started) * 1000),
+                        attrs={
+                            "stop_reason": result.stop_reason,
+                            "iterations": result.iterations,
+                            "tools_used_count": len(result.tools_used),
+                            "tool_result_count": len(result.tool_results),
+                            "final_response_chars": len(result.final_response or ""),
+                        },
+                    )
+                    result.trace_completed = True
+                    return result
 
                 if spec.cancel_event and spec.cancel_event.is_set():
                     emit_runner_event(
@@ -407,11 +454,13 @@ class AgentRunner:
         func_names = [
             tc.get("function", {}).get("name", "") for tc in tool_calls
         ]
-        status_text = (
-            f"{additional_ui_text}> 🛠️ 正在执行工具："
-            f"`{', '.join(func_names)}`..."
-        )
-        self._publish_progress(spec, result, status_text, "tool")
+        has_clarify = _CLARIFY_TOOL_NAME in func_names
+        if not has_clarify:
+            status_text = (
+                f"{additional_ui_text}> 🛠️ 正在执行工具："
+                f"`{', '.join(func_names)}`..."
+            )
+            self._publish_progress(spec, result, status_text, "tool")
 
         results_collected = []
         with concurrent.futures.ThreadPoolExecutor(
@@ -422,6 +471,7 @@ class AgentRunner:
                     contextvars.copy_context().run,
                     self._execute_single_tool,
                     spec,
+                    result,
                     tool_call,
                 )
                 for tool_call in tool_calls
@@ -450,7 +500,33 @@ class AgentRunner:
             )
         return results_collected
 
-    def _execute_single_tool(self, spec: AgentRunSpec, tool_call: dict) -> dict:
+    @staticmethod
+    def _get_clarify_tool_call(tool_calls: list | None) -> dict | None:
+        for tool_call in tool_calls or []:
+            if tool_call.get("function", {}).get("name") == _CLARIFY_TOOL_NAME:
+                return tool_call
+        return None
+
+    @staticmethod
+    def _get_clarify_stop_status(tool_results: list[dict]) -> str:
+        for tool_result in tool_results:
+            if tool_result.get("name") != _CLARIFY_TOOL_NAME:
+                continue
+            try:
+                payload = json.loads(tool_result.get("result", ""))
+            except Exception:
+                continue
+            status = payload.get("status")
+            if status in {"cancelled", "timeout"}:
+                return str(status)
+        return ""
+
+    def _execute_single_tool(
+        self,
+        spec: AgentRunSpec,
+        result: AgentRunResult,
+        tool_call: dict,
+    ) -> dict:
         started = time.perf_counter()
         func_name = tool_call.get("function", {}).get("name", "")
         func_args_str = tool_call.get("function", {}).get("arguments", "{}")
@@ -477,7 +553,22 @@ class AgentRunner:
                     tool_result = f"Error: 工具 '{func_name}' {validation_error}"
                     error_kind = "validation"
                 else:
-                    if spec.push_target:
+                    if func_name == _CLARIFY_TOOL_NAME:
+                        kwargs_dict["_tool_ctx"] = {
+                            "clarify_callback": lambda question, choices: ask_clarification(
+                                session_key=spec.session_key,
+                                question=question,
+                                choices=choices,
+                                publish=lambda text, status: self._publish_progress(
+                                    spec,
+                                    result,
+                                    text,
+                                    status,
+                                ),
+                                cancel_event=spec.cancel_event,
+                            )
+                        }
+                    elif spec.push_target:
                         kwargs_dict["_tool_ctx"] = {
                             "push_fn": self.runtime.make_exec_push_fn(
                                 lambda msg: self.runtime.deliver_text(

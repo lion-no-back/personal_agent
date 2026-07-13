@@ -146,6 +146,35 @@ def _load_skills(project_root: Path) -> tuple[str, dict]:
     return meta_prompt, skill_bodies
 
 
+def _load_workflow_prompt() -> str:
+    """Build a short fixed-trigger workflow guide for the LLM."""
+    try:
+        from personal_agent.workflows import WorkflowRegistry
+
+        workflows = WorkflowRegistry().get_ondemand_workflows()
+    except Exception as e:
+        logger.warning("加载工作流触发词提示失败: %s", e)
+        return ""
+
+    lines = []
+    for meta in workflows:
+        triggers = " / ".join(meta.intent_triggers)
+        if not triggers:
+            continue
+        usage_items = getattr(meta, "usage_examples", None) or meta.intent_triggers
+        usage = " / ".join(usage_items)
+        lines.append(f"- {meta.name}: 使用方式：{usage}；固定触发词：{triggers}")
+    if not lines:
+        return ""
+    return (
+        "【固定触发词工作流】\n"
+        "以下工作流只能由用户明确发送对应固定触发词触发；"
+        "不得自行改写用户请求或自动执行。"
+        "当用户疑似需要某个工作流但未使用触发词时，必须调用 clarify 告知可用触发词并询问如何继续。\n"
+        + "\n".join(lines)
+    )
+
+
 def _load_channels_config(project_root: Path) -> dict:
     """读取 config/channels.yaml，返回 channels 字典。找不到文件时回退为只启用飞书。"""
     channels_yaml = project_root / "config" / "channels.yaml"
@@ -365,6 +394,11 @@ def main() -> None:
     else:
         logger.info("未发现任何 SKILL.md，技能列表为空")
         skill_bodies = {}
+
+    workflow_prompt = _load_workflow_prompt()
+    if workflow_prompt:
+        extra_prompts.append(workflow_prompt)
+        logger.info("✅ 固定触发词工作流列表已注入系统提示词")
 
     base_extra_system_prompt = "\n\n".join(extra_prompts) if extra_prompts else None
 

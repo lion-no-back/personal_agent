@@ -6,6 +6,7 @@ from .web_fetch_tool import build_web_fetch_tool
 from .web_search_tool import build_web_search_tool
 from .playwright_mcp_tool import build_playwright_tools  # 1. 引入我们的 MCP 桥接工厂
 from .knowledge_tool import build_knowledge_search_tool
+from .clarify_tool import build_clarify_tool
 
 def get_all_tools() -> List[ToolDef]:
     """
@@ -13,6 +14,7 @@ def get_all_tools() -> List[ToolDef]:
     添加新工具后，在此处直接补入注册列即可。
     """
     return [
+        build_clarify_tool(),
         build_read_file_tool(),
         build_web_fetch_tool(),
         build_web_search_tool(),

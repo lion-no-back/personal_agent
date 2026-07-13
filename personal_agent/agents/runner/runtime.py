@@ -49,6 +49,12 @@ class AgentRuntime:
     def get_messages(self, session_key: str) -> list:
         return self.context.get_messages(session_key)
 
+    def get_history_length(self, session_key: str) -> int:
+        return self.context.get_history_length(session_key)
+
+    def rollback_to_length(self, session_key: str, target_len: int) -> None:
+        self.context.rollback_to_length(session_key, target_len)
+
     def add_message(
         self,
         session_key: str,

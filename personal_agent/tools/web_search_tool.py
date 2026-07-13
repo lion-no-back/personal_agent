@@ -172,6 +172,7 @@ def build_web_search_tool() -> ToolDef:
             "在互联网上搜索信息，返回相关网页的标题、URL 和摘要列表。"
             "当需要查找最新资讯、不知道具体 URL 时使用此工具；"
             "如需阅读某个结果的全文，再配合 web_fetch 工具使用。"
+            "如果用户意图、查询对象、指标或时间范围不清楚，必须先调用 clarify 澄清，不能直接搜索。"
         ),
         parameters={
             "type": "object",
