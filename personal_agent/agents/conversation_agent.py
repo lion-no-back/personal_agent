@@ -2,7 +2,6 @@ import logging
 import os
 import re
 import threading
-import time
 import json
 from typing import Callable, Optional
 
@@ -24,7 +23,6 @@ from ..core.task_manager import TaskManager
 from ..memory import MemoryModule
 from ..tools import get_all_tools, get_tools_openai_schema
 from ..tools.exec_tool import CommandResult
-from .conversation_runtime import is_llm_auth_error as _is_llm_auth_error
 from .pipeline import MessagePipeline, PipelineContext
 
 logger = logging.getLogger(__name__)
@@ -51,14 +49,6 @@ _HELP_TEXT = (
     + "\n".join(f"- `{cmd}`：{desc}" for cmd, desc in _BUILTIN_COMMANDS.items())
     + "\n\n> 直接发送消息即可与 AI 对话，无需任何指令。"
 )
-
-_LLM_AUTH_USER_MESSAGE = (
-    "⚠️ **无法调用 AI 服务**：接口密钥未通过验证。\n\n"
-    "请检查环境变量 <text_tag color='neutral'>LLM_API_KEY</text_tag> 与 "
-    "<text_tag color='neutral'>LLM_BASE_URL</text_tag> 是否属于同一服务商且填写正确，"
-    "修改后需重启服务。"
-)
-
 
 class ConversationAgent(BaseAgent):
     """
@@ -843,186 +833,3 @@ class ConversationAgent(BaseAgent):
             f"\n\n---\n"
             f"> 💡 如果回答不够深入，回复「换推理模型」可切换至 **{model_name}** 重新分析。"
         )
-
-    # ──────────────────────────────────────────────────────────
-    #   流式 LLM 调用 + 节流卡片更新
-    # ──────────────────────────────────────────────────────────
-
-    def _stream_and_update(
-        self,
-        messages: list,
-        on_update: Optional[Callable[[str, str], None]],
-        stream_updates_sync_with_llm: bool = False,
-        tools: Optional[list] = None,
-        task_type: str = "default",
-        cancel_event: Optional[threading.Event] = None,
-    ) -> tuple[str, Optional[list]]:
-        """
-        调用 LLM 流式接口，通过后台 flusher 线程解耦 token 消费与卡片刷新。
-
-        架构说明：
-        - 主流程（当前工作线程）：从 think_stream() 消费 token，写入共享 buffer，
-          完全不阻塞于任何 HTTP 调用。
-        - card-flusher 线程：每隔 card_update_interval 秒读取 buffer，
-          调用 on_update 触发平台更新；与主流程完全解耦。
-        - stream_updates_sync_with_llm=True 时：不启用 flusher，在 LLM 流式循环内
-          每次收到累计文本即 on_update(..., "generating")，结束时 on_update(..., "done")，
-          供飞书 CardKit 流式接口推送全文并由客户端逐字渲染。
-        - 两者通过 threading.Event 同步生命周期：主流程结束后 set() 通知
-          flusher 做最终一次刷新并退出。
-
-        节流逻辑（均在 flusher 中完成，主流程零感知）：
-        - 每隔 card_update_interval 秒触发一次 on_update("generating")（带光标 ▌）
-        - 流式结束时必定触发一次 on_update("done")（无光标，最终完整内容）
-        - 若发生异常，触发 on_update("error")；API 密钥无效（401）时不再向上抛出
-        - 其他异常仍向上抛出，由 Gateway 层统一处理
-
-        Args:
-            messages:  完整的 messages 列表（含系统提示 + 历史 + 当前用户消息）
-            on_update: 卡片更新回调，可为 None（测试 / 纯文本模式）
-
-        Returns:
-            完整的 LLM 响应文本；认证失败时为空字符串
-
-        Raises:
-            Exception: 非认证类 LLM 调用异常
-        """
-        # ── 共享状态（CPython GIL 保证简单赋值的原子性） ────────
-        _buf: dict = {"text": "", "error": None, "has_tools": False}
-        _stop = threading.Event()
-        _has_content = threading.Event()  # 首个 token 到达时 set，唤醒 flusher 推首帧
-        _flusher_thread: Optional[threading.Thread] = None
-
-        if on_update and stream_updates_sync_with_llm:
-            try:
-                full_response = ""
-                final_tool_calls = None
-                gen = self._llm.think_stream(messages, tools=tools, task_type=task_type)
-                for _delta, accumulated, tcs in gen:
-                    if cancel_event and cancel_event.is_set():
-                        gen.close()
-                        return full_response, None
-                    full_response = accumulated
-                    final_tool_calls = tcs
-                    if accumulated:
-                        on_update(accumulated, "generating")
-                # When flow finishes, if no tools, it's safe to mark 'done'. If there are tools, we still mark generating until final loop.
-                if not final_tool_calls:
-                    # Send final generating frame; process() sends the authoritative "done".
-                    on_update(full_response or "", "generating")
-                return full_response, final_tool_calls
-            except Exception as e:
-                if _is_llm_auth_error(e):
-                    logger.error(
-                        "❌ LLM API 认证失败（请检查 LLM_API_KEY / LLM_BASE_URL）：%s",
-                        e,
-                        exc_info=False,
-                    )
-                    on_update(_LLM_AUTH_USER_MESSAGE, "error")
-                    return "", None
-                error_msg = (
-                    f"抱歉，AI 调用过程中出现了错误，请稍后重试。\n\n> 错误信息：`{e}`"
-                )
-                on_update(error_msg, "error")
-                logger.error(f"❌ LLM 流式调用失败：{e}", exc_info=True)
-                raise
-
-        if on_update:
-
-            def _flusher() -> None:
-                """
-                打字机刷新线程：以固定节奏逐步揭露 buffer 中的文本。
-
-                核心设计：
-                - 用 time.sleep(interval) 替代 _stop.wait(timeout=interval)。
-                  _stop.wait 一旦被 stop 信号唤醒就立即返回，导致快速 LLM
-                  完成时中间帧全部被跳过（一次性出现全文）；time.sleep 则
-                  严格等满 interval，LLM 完成后仍按节奏继续揭字，直到追上。
-                - display_idx 是"已揭露到第几个字符"的游标，每帧前进
-                  stream_chars_per_tick 步，与 buffer 实际写入进度解耦。
-                - LLM 完成（_stop set）且剩余字符过多时自动加速，保证
-                  最多再经过 5 帧就能揭完并发出 "done"，不会长时间占用线程。
-                """
-                display_idx = 0
-
-                # 等待首个 token（认证失败时由 finally 负责 set 以解除阻塞）
-                _has_content.wait()
-
-                while True:
-                    full_text = _buf["text"]
-                    err = _buf["error"]
-
-                    # 错误路径：立即推送错误信息并退出
-                    if err is not None:
-                        on_update(err, "error")
-                        return
-
-                    llm_done = _stop.is_set()
-                    avail = len(full_text)
-
-                    # ── 写完即停手 ──────────────────────────────────
-                    # LLM 一结束就立刻把完整全文推一帧后退出，不再逐帧"补动画"。
-                    # 这样打字线程在 done 之后的存活窗口≈0，join 立即返回，
-                    # 上层 process() 紧随其后发的 "done" 收尾天然串行在最后一帧之后，
-                    # 不会再出现"收尾后迟到 generating 帧把卡片翻回输出中"。
-                    # 此处仍发 "generating"（而非 "done"）：权威的 "done" 由 process()
-                    # 追加路由提示后统一发送，避免重复 _on_done 导致内容重复。
-                    if llm_done:
-                        on_update(full_text, "generating")
-                        return
-
-                    # LLM 仍在生成：按节奏逐步揭字，做打字机动画
-                    if avail > display_idx:
-                        display_idx = min(display_idx + self._stream_chars_per_tick, avail)
-                        on_update(full_text[:display_idx] + " ▌", "generating")
-
-                    time.sleep(self._card_update_interval)
-
-            _flusher_thread = threading.Thread(
-                target=_flusher, daemon=True, name="card-flusher"
-            )
-            _flusher_thread.start()
-
-        try:
-            full_response = ""
-            final_tool_calls = None
-            for _delta, accumulated, tcs in self._llm.think_stream(messages, tools=tools, task_type=task_type):
-                full_response = accumulated
-                final_tool_calls = tcs
-                if tcs:
-                    _buf["has_tools"] = True
-                if accumulated:
-                    # 非阻塞写入共享 buffer，flusher 会自行读取
-                    _buf["text"] = accumulated
-                # 无论是否有文本，首次调用时唤醒 flusher 推送首帧
-                _has_content.set()
-
-            # 由于有可能是纯 tools 的结果（accumulated 为空），如果没设文本但也结束了
-            _buf["text"] = full_response
-            return full_response, final_tool_calls
-
-        except Exception as e:
-            if _is_llm_auth_error(e):
-                logger.error(
-                    "❌ LLM API 认证失败（请检查 LLM_API_KEY / LLM_BASE_URL）：%s",
-                    e,
-                    exc_info=False,
-                )
-                _buf["error"] = _LLM_AUTH_USER_MESSAGE
-                return "", None
-
-            error_msg = (
-                f"抱歉，AI 调用过程中出现了错误，请稍后重试。\n\n> 错误信息：`{e}`"
-            )
-            _buf["error"] = error_msg
-            logger.error(f"❌ LLM 流式调用失败：{e}", exc_info=True)
-            raise
-
-        finally:
-            # 无论正常结束还是异常，都通知 flusher 执行最终刷新并等待其退出。
-            # _has_content.set() 确保 flusher 不会永久阻塞在阶段 1 的 wait()
-            # （例如 LLM 在产生任何 token 之前就抛出认证异常的情况）。
-            if _flusher_thread is not None:
-                _has_content.set()
-                _stop.set()
-                _flusher_thread.join(timeout=30)
