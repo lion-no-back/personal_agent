@@ -19,6 +19,5 @@ class CommandStage:
         if command_response is None:
             return
 
-        if ctx.on_update:
-            ctx.on_update(command_response, "done")
+        ctx.publish_progress(command_response, "done")
         ctx.stop(command_response)

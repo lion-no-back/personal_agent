@@ -68,12 +68,12 @@ class ConversationAgent(BaseAgent):
     1. 识别并响应内置指令（/clear、/help 等）
     2. 将用户消息追加到对应会话的上下文
     3. 组装含历史记录的 messages 列表并传给 LLM
-    4. 驱动流式 LLM 调用，通过 on_update 回调实时推送卡片更新
+    4. 驱动流式 LLM 调用，通过 ResponsePublisher 发布实时进度
     5. 将 AI 回复写回上下文，供后续轮次使用
 
     解耦设计：
     - 不直接引用任何飞书 SDK 类，平台细节由 Gateway 层处理
-    - on_update 回调由 Gateway 层注入，Agent 只负责何时调用
+    - Gateway 只注册平台渲染 sink，Agent 只发布标准进度事件
     - card_update_interval 控制回调频率（旧版 PATCH 卡片；飞书 CardKit 流式模式应使用
       stream_updates_sync_with_llm=True，由客户端按 print_step 做打字机）
     """
@@ -222,8 +222,8 @@ class ConversationAgent(BaseAgent):
         keep_thinking: bool = True,
     ) -> str:
         """Process a standard bus inbound message through the existing pipeline."""
-        effective_on_update = on_update
-        if effective_on_update is None and publish_progress and self._message_bus is not None:
+        response_publisher = on_update
+        if response_publisher is None and publish_progress and self._message_bus is not None:
             target = progress_target or message.message_id
 
             def _publish_progress(content: str, status: str) -> None:
@@ -235,11 +235,11 @@ class ConversationAgent(BaseAgent):
                     )
                 )
 
-            effective_on_update = _publish_progress
+            response_publisher = _publish_progress
 
         return self.process(
             message.to_legacy_event(),
-            on_update=effective_on_update,
+            response_publisher=response_publisher,
             stream_updates_sync_with_llm=stream_updates_sync_with_llm,
             push_target=push_target,
             cancel_event=cancel_event,
@@ -251,6 +251,7 @@ class ConversationAgent(BaseAgent):
         event,
         on_update: Optional[Callable[[str, str], None]] = None,
         *,
+        response_publisher: Optional[Callable[[str, str], None]] = None,
         stream_updates_sync_with_llm: bool = False,
         push_target: Optional[str] = None,
         cancel_event: Optional[threading.Event] = None,
@@ -268,9 +269,10 @@ class ConversationAgent(BaseAgent):
         Returns:
             AI 生成的完整回复文本；指令场景直接返回指令响应文本
         """
+        publisher = response_publisher or on_update
         ctx = PipelineContext(
             event=event,
-            on_update=on_update,
+            response_publisher=publisher,
             stream_updates_sync_with_llm=stream_updates_sync_with_llm,
             push_target=push_target,
             cancel_event=cancel_event,
@@ -338,7 +340,7 @@ class ConversationAgent(BaseAgent):
                 self._ondemand_workflows = []
         return self._ondemand_workflows
 
-    def _check_ondemand_workflow(self, event, session_key: str, on_update) -> Optional[str]:
+    def _check_ondemand_workflow(self, event, session_key: str, progress_publisher) -> Optional[str]:
         """
         检查消息是否命中某个按需 workflow 的 intent_triggers。
         命中则启动后台线程执行，立即返回 ACK 字符串；未命中返回 None。
@@ -357,8 +359,8 @@ class ConversationAgent(BaseAgent):
                 triggers = " / ".join(f"**{t}**" for t in m.intent_triggers)
                 lines.append(f"| {m.name} | {triggers} |")
             help_text = "\n".join(lines)
-            if on_update:
-                on_update(help_text, "done")
+            if progress_publisher:
+                progress_publisher(help_text, "done")
             return help_text
 
         for meta in self._get_ondemand_workflows():
@@ -367,28 +369,33 @@ class ConversationAgent(BaseAgent):
 
             delivery_key = self._derive_delivery_key(event)
             ack = f"⏳ 正在执行【{meta.name}】，请稍候..."
-            if on_update:
-                on_update(ack, "processing")
+            if progress_publisher:
+                progress_publisher(ack, "processing")
 
             # 捕获触发者（当前 worker 线程的 contextvar），供工作流 usage 回传后归账
             from ..core.usage_tracker import current_user
             usage_user = current_user.get()
             self._run_ondemand_workflow_async(
-                meta, delivery_key, content, on_update=on_update, usage_user=usage_user
+                meta, delivery_key, content, progress_publisher=progress_publisher, usage_user=usage_user
             )
             return ack
 
         return None
 
-    def _run_ondemand_workflow_async(self, meta, delivery_key: str, event_content: str = "", on_update=None, usage_user=None) -> None:
+    def _run_ondemand_workflow_async(self, meta, delivery_key: str, event_content: str = "", progress_publisher=None, usage_user=None) -> None:
         """在后台 daemon 线程中执行按需 workflow，完成后通过 MessageBus 投递结果。
 
         工作流在独立子进程里运行（见 workflows/dispatch.py）：主进程不 import 其重原生库
         （numpy/pandas/torch 等），从根上避免多线程并发首次导入的竞态。
         """
         from personal_agent.workflows.dispatch import run_in_subprocess, INSTALL_GRACE_SECONDS
+        from ..core.telemetry import get_trace_context, set_trace_context
+
+        trace_context = get_trace_context()
 
         def _run():
+            if trace_context is not None:
+                set_trace_context(trace_context, workflow_id=meta.id)
             base_timeout = getattr(meta, "timeout", None)
             result = run_in_subprocess(
                 module=f"personal_agent.workflows.{meta.id}.runner",
@@ -428,14 +435,14 @@ class ConversationAgent(BaseAgent):
             if message:
                 # 优先把结果 finalize 到同一张「处理中」卡片；失败/无回调回退独立文字消息
                 delivered = False
-                if on_update is not None:
+                if progress_publisher is not None:
                     try:
                         # 卡片成功终态自带「✅完成」徽标，去掉正文重复的成功 emoji 前缀。
                         # 只剥成功标记（✅✔️☑️）；失败的 ❌/⚠️ 必须保留——否则卡片仍显示
                         # 「完成」徽标、正文又没了失败标记，用户将无法分辨成功还是失败。
                         # 文字降级路径无徽标，仍用带前缀的原 message。
                         card_message = re.sub(r"^[\s✅✔️☑️]+", "", message)
-                        on_update(card_message, "done")
+                        progress_publisher(card_message, "done")
                         delivered = True
                     except Exception:
                         logger.exception("[ondemand:%s] 卡片 finalize 失败，回退文字投递", meta.id)

@@ -13,7 +13,7 @@ class WorkflowStage:
         ondemand_ack = self.agent._check_ondemand_workflow(
             ctx.event,
             ctx.session_key,
-            ctx.on_update,
+            ctx.publish_progress,
         )
         if ondemand_ack is not None:
             ctx.stop(ondemand_ack)

@@ -238,7 +238,7 @@ class FeishuGateway(BaseGateway):
     - _ws_client:   lark.ws.Client     被动接收飞书事件推送（WebSocket 长连接）
 
     依赖注入（解耦设计）：
-    - agent:    任何实现了 BaseAgent.process() 的 Agent 实例
+    - agent:    任何实现了 BaseAgent.process_inbound() 的 Agent 实例
     - context:  ConversationContext 实例（用于消息去重）
     """
 

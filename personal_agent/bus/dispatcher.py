@@ -16,6 +16,7 @@ from .events import (
     ProgressUpdate,
 )
 from .message_bus import MessageBus
+from .tracing import delivery_attrs, emit_bus_event
 
 logger = logging.getLogger(__name__)
 
@@ -29,17 +30,23 @@ class GatewayDispatcher:
 
     def dispatch(self, event: OutboundEvent) -> DeliveryReport:
         if isinstance(event, OutboundText):
-            return self._dispatch_text(event)
+            report = self._dispatch_text(event)
         elif isinstance(event, OutboundFile):
-            return self._dispatch_file(event)
+            report = self._dispatch_file(event)
         elif isinstance(event, OutboundImageText):
-            return self._dispatch_image_text(event)
+            report = self._dispatch_image_text(event)
         elif isinstance(event, ProgressUpdate):
             self._dispatch_progress(event)
             return DeliveryReport(event_kind=event.kind)
         else:
             logger.warning("Unknown outbound event type: %s", type(event).__name__)
             return DeliveryReport(event_kind=getattr(event, "kind", type(event).__name__))
+        emit_bus_event(
+            "bus.delivery.report",
+            status=self._report_status(report),
+            attrs=delivery_attrs(report),
+        )
+        return report
 
     def _dispatch_text(self, event: OutboundText) -> DeliveryReport:
         attempts: list[DeliveryAttempt] = []
@@ -101,8 +108,23 @@ class GatewayDispatcher:
     def _dispatch_progress(self, event: ProgressUpdate) -> None:
         if self._message_bus is None:
             logger.debug("ProgressUpdate has no message bus registry | target=%s", event.target)
+            emit_bus_event(
+                "bus.progress.missing_sink",
+                status="error",
+                attrs={"status": event.status},
+            )
             return
         self._message_bus.dispatch_progress(event)
+
+    @staticmethod
+    def _report_status(report: DeliveryReport) -> str:
+        if report.succeeded > 0 and report.failed == 0:
+            return "ok"
+        if report.succeeded > 0 and report.failed > 0:
+            return "partial"
+        if report.matched == 0:
+            return "dropped"
+        return "error"
 
     @staticmethod
     def _gateway_accepts_target(gateway: Any, target: str) -> bool:

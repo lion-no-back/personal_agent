@@ -260,7 +260,11 @@ def emit_event(
         config = load_config()
         if not config.enabled:
             return
-        context = set_trace_context(**context_updates)
+        context = (
+            set_trace_context(**context_updates)
+            if context_updates
+            else get_trace_context()
+        )
         payload: dict[str, Any] = {
             "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
             "event": event,

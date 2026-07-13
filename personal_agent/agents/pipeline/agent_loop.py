@@ -110,13 +110,12 @@ class AgentLoopStage:
             )
 
             def custom_on_update(content: str, status: str) -> None:
-                if ctx.on_update:
-                    combined = (
-                        ctx.ui_text_buffer + content
-                        if ctx.keep_thinking
-                        else content
-                    )
-                    ctx.on_update(combined.strip(), status)
+                combined = (
+                    ctx.ui_text_buffer + content
+                    if ctx.keep_thinking
+                    else content
+                )
+                ctx.publish_progress(combined.strip(), status)
 
             if turn_index == 1:
                 if event_images:

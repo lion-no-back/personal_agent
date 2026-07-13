@@ -7,7 +7,9 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from ..core.telemetry import start_trace
 from .events import InboundMessage, OutboundEvent, ProgressUpdate
+from .tracing import emit_bus_event, outbound_attrs, should_trace_progress, target_preview, value_hash
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +78,26 @@ class MessageBus:
             sink = self._progress_sinks.get(event.target)
         if sink is None:
             logger.debug("ProgressUpdate has no active sink | target=%s", event.target)
+            emit_bus_event(
+                "bus.progress.missing_sink",
+                status="error",
+                attrs={
+                    "status": event.status,
+                    "target_hash": value_hash(event.target),
+                    "target_preview": target_preview(event.target),
+                    "progress_chars": len(event.content or ""),
+                },
+            )
             return False
 
         try:
             sink(event.content, event.status)
+            if should_trace_progress(event.status):
+                emit_bus_event(
+                    "bus.progress.update",
+                    status=event.status,
+                    attrs=outbound_attrs(event),
+                )
             return True
         finally:
             if event.status in {"done", "error", "cancelled"}:
@@ -88,8 +106,31 @@ class MessageBus:
                         self._progress_sinks.pop(event.target, None)
 
     def publish_inbound(self, message: InboundMessage) -> list[Any]:
+        start_trace(
+            source=message.source,
+            platform=message.source,
+            message_id=message.message_id,
+            cron_job_id=message.metadata.get("job_id") if isinstance(message.metadata, dict) else None,
+        )
         with self._lock:
             subscribers = list(self._inbound_subscribers)
+        emit_bus_event(
+            "bus.inbound.publish",
+            status="ok" if subscribers else "dropped",
+            attrs={
+                "source": message.source,
+                "chat_type": message.chat_type,
+                "account_id": message.account_id,
+                "agent_id": message.agent_id,
+                "is_scheduled": message.is_scheduled,
+                "input_chars": len(message.content or ""),
+                "attached_files": len(message.attached_files),
+                "images": len(message.images),
+                "subscriber_count": len(subscribers),
+            },
+            message_id=message.message_id,
+            platform=message.source,
+        )
         if not subscribers:
             logger.debug("Inbound message has no subscribers | source=%s", message.source)
             return []
@@ -99,17 +140,46 @@ class MessageBus:
             try:
                 results.append(subscriber(message))
             except Exception:
+                emit_bus_event(
+                    "bus.inbound.handled",
+                    status="error",
+                    attrs={
+                        "source": message.source,
+                        "subscriber": getattr(subscriber, "__qualname__", repr(subscriber)),
+                    },
+                    message_id=message.message_id,
+                    platform=message.source,
+                )
                 logger.exception(
                     "Inbound subscriber failed | source=%s message_id=%s",
                     message.source,
                     message.message_id,
                 )
                 raise
+        emit_bus_event(
+            "bus.inbound.handled",
+            status="ok",
+            attrs={
+                "source": message.source,
+                "subscriber_count": len(subscribers),
+                "result_count": len(results),
+                "string_results": sum(1 for result in results if isinstance(result, str)),
+            },
+            message_id=message.message_id,
+            platform=message.source,
+        )
         return results
 
     def publish_outbound(self, event: OutboundEvent) -> list[Any]:
         with self._lock:
             subscribers = list(self._outbound_subscribers)
+        should_trace = not isinstance(event, ProgressUpdate) or should_trace_progress(event.status)
+        if should_trace:
+            emit_bus_event(
+                "bus.outbound.publish",
+                status="ok" if subscribers else "dropped",
+                attrs={**outbound_attrs(event), "subscriber_count": len(subscribers)},
+            )
         if not subscribers:
             logger.debug("Outbound event has no subscribers | kind=%s", event.kind)
             return []
@@ -119,7 +189,25 @@ class MessageBus:
             try:
                 results.append(subscriber(event))
             except Exception:
+                if should_trace:
+                    emit_bus_event(
+                        "bus.outbound.handled",
+                        status="error",
+                        attrs={
+                            **outbound_attrs(event),
+                            "subscriber": getattr(subscriber, "__qualname__", repr(subscriber)),
+                        },
+                    )
                 logger.exception("Outbound subscriber failed | kind=%s", event.kind)
-                if isinstance(event, ProgressUpdate):
-                    raise
+                raise
+        if should_trace:
+            emit_bus_event(
+                "bus.outbound.handled",
+                status="ok",
+                attrs={
+                    **outbound_attrs(event),
+                    "subscriber_count": len(subscribers),
+                    "result_count": len(results),
+                },
+            )
         return results

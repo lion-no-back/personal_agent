@@ -25,15 +25,14 @@ class DeliveryStage:
             session_key=ctx.session_key,
         )
 
-        if ctx.on_update:
-            if ctx.keep_thinking:
-                done_text = sanitized
-            else:
-                done_text = sanitize_output(
-                    ctx.final_response.strip(),
-                    session_key=ctx.session_key,
-                )
-            ctx.on_update(done_text, "done")
+        if ctx.keep_thinking:
+            done_text = sanitized
+        else:
+            done_text = sanitize_output(
+                ctx.final_response.strip(),
+                session_key=ctx.session_key,
+            )
+        ctx.publish_progress(done_text, "done")
 
         if ctx.delivery_kind == "success":
             if self.agent._memory:

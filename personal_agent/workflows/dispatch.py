@@ -147,6 +147,11 @@ def _run_in_subprocess_once(
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
+    try:
+        from personal_agent.core.telemetry import telemetry_env
+        env.update(telemetry_env())
+    except Exception:
+        logger.debug("[dispatch] telemetry context export skipped", exc_info=True)
     if content is not None:
         env["WF_CONTENT"] = content
 
