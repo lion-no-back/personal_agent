@@ -12,7 +12,7 @@ class PipelineContext:
     event: object
     on_update: Optional[Callable[[str, str], None]] = None
     stream_updates_sync_with_llm: bool = False
-    push_fn: Optional[Callable[[str], None]] = None
+    push_target: Optional[str] = None
     cancel_event: Optional[threading.Event] = None
     keep_thinking: bool = True
 

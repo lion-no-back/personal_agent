@@ -11,7 +11,7 @@
     scheduler = SchedulerDaemon(config_path=_PROJECT_ROOT / "config" / "scheduler.yaml")
     scheduler.start(
         agent=agent,
-        notify_fn=gateway.send_text,
+        message_bus=message_bus,
         alert_callback=None,   # 仅日志；传入回调即可接入飞书告警
     )
 """
@@ -24,7 +24,9 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
+
+from personal_agent.bus import MessageBus, OutboundText
 
 from .config_loader import SchedulerConfig, load_scheduler_config
 from .cron_engine import CronEngine
@@ -59,9 +61,7 @@ class SchedulerDaemon:
         self,
         *,
         agent=None,
-        notify_fn: Optional[Callable[[str, str], None]] = None,
-        send_file_fn: Optional[Callable[[str, str, str], None]] = None,
-        send_image_text_fn: Optional[Callable[[str, str, str], None]] = None,
+        message_bus: Optional[MessageBus] = None,
         alert_callback: Optional[AlertCallback] = None,
     ) -> None:
         """
@@ -69,8 +69,7 @@ class SchedulerDaemon:
 
         Args:
             agent:          ConversationAgent 实例（agent_message 类型任务需要）
-            notify_fn:      notify_fn(session_key, text) 将 cron 结果投递到网关
-            send_file_fn:   send_file_fn(session_key, file_path, filename) 投递文件
+            message_bus:    通过 OutboundEvent 将 cron 结果投递到网关
             alert_callback: 心跳状态变更回调 callback(id, name, is_up, message)
         """
         config = (
@@ -106,15 +105,17 @@ class SchedulerDaemon:
         )
         self._thread.start()
 
-        # 若 YAML 配置了 alert_to 且外部未传入回调，则自动构建飞书告警回调
-        if config.alert_to and notify_fn and alert_callback is None:
+        # 若 YAML 配置了 alert_to 且外部未传入回调，则通过消息总线投递告警
+        if config.alert_to and message_bus and alert_callback is None:
             _alert_to = config.alert_to
-            _notify = notify_fn
+            _message_bus = message_bus
             def alert_callback(
                 service_id: str, service_name: str, is_up: bool, message: str
             ) -> None:
                 status = "💚 恢复正常" if is_up else "🔴 服务异常"
-                _notify(_alert_to, f"{status} | {service_name}\n{message}")
+                _message_bus.publish_outbound(
+                    OutboundText.to(_alert_to, f"{status} | {service_name}\n{message}")
+                )
 
         persistence: Optional[JobPersistence] = None
         if config.persist.enabled and all_jobs:
@@ -130,9 +131,7 @@ class SchedulerDaemon:
             jobs=all_jobs,
             timezone=config.timezone,
             agent=agent,
-            notify_fn=notify_fn,
-            send_file_fn=send_file_fn,
-            send_image_text_fn=send_image_text_fn,
+            message_bus=message_bus,
             persistence=persistence,
             default_misfire_grace_time=config.persist.default_misfire_grace_time,
         )

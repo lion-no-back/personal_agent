@@ -458,50 +458,47 @@ def main() -> None:
             file_stash.set_remind_callback(gw.send_stash_remind_card)
 
     # ── Step 7.5: 启动调度器（定时任务 + 心跳引擎） ──────────
+    from personal_agent.bus import (
+        GatewayDispatcher,
+        InboundMessage,
+        MessageBus,
+    )
     from personal_agent.scheduler import SchedulerDaemon
 
-    # 广播 notify_fn：尝试所有 gateway，各自按 session_key 前缀决定是否发送
-    def _broadcast_notify(session_key: str, text: str) -> None:
-        for gw in gateways:
-            try:
-                gw.send_text(session_key, text)
-            except NotImplementedError:
-                logger.debug("%s.send_text 未实现，跳过", gw.platform)
-            except Exception as exc:
-                logger.error("%s.send_text 失败: %s", gw.platform, exc)
+    message_bus = MessageBus()
+    gateway_dispatcher = GatewayDispatcher(gateways, message_bus=message_bus)
+    message_bus.subscribe_outbound(gateway_dispatcher.dispatch)
+    for gw in gateways:
+        if hasattr(gw, "set_message_bus"):
+            gw.set_message_bus(message_bus)
 
-    def _broadcast_send_file(session_key: str, file_path: str, filename: str) -> None:
-        for gw in gateways:
-            try:
-                gw.send_file(session_key, file_path, filename)
-            except NotImplementedError:
-                logger.debug("%s.send_file 未实现，跳过", gw.platform)
-            except Exception as exc:
-                logger.error("%s.send_file 失败: %s", gw.platform, exc)
+    def _handle_inbound_message(msg: InboundMessage):
+        target_agent = agents.get(msg.agent_id) if msg.agent_id else None
+        runtime = msg.metadata.get("_runtime", {}) if isinstance(msg.metadata, dict) else {}
+        progress_target = runtime.get("progress_target") or msg.message_id
 
-    def _broadcast_send_image_text(session_key: str, image_path: str, text: str) -> None:
-        for gw in gateways:
-            try:
-                gw.send_image_text(session_key, image_path, text)
-            except NotImplementedError:
-                logger.debug("%s.send_image_text 未实现，跳过", gw.platform)
-            except Exception as exc:
-                logger.error("%s.send_image_text 失败: %s", gw.platform, exc)
+        return (target_agent or agent).process_inbound(
+            msg,
+            progress_target=progress_target,
+            publish_progress=bool(runtime.get("publish_progress", False)),
+            stream_updates_sync_with_llm=bool(runtime.get("stream_updates_sync_with_llm", False)),
+            push_target=runtime.get("push_target"),
+            cancel_event=runtime.get("cancel_event"),
+            keep_thinking=runtime.get("keep_thinking", True),
+        )
+
+    message_bus.subscribe_inbound(_handle_inbound_message)
 
     for agent_instance in agents.values():
-        agent_instance._notify_fn = _broadcast_notify
-        agent_instance._send_file_fn = _broadcast_send_file
-        agent_instance._send_image_text_fn = _broadcast_send_image_text
-    logger.info("✅ 按需 workflow 投递回调已注入 Agent | count=%d", len(agents))
+        agent_instance.set_message_bus(message_bus)
+    logger.info("✅ MessageBus 已注入 Agent | count=%d", len(agents))
 
     scheduler = SchedulerDaemon(
         config_path=_PROJECT_ROOT / "config" / "scheduler.yaml"
     )
     scheduler.start(
         agent=agent,
-        notify_fn=_broadcast_notify,
-        send_file_fn=_broadcast_send_file,
-        send_image_text_fn=_broadcast_send_image_text,
+        message_bus=message_bus,
         alert_callback=None,
     )
     logger.info("✅ SchedulerDaemon 就绪")

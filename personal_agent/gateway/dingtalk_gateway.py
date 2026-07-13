@@ -32,6 +32,7 @@ except ImportError as _e:
         "dingtalk-stream 未安装，请执行: pip install dingtalk-stream"
     ) from _e
 
+from ..bus import InboundMessage, MessageBus
 from ..routing import AccessPolicy, SessionRunLocks
 from .base_gateway import BaseGateway
 from .dingtalk_media import DingTalkMediaClient
@@ -695,6 +696,7 @@ class DingTalkGateway(BaseGateway):
         self._context = context
         self._task_manager = task_manager
         self._file_stash = file_stash
+        self._message_bus: MessageBus | None = None
 
         # 用户白名单：DINGTALK_ALLOWED_USERS 逗号分隔的 staffId 列表
         # 未配置时允许所有人（兼容现有部署），但打印警告
@@ -757,6 +759,50 @@ class DingTalkGateway(BaseGateway):
     @property
     def platform(self) -> str:
         return f"dingtalk:{self._account_id}"
+
+    def set_message_bus(self, message_bus: MessageBus) -> None:
+        self._message_bus = message_bus
+
+    def _publish_agent_message(self, event: DingTalkMessageEvent, **runtime):
+        runtime_for_bus = dict(runtime)
+        progress_sink = runtime_for_bus.pop("on_update", None)
+        progress_target = runtime_for_bus.get("progress_target") or event.message_id
+        runtime_for_bus["progress_target"] = progress_target
+        runtime_for_bus["publish_progress"] = callable(progress_sink)
+        inbound = InboundMessage(
+            source="dingtalk",
+            message_id=event.message_id,
+            chat_id=event.chat_id,
+            chat_type=event.chat_type,
+            content=event.content,
+            sender_id=event.sender_open_id,
+            sender_name=event.sender_name,
+            thread_id=event.thread_id,
+            attached_files=list(event.attached_files),
+            images=list(event.images),
+            is_scheduled=event.is_scheduled,
+            account_id=event.account_id,
+            agent_id=event.agent_id,
+            metadata={"_runtime": runtime_for_bus},
+        )
+        if self._message_bus is None:
+            return self._agent.process_inbound(inbound, **runtime)
+        unregister_progress = None
+        if callable(progress_sink):
+            unregister_progress = self._message_bus.register_progress_sink(
+                progress_target,
+                progress_sink,
+            )
+        try:
+            responses = self._message_bus.publish_inbound(inbound)
+        except Exception:
+            if unregister_progress is not None:
+                unregister_progress()
+            raise
+        for response in responses:
+            if isinstance(response, str):
+                return response
+        return ""
 
     def start(self) -> None:
         """
@@ -831,6 +877,7 @@ class DingTalkGateway(BaseGateway):
                 session_key,
                 e,
             )
+            raise
 
     def send_file(self, session_key: str, file_path: str, filename: str) -> None:
         """
@@ -856,6 +903,7 @@ class DingTalkGateway(BaseGateway):
                 filename,
                 e,
             )
+            raise
 
     def send_image_text(self, session_key: str, image_path: str, text: str) -> None:
         """
@@ -885,6 +933,7 @@ class DingTalkGateway(BaseGateway):
                 image_path,
                 e,
             )
+            raise
 
     # ──────────────────────────────────────────────────────────
     #   消息派发（由 _MessageHandler 调用）
@@ -1126,7 +1175,7 @@ class DingTalkGateway(BaseGateway):
         """
         if renderer is not None:
             try:
-                self._agent.process(event, on_update=renderer.on_update, keep_thinking=False)
+                self._publish_agent_message(event, on_update=renderer.on_update, keep_thinking=False)
             except Exception as e:
                 logger.error(
                     "Agent 处理失败 | account=%s agent=%s session=%s message_id=%s error=%s",
@@ -1147,7 +1196,7 @@ class DingTalkGateway(BaseGateway):
                     final_reply.append(text)
 
             try:
-                self._agent.process(event, on_update=on_update)
+                self._publish_agent_message(event, on_update=on_update)
             except Exception as e:
                 logger.error(
                     "Agent 处理失败 | account=%s agent=%s session=%s message_id=%s error=%s",

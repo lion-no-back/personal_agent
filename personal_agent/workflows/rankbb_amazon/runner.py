@@ -19,8 +19,19 @@ import sys
 from pathlib import Path
 
 from . import config  # 设置 PLAYWRIGHT_BROWSERS_PATH 指向本工作流 chromium/ 目录
+from personal_agent.workflows.errors import WorkflowBusinessError, rankbb_browser_failed_error
 
 logger = logging.getLogger(__name__)
+
+_BROWSER_FAILURE_MARKERS = (
+    "TargetClosedError",
+    "BrowserType.launch",
+    "launch_persistent_context",
+    "browser has been closed",
+    "3221225477",
+    "0xC0000005",
+    "Playwright",
+)
 
 # scrapling[all] 装好后会带来这两个包；缺任一即视为未安装。
 # 裸装 scrapling 也能 import scrapling，但 import scrapling.fetchers 需要 extra 带来的 curl_cffi。
@@ -70,6 +81,11 @@ def _deps_ready() -> bool:
     return pkgs_ok and _browser_ready()
 
 
+def _is_browser_start_failure(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}"
+    return any(marker in text for marker in _BROWSER_FAILURE_MARKERS)
+
+
 def _ensure_deps() -> None:
     """配置段调用：装 scrapling[all]，并确保本工作流目录内有 Chromium（缺则下载）。"""
     missing = [p for p in _CHECK_PACKAGES if importlib.util.find_spec(p) is None]
@@ -109,7 +125,15 @@ def _run_broadcast() -> dict:
 
     from . import brand_rank_checker as checker
 
-    results_sorted, shots, stats_by_site = checker.run_pipeline()
+    try:
+        results_sorted, shots, stats_by_site = checker.run_pipeline()
+    except WorkflowBusinessError:
+        raise
+    except Exception as exc:
+        logger.exception("[rankbb_amazon] 排名播报采集失败")
+        if _is_browser_start_failure(exc):
+            raise rankbb_browser_failed_error(exc) from exc
+        raise
 
     if not results_sorted:
         return {"message": "（本次抓取范围内无目标品牌上榜）", "segments": []}

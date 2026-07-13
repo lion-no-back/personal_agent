@@ -7,7 +7,7 @@ class BaseGateway(ABC):
 
     职责：
     - 定义 start()：阻塞当前线程维持长连接（asyncio 型网关实现为 asyncio.run(...)）
-    - 定义 send_text() / send_file()：主动发送接口，供调度器 notify_fn 使用
+    - 定义 send_text() / send_file()：主动发送接口，供 GatewayDispatcher 投递 OutboundEvent 使用
     - 提供 make_session_key()：统一 session key 格式，防止跨平台 ID 碰撞
     """
 
@@ -49,7 +49,7 @@ class BaseGateway(ABC):
     def send_text(self, session_key: str, text: str) -> None:
         """
         向指定会话发送纯文本消息。
-        session_key 格式见 make_session_key()，调度器 notify_fn 使用此接口。
+        session_key 格式见 make_session_key()，GatewayDispatcher 使用此接口。
         """
 
     @abstractmethod

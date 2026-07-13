@@ -25,6 +25,15 @@ from typing import TYPE_CHECKING, Callable, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from personal_agent.bus import (
+    DeliveryReport,
+    InboundMessage,
+    MessageBus,
+    OutboundFile,
+    OutboundImageText,
+    OutboundText,
+)
+
 from .config_loader import CronJobConfig
 
 if TYPE_CHECKING:
@@ -48,7 +57,7 @@ def _wrap_job(
     inner: Callable[[], "asyncio.Coroutine"],
     lock: asyncio.Lock,
     persistence: "Optional[JobPersistence]" = None,
-    notify_fn: Optional[Callable[[str, str], None]] = None,
+    deliver_text: Optional[Callable[[str, str], None]] = None,
 ) -> Callable[[], "asyncio.Coroutine"]:
     """
     统一执行器包装：
@@ -125,9 +134,9 @@ def _wrap_job(
                     if persistence is not None and attempt_id is not None:
                         persistence.record_attempt_end(attempt_id, "timeout", elapsed)
                     # 超时不重试：线程仍在运行，重试会并发冲突
-                    if notify_fn and _is_valid_receive_id(job_config.deliver_to):
+                    if deliver_text and _is_valid_receive_id(job_config.deliver_to):
                         try:
-                            notify_fn(
+                            deliver_text(
                                 job_config.deliver_to,
                                 f"⏰ {job_config.name} 执行超时（>{job_config.timeout:.0f}s）",
                             )
@@ -147,14 +156,14 @@ def _wrap_job(
                     if persistence is not None and attempt_id is not None:
                         persistence.record_attempt_end(attempt_id, "error", elapsed)
                     if is_final:
-                        if notify_fn and _is_valid_receive_id(job_config.deliver_to):
+                        if deliver_text and _is_valid_receive_id(job_config.deliver_to):
                             try:
                                 retry_info = (
                                     f"，已重试 {job_config.max_retries} 次"
                                     if job_config.max_retries > 0
                                     else ""
                                 )
-                                notify_fn(
+                                deliver_text(
                                     job_config.deliver_to,
                                     f"❌ {job_config.name} 执行失败{retry_info}",
                                 )
@@ -215,9 +224,7 @@ class CronEngine:
         jobs: list[CronJobConfig],
         timezone: str = "UTC",
         agent=None,
-        notify_fn: Optional[Callable[[str, str], None]] = None,
-        send_file_fn: Optional[Callable[[str, str, str], None]] = None,
-        send_image_text_fn: Optional[Callable[[str, str, str], None]] = None,
+        message_bus: Optional[MessageBus] = None,
         persistence: "Optional[JobPersistence]" = None,
         default_misfire_grace_time: int = 259200,
     ) -> None:
@@ -226,21 +233,83 @@ class CronEngine:
             jobs:                       cron 任务配置列表
             timezone:                   调度时区，约束要求统一 UTC
             agent:                      ConversationAgent 实例（agent_message 类型需要）
-            notify_fn:                  notify_fn(session_key, text) 投递文本消息（可选）
-            send_file_fn:               send_file_fn(session_key, file_path, filename) 投递文件（可选）
+            message_bus:                用于发布 OutboundEvent 投递 cron 结果
             persistence:                JobPersistence 实例；None = 不持久化、不补跑
             default_misfire_grace_time: 全局默认补跑窗口（秒），可被任务级配置覆盖
         """
         self._jobs = jobs
         self._timezone = timezone
         self._agent = agent
-        self._notify_fn = notify_fn
-        self._send_file_fn = send_file_fn
-        self._send_image_text_fn = send_image_text_fn
+        self._message_bus = message_bus
         self._persistence = persistence
         self._default_grace = default_misfire_grace_time
         self._scheduler: Optional[AsyncIOScheduler] = None
         self._locks: dict[str, asyncio.Lock] = {}
+
+    def _deliver_text(self, target: str, text: str) -> None:
+        if not _is_valid_receive_id(target):
+            logger.error("[cron] deliver_to=%r 不是有效的投递目标，跳过文本投递", target)
+            raise ValueError(f"无效的投递目标: {target!r}")
+        if self._message_bus is None:
+            logger.warning("[cron] MessageBus 未接入，跳过文本投递 | target=%s", target)
+            raise RuntimeError("MessageBus 未接入，无法投递文本")
+        event = OutboundText.to(target, text)
+        self._ensure_delivered(self._message_bus.publish_outbound(event), event.kind, event.targets)
+
+    def _deliver_file(self, target: str, file_path, filename: str = "") -> None:
+        if not _is_valid_receive_id(target):
+            logger.error("[cron] deliver_to=%r 不是有效的投递目标，跳过文件投递", target)
+            raise ValueError(f"无效的投递目标: {target!r}")
+        if self._message_bus is None:
+            logger.warning("[cron] MessageBus 未接入，跳过文件投递 | target=%s file=%s", target, file_path)
+            raise RuntimeError("MessageBus 未接入，无法投递文件")
+        event = OutboundFile.to(
+            target,
+            file_path,
+            filename or getattr(file_path, "name", str(file_path)),
+        )
+        self._ensure_delivered(self._message_bus.publish_outbound(event), event.kind, event.targets)
+
+    def _deliver_image_text(self, target: str, image_path, text: str) -> None:
+        if not _is_valid_receive_id(target):
+            logger.error("[cron] deliver_to=%r 不是有效的投递目标，跳过图文投递", target)
+            raise ValueError(f"无效的投递目标: {target!r}")
+        if self._message_bus is None:
+            logger.warning("[cron] MessageBus 未接入，跳过图文投递 | target=%s image=%s", target, image_path)
+            raise RuntimeError("MessageBus 未接入，无法投递图文")
+        event = OutboundImageText.to(target, image_path, text)
+        self._ensure_delivered(self._message_bus.publish_outbound(event), event.kind, event.targets)
+
+    def _ensure_delivered(
+        self,
+        reports: list[object],
+        event_kind: str,
+        targets: tuple[str, ...],
+    ) -> None:
+        delivery_reports = [report for report in reports if isinstance(report, DeliveryReport)]
+        if not delivery_reports:
+            raise RuntimeError(f"{event_kind} 投递失败：没有出站投递报告 | targets={targets!r}")
+
+        matched = sum(report.matched for report in delivery_reports)
+        succeeded = sum(report.succeeded for report in delivery_reports)
+        failed = sum(report.failed for report in delivery_reports)
+        if succeeded > 0:
+            if failed:
+                logger.warning(
+                    "[cron] %s 投递部分失败 | targets=%s matched=%d succeeded=%d failed=%d",
+                    event_kind,
+                    targets,
+                    matched,
+                    succeeded,
+                    failed,
+                )
+            return
+
+        if matched == 0:
+            raise RuntimeError(f"{event_kind} 投递失败：没有匹配的 Gateway | targets={targets!r}")
+        raise RuntimeError(
+            f"{event_kind} 投递失败：Gateway 均未发送成功 | targets={targets!r} failed={failed}"
+        )
 
     async def start(self) -> None:
         """在调用方的 asyncio 事件循环中启动调度器。"""
@@ -255,7 +324,7 @@ class CronEngine:
             self._locks[job_cfg.id] = lock
 
             inner = self._make_inner(job_cfg)
-            wrapped = _wrap_job(job_cfg, inner, lock, self._persistence, self._notify_fn)
+            wrapped = _wrap_job(job_cfg, inner, lock, self._persistence, self._deliver_text)
 
             try:
                 cron_kwargs = _parse_cron(job_cfg.schedule)
@@ -383,7 +452,7 @@ class CronEngine:
 
         lock = self._locks[job_cfg.id]
         inner = self._make_inner(job_cfg)
-        wrapped = _wrap_job(job_cfg, inner, lock, self._persistence, self._notify_fn)
+        wrapped = _wrap_job(job_cfg, inner, lock, self._persistence, self._deliver_text)
         asyncio.create_task(wrapped(), name=f"catchup-{job_cfg.id}")
 
     # ──────────────────────────────────────────────────────────
@@ -405,7 +474,6 @@ class CronEngine:
                 logger.warning("[cron:%s] agent 未注入，跳过", job_cfg.id)
                 return
 
-            from personal_agent.gateway.feishu_gateway import MessageEvent
 
             # ConversationContext 对 p2p 会话的 key 规则：p2p_{sender_open_id}
             # 用 job_cfg.session_key 作为 sender_open_id，保证不同任务会话互相隔离
@@ -422,19 +490,35 @@ class CronEngine:
                 ilogger.suppress_console(cron_session_key)
 
             try:
-                fake_event = MessageEvent(
+                inbound = InboundMessage(
+                    source="scheduler",
                     message_id=f"cron_{job_cfg.id}_{uuid.uuid4().hex[:8]}",
                     chat_id=f"cron_{job_cfg.session_key}",
                     chat_type="p2p",
                     content=job_cfg.prompt,
-                    sender_open_id=job_cfg.session_key,
+                    sender_id=job_cfg.session_key,
                     is_scheduled=True,
+                    metadata={"job_id": job_cfg.id, "job_name": job_cfg.name},
                 )
 
                 loop = asyncio.get_running_loop()
-                result: str = await loop.run_in_executor(
-                    None, self._agent.process, fake_event
-                )
+                if self._message_bus is not None:
+                    def _publish_scheduler_message() -> tuple[bool, str]:
+                        responses = self._message_bus.publish_inbound(inbound)
+                        for response in responses:
+                            if isinstance(response, str):
+                                return True, response
+                        return bool(responses), ""
+
+                    handled, result = await loop.run_in_executor(None, _publish_scheduler_message)
+                    if not handled and self._agent is not None:
+                        result = await loop.run_in_executor(
+                            None, self._agent.process_inbound, inbound
+                        )
+                else:
+                    result = await loop.run_in_executor(
+                        None, self._agent.process_inbound, inbound
+                    )
             finally:
                 # ③ 无论成功/异常都恢复，避免永久静默该 session_key
                 if ilogger is not None:
@@ -447,7 +531,7 @@ class CronEngine:
                 job_cfg.deliver_to or "(none)",
             )
 
-            if job_cfg.deliver_to and self._notify_fn:
+            if job_cfg.deliver_to:
                 if not _is_valid_receive_id(job_cfg.deliver_to):
                     logger.error(
                         "[cron:%s] deliver_to=%r 不是有效的投递目标，跳过投递。"
@@ -457,7 +541,7 @@ class CronEngine:
                     )
                 else:
                     try:
-                        self._notify_fn(job_cfg.deliver_to, result)
+                        self._deliver_text(job_cfg.deliver_to, result)
                     except Exception:
                         logger.exception("[cron:%s] 投递消息失败", job_cfg.id)
 
@@ -466,7 +550,7 @@ class CronEngine:
     def _make_python_function(self, job_cfg: CronJobConfig):
         """构造 python_function 类型的 inner 协程函数。
 
-        成功时若返回字符串且 deliver_to 已配置，则通过 notify_fn 投递飞书消息。
+        成功时若返回字符串且 deliver_to 已配置，则通过 MessageBus 发布 OutboundEvent。
         异常向外传播，由 _wrap_job 负责重试和最终失败通知。
         """
 
@@ -530,25 +614,22 @@ class CronEngine:
 
             if effective_deliver_to:
                 if isinstance(result, str):
-                    if self._notify_fn:
-                        try:
-                            self._notify_fn(effective_deliver_to, result)
-                        except Exception:
-                            logger.exception("[cron:%s] 投递消息失败", job_cfg.id)
+                    try:
+                        self._deliver_text(effective_deliver_to, result)
+                    except Exception:
+                        logger.exception("[cron:%s] 投递消息失败", job_cfg.id)
                 elif isinstance(result, dict):
                     msg = result.get("message", "")
                     files = result.get("files", [])
-                    if msg and self._notify_fn:
+                    if msg:
                         try:
-                            self._notify_fn(effective_deliver_to, msg)
+                            self._deliver_text(effective_deliver_to, msg)
                         except Exception:
                             logger.exception("[cron:%s] 投递消息失败", job_cfg.id)
-                    if files and self._send_file_fn:
+                    if files:
                         for f in files:
                             try:
-                                self._send_file_fn(
-                                    effective_deliver_to, str(f), getattr(f, "name", str(f))
-                                )
+                                self._deliver_file(effective_deliver_to, str(f), getattr(f, "name", str(f)))
                             except Exception:
                                 logger.exception(
                                     "[cron:%s] 投递文件失败 | file=%s", job_cfg.id, f
@@ -559,10 +640,10 @@ class CronEngine:
                         img = seg.get("image")
                         txt = seg.get("text", "")
                         try:
-                            if img and self._send_image_text_fn:
-                                self._send_image_text_fn(effective_deliver_to, str(img), txt)
-                            elif txt and self._notify_fn:
-                                self._notify_fn(effective_deliver_to, txt)
+                            if img:
+                                self._deliver_image_text(effective_deliver_to, str(img), txt)
+                            elif txt:
+                                self._deliver_text(effective_deliver_to, txt)
                         except Exception:
                             logger.exception(
                                 "[cron:%s] 投递图文段失败 | image=%s", job_cfg.id, img

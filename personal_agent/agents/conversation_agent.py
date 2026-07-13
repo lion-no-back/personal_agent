@@ -7,6 +7,15 @@ import json
 from typing import Callable, Optional
 
 from ..agents.base_agent import BaseAgent
+from ..bus import (
+    DeliveryReport,
+    InboundMessage,
+    MessageBus,
+    OutboundFile,
+    OutboundImageText,
+    OutboundText,
+    ProgressUpdate,
+)
 from ..context.conversation_context import ConversationContext
 from ..core.interaction_logger import InteractionLogger
 from ..core.llm_router import LLMRouter
@@ -78,9 +87,7 @@ class ConversationAgent(BaseAgent):
         interaction_logger: Optional[InteractionLogger] = None,
         skill_bodies: Optional[dict] = None,
         scorer: Optional[RequestScorer] = None,
-        notify_fn: Optional[Callable[[str, str], None]] = None,
-        send_file_fn: Optional[Callable[[str, str, str], None]] = None,
-        send_image_text_fn: Optional[Callable[[str, str, str], None]] = None,
+        message_bus: Optional[MessageBus] = None,
     ):
         """
         Args:
@@ -99,9 +106,7 @@ class ConversationAgent(BaseAgent):
         self._skill_bodies: dict = skill_bodies or {}
         self._scorer = scorer
         self._memory: Optional[MemoryModule] = None
-        self._notify_fn = notify_fn
-        self._send_file_fn = send_file_fn
-        self._send_image_text_fn = send_image_text_fn
+        self._message_bus = message_bus
         self._ondemand_workflows: Optional[list] = None  # lazy-loaded
         self._card_update_interval = card_update_interval or float(
             os.getenv("CARD_UPDATE_INTERVAL", "0.3")
@@ -131,13 +136,123 @@ class ConversationAgent(BaseAgent):
     #   BaseAgent 实现
     # ──────────────────────────────────────────────────────────
 
+    def set_message_bus(self, message_bus: MessageBus) -> None:
+        """Attach the runtime message bus for outbound delivery."""
+        self._message_bus = message_bus
+        logger.info("MessageBus attached to ConversationAgent")
+
+    def _deliver_text(self, target: str, text: str) -> None:
+        if self._message_bus is not None:
+            event = OutboundText.to(target, text)
+            self._ensure_outbound_delivered(
+                self._message_bus.publish_outbound(event),
+                event.kind,
+                event.targets,
+            )
+            return
+        raise RuntimeError(f"MessageBus is not attached; text delivery skipped | target={target}")
+
+    def _deliver_file(self, target: str, file_path: str, filename: str) -> None:
+        if self._message_bus is not None:
+            event = OutboundFile.to(target, file_path, filename)
+            self._ensure_outbound_delivered(
+                self._message_bus.publish_outbound(event),
+                event.kind,
+                event.targets,
+            )
+            return
+        raise RuntimeError(
+            f"MessageBus is not attached; file delivery skipped | target={target} file={file_path}"
+        )
+
+    def _deliver_image_text(self, target: str, image_path: str, text: str) -> None:
+        if self._message_bus is not None:
+            event = OutboundImageText.to(target, image_path, text)
+            self._ensure_outbound_delivered(
+                self._message_bus.publish_outbound(event),
+                event.kind,
+                event.targets,
+            )
+            return
+        raise RuntimeError(
+            f"MessageBus is not attached; image_text delivery skipped | target={target} image={image_path}"
+        )
+
+    def _ensure_outbound_delivered(
+        self,
+        reports: list[object],
+        event_kind: str,
+        targets: tuple[str, ...],
+    ) -> None:
+        delivery_reports = [report for report in reports if isinstance(report, DeliveryReport)]
+        if not delivery_reports:
+            raise RuntimeError(f"{event_kind} delivery failed: no outbound delivery report | targets={targets!r}")
+
+        matched = sum(report.matched for report in delivery_reports)
+        succeeded = sum(report.succeeded for report in delivery_reports)
+        failed = sum(report.failed for report in delivery_reports)
+        if succeeded > 0:
+            if failed:
+                logger.warning(
+                    "%s delivery partially failed | targets=%s matched=%d succeeded=%d failed=%d",
+                    event_kind,
+                    targets,
+                    matched,
+                    succeeded,
+                    failed,
+                )
+            return
+
+        if matched == 0:
+            raise RuntimeError(f"{event_kind} delivery failed: no matching gateway | targets={targets!r}")
+        raise RuntimeError(
+            f"{event_kind} delivery failed: no gateway send succeeded | targets={targets!r} failed={failed}"
+        )
+
+    def process_inbound(
+        self,
+        message: InboundMessage,
+        on_update: Optional[Callable[[str, str], None]] = None,
+        *,
+        progress_target: Optional[str] = None,
+        publish_progress: bool = False,
+        stream_updates_sync_with_llm: bool = False,
+        push_target: Optional[str] = None,
+        cancel_event: Optional[threading.Event] = None,
+        keep_thinking: bool = True,
+    ) -> str:
+        """Process a standard bus inbound message through the existing pipeline."""
+        effective_on_update = on_update
+        if effective_on_update is None and publish_progress and self._message_bus is not None:
+            target = progress_target or message.message_id
+
+            def _publish_progress(content: str, status: str) -> None:
+                self._message_bus.publish_outbound(
+                    ProgressUpdate(
+                        target=target,
+                        content=content,
+                        status=status,
+                    )
+                )
+
+            effective_on_update = _publish_progress
+
+        return self.process(
+            message.to_legacy_event(),
+            on_update=effective_on_update,
+            stream_updates_sync_with_llm=stream_updates_sync_with_llm,
+            push_target=push_target,
+            cancel_event=cancel_event,
+            keep_thinking=keep_thinking,
+        )
+
     def process(
         self,
         event,
         on_update: Optional[Callable[[str, str], None]] = None,
         *,
         stream_updates_sync_with_llm: bool = False,
-        push_fn: Optional[Callable[[str], None]] = None,
+        push_target: Optional[str] = None,
         cancel_event: Optional[threading.Event] = None,
         keep_thinking: bool = True,
     ) -> str:
@@ -157,7 +272,7 @@ class ConversationAgent(BaseAgent):
             event=event,
             on_update=on_update,
             stream_updates_sync_with_llm=stream_updates_sync_with_llm,
-            push_fn=push_fn,
+            push_target=push_target,
             cancel_event=cancel_event,
             keep_thinking=keep_thinking,
         )
@@ -266,7 +381,7 @@ class ConversationAgent(BaseAgent):
         return None
 
     def _run_ondemand_workflow_async(self, meta, delivery_key: str, event_content: str = "", on_update=None, usage_user=None) -> None:
-        """在后台 daemon 线程中执行按需 workflow，完成后通过 notify_fn/send_file_fn 投递结果。
+        """在后台 daemon 线程中执行按需 workflow，完成后通过 MessageBus 投递结果。
 
         工作流在独立子进程里运行（见 workflows/dispatch.py）：主进程不 import 其重原生库
         （numpy/pandas/torch 等），从根上避免多线程并发首次导入的竞态。
@@ -318,22 +433,22 @@ class ConversationAgent(BaseAgent):
                         # 卡片成功终态自带「✅完成」徽标，去掉正文重复的成功 emoji 前缀。
                         # 只剥成功标记（✅✔️☑️）；失败的 ❌/⚠️ 必须保留——否则卡片仍显示
                         # 「完成」徽标、正文又没了失败标记，用户将无法分辨成功还是失败。
-                        # 文字降级路径（notify_fn）无徽标，仍用带前缀的原 message。
+                        # 文字降级路径无徽标，仍用带前缀的原 message。
                         card_message = re.sub(r"^[\s✅✔️☑️]+", "", message)
                         on_update(card_message, "done")
                         delivered = True
                     except Exception:
                         logger.exception("[ondemand:%s] 卡片 finalize 失败，回退文字投递", meta.id)
-                if not delivered and self._notify_fn:
+                if not delivered:
                     try:
-                        self._notify_fn(delivery_key, message)
+                        self._deliver_text(delivery_key, message)
                     except Exception:
                         logger.exception("[ondemand:%s] 文字结果投递失败", meta.id)
 
-            if self._send_file_fn and files:
+            if files:
                 for fp in files:
                     try:
-                        self._send_file_fn(delivery_key, str(fp), fp.name)
+                        self._deliver_file(delivery_key, str(fp), fp.name)
                     except Exception:
                         logger.exception("[ondemand:%s] 文件发送失败: %s", meta.id, fp)
 
@@ -344,10 +459,10 @@ class ConversationAgent(BaseAgent):
                     img = seg.get("image")
                     txt = seg.get("text", "")
                     try:
-                        if img and self._send_image_text_fn:
-                            self._send_image_text_fn(delivery_key, str(img), txt)
-                        elif txt and self._notify_fn:
-                            self._notify_fn(delivery_key, txt)
+                        if img:
+                            self._deliver_image_text(delivery_key, str(img), txt)
+                        elif txt:
+                            self._deliver_text(delivery_key, txt)
                     except Exception:
                         logger.exception("[ondemand:%s] 图文段投递失败: %s", meta.id, img)
 

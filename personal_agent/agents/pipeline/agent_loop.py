@@ -199,10 +199,10 @@ class AgentLoopStage:
                             if validation_error:
                                 result = f"Error: 工具 '{func_name}' {validation_error}"
                             else:
-                                if ctx.push_fn is not None:
+                                if ctx.push_target:
                                     kwargs_dict["_tool_ctx"] = {
                                         "push_fn": agent._make_exec_push_fn(
-                                            ctx.push_fn
+                                            lambda msg: agent._deliver_text(ctx.push_target, msg)
                                         ),
                                     }
                                 result = tool.call(**kwargs_dict)

@@ -37,6 +37,7 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequestBody,
 )
 
+from ..bus import InboundMessage, MessageBus
 from ..core.task_manager import TaskManager
 from ..guardrails import check_input
 from ..routing import AccessPolicy, SessionRunLocks
@@ -258,6 +259,7 @@ class FeishuGateway(BaseGateway):
         self._context = context
         self._task_manager = task_manager
         self._file_stash = file_stash
+        self._message_bus: MessageBus | None = None
 
         # 线程池：承载 LLM 推理等耗时操作，确保事件回调在 3s 内返回
         self._executor = ThreadPoolExecutor(
@@ -369,6 +371,52 @@ class FeishuGateway(BaseGateway):
     @property
     def platform(self) -> str:
         return "feishu"
+
+    def set_message_bus(self, message_bus: MessageBus) -> None:
+        self._message_bus = message_bus
+
+    def _publish_agent_message(self, event: MessageEvent, **runtime):
+        runtime_for_bus = dict(runtime)
+        progress_sink = runtime_for_bus.pop("on_update", None)
+        progress_target = runtime_for_bus.get("progress_target") or event.message_id
+        runtime_for_bus["progress_target"] = progress_target
+        runtime_for_bus["publish_progress"] = callable(progress_sink)
+        metadata = {
+            "_runtime": runtime_for_bus,
+            "file_context": getattr(event, "file_context", None),
+        }
+        inbound = InboundMessage(
+            source="feishu",
+            message_id=event.message_id,
+            chat_id=event.chat_id,
+            chat_type=event.chat_type,
+            content=event.content,
+            sender_id=event.sender_open_id,
+            thread_id=event.thread_id,
+            parent_id=event.parent_id,
+            attached_files=list(event.attached_files),
+            images=list(event.images),
+            is_scheduled=event.is_scheduled,
+            metadata=metadata,
+        )
+        if self._message_bus is None:
+            return self._agent.process_inbound(inbound, **runtime)
+        unregister_progress = None
+        if callable(progress_sink):
+            unregister_progress = self._message_bus.register_progress_sink(
+                progress_target,
+                progress_sink,
+            )
+        try:
+            responses = self._message_bus.publish_inbound(inbound)
+        except Exception:
+            if unregister_progress is not None:
+                unregister_progress()
+            raise
+        for response in responses:
+            if isinstance(response, str):
+                return response
+        return ""
 
     def start(self) -> None:
         """阻塞当前线程，维持飞书 WebSocket 长连接。"""
@@ -889,7 +937,8 @@ class FeishuGateway(BaseGateway):
         *,
         receive_id_type: str = "chat_id",
         _retries: int = 1,
-    ) -> None:
+        raise_on_failure: bool = False,
+    ) -> bool:
         """发送普通文本消息，失败时最多重试 _retries 次（间隔 2s）。永久错误码不重试。"""
         import time
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
@@ -901,24 +950,35 @@ class FeishuGateway(BaseGateway):
                              .content(json.dumps({"text": text}, ensure_ascii=False))
                              .build())
                .build())
+        last_error = ""
         for attempt in range(1 + _retries):
             try:
                 resp = self._api_client.im.v1.message.create(req)
+            except Exception as e:
+                last_error = str(e)
+                logger.error(
+                    "发送文本消息异常 | receive_id=%s attempt=%d error=%s",
+                    receive_id, attempt + 1, e,
+                )
+            else:
                 if resp.success():
-                    return
+                    return True
+                last_error = f"code={resp.code} msg={resp.msg}"
                 logger.error(
                     "发送文本消息失败 | receive_id=%s type=%s attempt=%d code=%s msg=%s",
                     receive_id, receive_id_type, attempt + 1, resp.code, resp.msg,
                 )
                 if resp.code in self._PERMANENT_ERROR_CODES:
-                    return  # 永久错误，不重试
-            except Exception as e:
-                logger.error(
-                    "发送文本消息异常 | receive_id=%s attempt=%d error=%s",
-                    receive_id, attempt + 1, e,
-                )
+                    if raise_on_failure:
+                        raise RuntimeError(f"发送文本消息失败: {last_error}")
+                    return False  # 永久错误，不重试
             if attempt < _retries:
                 time.sleep(2)
+        if raise_on_failure:
+            raise RuntimeError(
+                f"发送文本消息失败: receive_id={receive_id} type={receive_id_type} error={last_error}"
+            )
+        return False
 
     def send_text(self, session_key: str, text: str) -> None:
         """发送普通文本消息（供外部调用，如定时任务结果投递）。
@@ -935,7 +995,7 @@ class FeishuGateway(BaseGateway):
         # 剥离 feishu:{id_type}: 前缀，还原原始 ID
         raw_id = session_key.split(":")[-1] if session_key.startswith("feishu:") else session_key
         receive_id_type = "open_id" if raw_id.startswith("ou_") else "chat_id"
-        self._send_text_message(raw_id, text, receive_id_type=receive_id_type)
+        self._send_text_message(raw_id, text, receive_id_type=receive_id_type, raise_on_failure=True)
 
     def send_file(self, session_key: str, file_path: str, filename: str) -> None:
         """
@@ -1401,13 +1461,12 @@ class FeishuGateway(BaseGateway):
                     self._on_streaming_card_update(stream_session, content, status)
 
             # ── Step 3: 调用 Agent（CardKit 流式下不受 im PATCH 5QPS 限制）──
-            # push_fn 用于 exec 等工具在后台任务完成后主动推送飞书文本消息
-            push_fn = lambda msg: self._send_text_message(event.chat_id, msg)
-            self._agent.process(
+            # push_target 用于 exec 等工具在后台任务完成后通过 MessageBus 主动推送文本消息
+            self._publish_agent_message(
                 event,
                 on_update=on_update,
                 stream_updates_sync_with_llm=True,
-                push_fn=push_fn,
+                push_target=event.chat_id,
                 cancel_event=cancel_event,
             )
 

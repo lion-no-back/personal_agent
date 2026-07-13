@@ -77,3 +77,25 @@ def mabang_network_failed_error(workflow_name: str, exc: BaseException) -> Workf
             "exception": str(exc),
         },
     )
+
+
+def rankbb_browser_failed_error(exc: BaseException) -> WorkflowBusinessError:
+    user_message = (
+        "❌【排名播报】浏览器采集启动失败\n"
+        "失败阶段：打开 Amazon 榜单采集浏览器。\n"
+        "可能原因：本机 Chromium / Playwright 在后台子进程中启动异常、浏览器缓存损坏，或当前 Windows 运行环境临时不稳定。\n"
+        "系统已处理：底层浏览器命令和调用栈已写入日志，不会直接发送给用户。\n"
+        "建议：稍后重新触发【排名播报】；如果连续失败，请先发送【排名配置】重新检查浏览器依赖。"
+    )
+    return WorkflowBusinessError(
+        f"Rank broadcast browser step failed: {type(exc).__name__}: {exc}",
+        code="RANKBB_BROWSER_FAILED",
+        user_message=user_message,
+        retryable=True,
+        details={
+            "stage": "rankbb_browser",
+            "workflow_name": "排名播报",
+            "exception_type": type(exc).__name__,
+            "exception": str(exc),
+        },
+    )

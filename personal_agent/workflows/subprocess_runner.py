@@ -27,6 +27,17 @@ import sys
 from pathlib import Path
 
 
+def _configure_stdio() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def _setup_child_logging(log_file: str) -> None:
     """子进程独立日志：写自己的文件 + 继承的 stdout（控制台仍可见进度）。
 
@@ -62,6 +73,8 @@ def _serialize(result) -> dict:
 
 
 def main() -> int:
+    _configure_stdio()
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--module", required=True)
     parser.add_argument("--function", default="run")
@@ -94,6 +107,11 @@ def main() -> int:
             payload.update(exc.to_payload())
         else:
             payload["error"] = f"{type(exc).__name__}: {exc}"
+            payload["error_type"] = type(exc).__name__
+            payload["details"] = {
+                "exception_type": type(exc).__name__,
+                "exception": str(exc),
+            }
         payload["ok"] = False
 
     # 回传子进程内收集的 LLM usage（即使失败也回传已发生的调用），主进程统一记账

@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,7 @@ _KILL_GRACE_SECONDS = 5
 _WORKFLOW_RETRY_MODULES = {
     "personal_agent.workflows.bhwarn_mabang.runner",
     "personal_agent.workflows.qhwarn_mabang.runner",
+    "personal_agent.workflows.rankbb_amazon.runner",
     "personal_agent.workflows.zxwarn_mabang.runner",
 }
 
@@ -94,6 +96,37 @@ def _append_child_output(log_file: Path, stdout: Optional[str], stderr: Optional
         logger.exception("[dispatch] 写入子进程捕获输出失败 | log=%s", log_file)
 
 
+def _safe_stream_write(stream, text: str) -> None:
+    try:
+        stream.write(text)
+        stream.flush()
+        return
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+        stream.write(safe_text)
+        stream.flush()
+
+
+def _stream_child_pipe(pipe, stream, chunks: list[str]) -> None:
+    if pipe is None:
+        return
+    try:
+        while True:
+            line = pipe.readline()
+            if line == "":
+                break
+            chunks.append(line)
+            _safe_stream_write(stream, line)
+    except Exception:
+        logger.exception("[dispatch] 读取工作流子进程输出失败")
+    finally:
+        try:
+            pipe.close()
+        except Exception:
+            pass
+
+
 def _run_in_subprocess_once(
     module: str,
     function: str = "run",
@@ -106,11 +139,14 @@ def _run_in_subprocess_once(
     log_file = _new_log_file(module)
 
     cmd = [
-        sys.executable, "-m", "personal_agent.workflows.subprocess_runner",
+        sys.executable, "-u", "-m", "personal_agent.workflows.subprocess_runner",
         "--module", module, "--function", function,
         "--result-file", result_path, "--log-file", str(log_file),
     ]
     env = {**os.environ}
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
     if content is not None:
         env["WF_CONTENT"] = content
 
@@ -122,21 +158,45 @@ def _run_in_subprocess_once(
         cmd, cwd=str(_PROJECT_ROOT), env=env,
         stdin=subprocess.DEVNULL, creationflags=creationflags,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace",
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
     )
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    stdout_thread = threading.Thread(
+        target=_stream_child_pipe,
+        args=(proc.stdout, sys.stdout, stdout_chunks),
+        name=f"wf-stdout-{proc.pid}",
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_stream_child_pipe,
+        args=(proc.stderr, sys.stderr, stderr_chunks),
+        name=f"wf-stderr-{proc.pid}",
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
     try:
-        stdout, stderr = proc.communicate(timeout=total_timeout)
+        proc.wait(timeout=total_timeout)
     except subprocess.TimeoutExpired:
         logger.error("[dispatch] 工作流超时，强制中止 | module=%s pid=%s", module, proc.pid)
         _kill_tree(proc)
         try:
-            stdout, stderr = proc.communicate(timeout=2)
+            proc.wait(timeout=2)
         except Exception:
-            stdout, stderr = "", ""
+            pass
+        stdout_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
+        stdout = "".join(stdout_chunks)
+        stderr = "".join(stderr_chunks)
         _append_child_output(log_file, stdout, stderr)
         _cleanup(result_path)
         return {"ok": False, "message": "❌ 执行超时，已强制中止",
                 "files": [], "segments": [], "error": "timeout"}
+    stdout_thread.join(timeout=2)
+    stderr_thread.join(timeout=2)
+    stdout = "".join(stdout_chunks)
+    stderr = "".join(stderr_chunks)
 
     try:
         raw_result = Path(result_path).read_text(encoding="utf-8")
@@ -152,6 +212,7 @@ def _run_in_subprocess_once(
     finally:
         _cleanup(result_path)
 
+    payload.setdefault("log_file", str(log_file))
     payload["files"] = [Path(f) for f in payload.get("files", [])]
     for seg in payload.get("segments", []):
         if seg.get("image"):
@@ -172,8 +233,11 @@ def _finalize_failure_message(payload: dict, workflow_retry_count: int) -> dict:
         return payload
     message = payload.get("user_message") or payload.get("message")
     if not message:
-        error = payload.get("error") or "未知错误"
-        message = f"❌ 工作流执行失败：{error}"
+        error_type = payload.get("error_type") or payload.get("error_code") or "UNKNOWN_ERROR"
+        log_file = payload.get("log_file")
+        message = f"❌ 工作流执行失败：系统内部异常（{error_type}）。底层错误详情已写入日志，避免直接发送给用户。"
+        if log_file:
+            message += f"\n日志：{log_file}"
     if workflow_retry_count:
         message = (
             f"{message}\n"

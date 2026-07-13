@@ -18,7 +18,9 @@ import re
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib.request
+from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -228,7 +230,7 @@ def _rank_gaps(items):
     return set(range(ranks[0], ranks[-1] + 1)) - set(ranks)
 
 
-def fetch_page(session, page_url, label, pg, attempts=3):
+def fetch_page(session, page_url, label, pg, attempts=3, monitor=None):
     """抓取单页, 最多重试 attempts 次, 保留"无跳号缺口且数量最多"的结果。
 
     满 50 即视为完整、立即返回; 若类目本身不足 50, 多次重试数量会稳定
@@ -236,9 +238,16 @@ def fetch_page(session, page_url, label, pg, attempts=3):
     """
     best, best_n = [], -1
     for attempt in range(1, attempts + 1):
-        page = session.fetch(page_url, page_action=scroll_to_load_all)
+        try:
+            page = session.fetch(page_url, page_action=scroll_to_load_all)
+        except Exception as e:
+            if monitor:
+                monitor.record_board_exception(label, pg, page_url, e)
+            raise
         items = parse_items(page, label, pg)
         gaps = _rank_gaps(items)
+        if monitor:
+            monitor.record_board_attempt(label, pg, page_url, attempt, page, len(items), gaps)
         logger.debug("[%s 第%d页] 尝试%d: %d 个, 跳号缺口=%s",
                      label, pg, attempt, len(items), sorted(gaps)[:8])
         if not gaps and len(items) > best_n:
@@ -250,13 +259,13 @@ def fetch_page(session, page_url, label, pg, attempts=3):
     return best
 
 
-def scrape_ranking(session, url, label):
+def scrape_ranking(session, url, label, monitor=None):
     by_asin = {}
     for pg in PAGES:
         page_url = url if pg == 1 else f"{url}?pg={pg}"
         print(f"  {label} 第{pg}页 ...")
         logger.debug("抓取: %s", page_url)
-        for item in fetch_page(session, page_url, label, pg):
+        for item in fetch_page(session, page_url, label, pg, monitor=monitor):
             by_asin.setdefault(item["asin"], item)  # 按 ASIN 去重, 保留首见排名
         print(f"    累计 {len(by_asin)} 个商品")
 
@@ -399,6 +408,345 @@ def _needs_delivery_location_sold_by(asin, site):
 _BLOCK_MARKERS = ("Enter the characters you see", "Robot Check", "api-services-support@amazon.com",
                    "Sorry, we just need to make sure you're not a robot", "Continue shopping")
 
+_TEMP_BAN_MIN_SAMPLES = 10
+_TEMP_BAN_BLOCK_RATE = 0.35
+_TEMP_BAN_SUSPICIOUS_RATE = 0.50
+_TEMP_BAN_COOLDOWN_SECONDS = 120  # 用户要求不超过 3 分钟; 这里固定冷却 2 分钟
+_MAX_TLS_ROTATIONS_PER_SITE = 1
+_MAX_PROXY_FALLBACKS_PER_SITE = 3
+_PROXIFLY_HTTPS_PROXY_URL = (
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/https/data.txt"
+)
+_PROXY_FETCH_TIMEOUT = 12
+_PROXY_CANDIDATE_LIMIT = 20
+
+
+def _normalize_proxy_url(raw):
+    raw = (raw or "").strip()
+    if not raw or raw.startswith("#"):
+        return ""
+    if "://" in raw:
+        return raw
+    return f"http://{raw}"
+
+
+def _load_proxifly_https_proxies(limit=_PROXY_CANDIDATE_LIMIT):
+    try:
+        req = urllib.request.Request(
+            _PROXIFLY_HTTPS_PROXY_URL,
+            headers={"User-Agent": "PersonalAgent-rankbb/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=_PROXY_FETCH_TIMEOUT) as resp:
+            text = resp.read(200_000).decode("utf-8", errors="replace")
+    except Exception as e:
+        logger.warning("proxifly 免费代理列表拉取失败: %s", e)
+        return []
+
+    proxies = []
+    seen = set()
+    for line in text.splitlines():
+        proxy = _normalize_proxy_url(line)
+        if not proxy or proxy in seen:
+            continue
+        seen.add(proxy)
+        proxies.append(proxy)
+        if len(proxies) >= limit:
+            break
+    return proxies
+
+
+class AmazonBlockMonitor:
+    """把单次请求异常聚合成站点级封控状态。"""
+
+    def __init__(self, site):
+        self.site = site
+        self._lock = threading.Lock()
+        self.fingerprint_index = 0
+        self.rotations = 0
+        self.proxy_fallbacks = 0
+        self.proxy_candidates = []
+        self.proxy_index = -1
+        self.circuit_open = False
+        self.circuit_history = []
+        self.detail_total = 0
+        self.detail_valid = 0
+        self.detail_blocked = 0
+        self.detail_suspicious = 0
+        self.board_zero_cards = 0
+        self.board_exceptions = 0
+        self.counters = Counter()
+        self.examples = []
+
+    def _add_example(self, text):
+        if len(self.examples) < 5:
+            self.examples.append(text)
+
+    def current_impersonate(self):
+        with self._lock:
+            return _IMPERSONATE_POOL[self.fingerprint_index % len(_IMPERSONATE_POOL)]
+
+    def current_proxy(self):
+        with self._lock:
+            if self.proxy_index < 0 or self.proxy_index >= len(self.proxy_candidates):
+                return None
+            return self.proxy_candidates[self.proxy_index]
+
+    def _reset_window_locked(self):
+        self.detail_total = 0
+        self.detail_valid = 0
+        self.detail_blocked = 0
+        self.detail_suspicious = 0
+        self.board_zero_cards = 0
+        self.board_exceptions = 0
+        self.counters.clear()
+        self.examples.clear()
+
+    def record_board_exception(self, label, pg, url, exc):
+        with self._lock:
+            self.board_exceptions += 1
+            self.counters["board_exception"] += 1
+            self._add_example(f"{label} 第{pg}页榜单异常: {type(exc).__name__}: {str(exc)[:120]}")
+
+    def record_board_attempt(self, label, pg, url, attempt, page, item_count, gaps):
+        if item_count > 0:
+            return
+        text = ""
+        try:
+            text = page.get_all_text(separator=" ", strip=True)
+        except Exception:
+            pass
+        marker = next((m for m in _BLOCK_MARKERS if m in text), None)
+        with self._lock:
+            self.board_zero_cards += 1
+            self.counters["board_zero_cards"] += 1
+            if marker:
+                self.counters[f"board_marker:{marker}"] += 1
+            self._add_example(
+                f"{label} 第{pg}页第{attempt}次榜单0商品"
+                + (f", marker={marker}" if marker else "")
+            )
+
+    def record_detail_exception(self, asin, attempt, exc):
+        with self._lock:
+            self.detail_total += 1
+            self.detail_suspicious += 1
+            self.counters["detail_exception"] += 1
+            self._add_example(f"详情页 {asin} 第{attempt}次异常: {type(exc).__name__}: {str(exc)[:120]}")
+
+    def record_detail_status(self, asin, attempt, status):
+        with self._lock:
+            self.detail_total += 1
+            key = f"detail_status:{status}"
+            self.counters[key] += 1
+            if status in (403, 429, 503):
+                self.detail_blocked += 1
+                self._add_example(f"详情页 {asin} 第{attempt}次 status={status}")
+            else:
+                self.detail_suspicious += 1
+
+    def record_detail_soft_failure(self, asin, attempt, text_len, marker):
+        with self._lock:
+            self.detail_total += 1
+            self.detail_suspicious += 1
+            self.counters["detail_no_product_title"] += 1
+            if marker:
+                self.detail_blocked += 1
+                self.counters[f"detail_marker:{marker}"] += 1
+            self._add_example(
+                f"详情页 {asin} 第{attempt}次无#productTitle, text_len={text_len}, marker={marker}"
+            )
+
+    def record_detail_valid(self):
+        with self._lock:
+            self.detail_total += 1
+            self.detail_valid += 1
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "fingerprint": _IMPERSONATE_POOL[self.fingerprint_index % len(_IMPERSONATE_POOL)],
+                "rotations": self.rotations,
+                "proxy_fallbacks": self.proxy_fallbacks,
+                "proxy": (
+                    self.proxy_candidates[self.proxy_index]
+                    if 0 <= self.proxy_index < len(self.proxy_candidates)
+                    else None
+                ),
+                "circuit_open": self.circuit_open,
+                "circuit_history": list(self.circuit_history),
+                "detail_total": self.detail_total,
+                "detail_valid": self.detail_valid,
+                "detail_blocked": self.detail_blocked,
+                "detail_suspicious": self.detail_suspicious,
+                "board_zero_cards": self.board_zero_cards,
+                "board_exceptions": self.board_exceptions,
+                "counters": dict(self.counters),
+                "examples": list(self.examples),
+            }
+
+    def is_temp_ban_suspected(self):
+        snap = self.snapshot()
+        total = snap["detail_total"]
+        if snap["board_exceptions"] >= 2 or snap["board_zero_cards"] >= 3:
+            return True
+        if total < _TEMP_BAN_MIN_SAMPLES:
+            return False
+        blocked_rate = snap["detail_blocked"] / total
+        suspicious_rate = (snap["detail_blocked"] + snap["detail_suspicious"]) / total
+        return blocked_rate >= _TEMP_BAN_BLOCK_RATE or suspicious_rate >= _TEMP_BAN_SUSPICIOUS_RATE
+
+    def open_circuit_if_needed(self):
+        if not self.is_temp_ban_suspected():
+            return False
+        with self._lock:
+            if self.circuit_open:
+                return True
+            snap = {
+                "fingerprint": _IMPERSONATE_POOL[self.fingerprint_index % len(_IMPERSONATE_POOL)],
+                "proxy": (
+                    self.proxy_candidates[self.proxy_index]
+                    if 0 <= self.proxy_index < len(self.proxy_candidates)
+                    else None
+                ),
+                "detail_total": self.detail_total,
+                "detail_blocked": self.detail_blocked,
+                "detail_suspicious": self.detail_suspicious,
+                "board_zero_cards": self.board_zero_cards,
+                "board_exceptions": self.board_exceptions,
+                "counters": dict(self.counters),
+                "examples": list(self.examples),
+            }
+            self.circuit_history.append(snap)
+            self.circuit_open = True
+        return True
+
+    def cooldown_and_rotate_tls(self):
+        with self._lock:
+            if not self.circuit_open:
+                return True
+            if self.rotations >= _MAX_TLS_ROTATIONS_PER_SITE:
+                return self.enable_proxy_fallback()
+            old_fp = _IMPERSONATE_POOL[self.fingerprint_index % len(_IMPERSONATE_POOL)]
+            new_index = (self.fingerprint_index + 1) % len(_IMPERSONATE_POOL)
+            new_fp = _IMPERSONATE_POOL[new_index]
+
+        print(
+            f"\n[熔断] {self.site.name_cn}: 检测到疑似 IP 临时封禁，"
+            f"暂停 { _TEMP_BAN_COOLDOWN_SECONDS } 秒后切换 TLS 指纹 {old_fp} -> {new_fp}"
+        )
+        logger.warning(
+            "[%s] IP 临时封禁熔断: cooldown=%ss tls=%s->%s",
+            self.site.name_cn, _TEMP_BAN_COOLDOWN_SECONDS, old_fp, new_fp,
+        )
+        time.sleep(_TEMP_BAN_COOLDOWN_SECONDS)
+
+        with self._lock:
+            self.fingerprint_index = new_index
+            self.rotations += 1
+            self.circuit_open = False
+            self._reset_window_locked()
+        print(f"[熔断] {self.site.name_cn}: 冷却结束，已切换 TLS 指纹为 {new_fp}，保持原并发继续")
+        return True
+
+    def enable_proxy_fallback(self):
+        with self._lock:
+            if self.proxy_fallbacks >= _MAX_PROXY_FALLBACKS_PER_SITE:
+                logger.warning("[%s] proxifly 免费代理兜底次数已用尽, 停止继续请求", self.site.name_cn)
+                print(f"\n[熔断] {self.site.name_cn}: proxifly 免费代理兜底次数已用尽，停止该站点剩余详情页请求")
+                return False
+            if self.proxy_candidates and self.proxy_index + 1 < len(self.proxy_candidates):
+                self.proxy_index += 1
+                self.proxy_fallbacks += 1
+                self.circuit_open = False
+                self._reset_window_locked()
+                proxy = self.proxy_candidates[self.proxy_index]
+                logger.warning("[%s] 切换 proxifly 免费代理兜底: proxy=%s", self.site.name_cn, proxy)
+                print(
+                    f"[代理兜底] {self.site.name_cn}: 切换到下一个代理 {proxy} "
+                    f"({self.proxy_fallbacks}/{_MAX_PROXY_FALLBACKS_PER_SITE})，保持原并发继续"
+                )
+                return True
+
+        print(f"\n[代理兜底] {self.site.name_cn}: TLS 指纹轮换后仍疑似封控，开始拉取 proxifly 免费 HTTPS 代理列表")
+        proxies = _load_proxifly_https_proxies()
+        if not proxies:
+            print(f"[代理兜底] {self.site.name_cn}: 未获取到可用代理候选，停止该站点剩余详情页请求")
+            return False
+
+        with self._lock:
+            self.proxy_candidates = proxies
+            self.proxy_index = 0
+            self.proxy_fallbacks += 1
+            self.circuit_open = False
+            self._reset_window_locked()
+            proxy = self.proxy_candidates[self.proxy_index]
+
+        logger.warning(
+            "[%s] 启用 proxifly 免费代理兜底: proxy=%s candidates=%d",
+            self.site.name_cn, proxy, len(proxies),
+        )
+        print(
+            f"[代理兜底] {self.site.name_cn}: 已启用代理 {proxy} "
+            f"(候选 {len(proxies)} 个)，保持原并发继续"
+        )
+        return True
+
+    def print_summary(self):
+        snap = self.snapshot()
+        total = snap["detail_total"]
+        if not self.is_temp_ban_suspected():
+            if snap["circuit_history"]:
+                print(
+                    f"\n[封控检测] {self.site.name_cn}: 本轮曾触发熔断，"
+                    f"当前 TLS 指纹 {snap['fingerprint']} 未达到临时封禁阈值"
+                )
+                for idx, item in enumerate(snap["circuit_history"], 1):
+                    total0 = item["detail_total"]
+                    abnormal0 = item["detail_blocked"] + item["detail_suspicious"]
+                    print(
+                        f"  熔断历史{idx}: TLS={item['fingerprint']}, "
+                        f"详情页异常={abnormal0}/{total0}, 榜单0商品={item['board_zero_cards']}"
+                    )
+            elif snap["detail_blocked"] or snap["detail_suspicious"] or snap["board_zero_cards"]:
+                print(
+                    f"\n[封控检测] {self.site.name_cn}: 未达到 IP 临时封禁阈值 "
+                    f"(详情页异常={snap['detail_blocked'] + snap['detail_suspicious']}/{total}, "
+                    f"榜单0商品={snap['board_zero_cards']})"
+                )
+            return
+
+        blocked_rate = (snap["detail_blocked"] / total * 100) if total else 0
+        abnormal_rate = (
+            (snap["detail_blocked"] + snap["detail_suspicious"]) / total * 100
+        ) if total else 0
+        logger.warning(
+            "[%s] 疑似 IP 临时封禁: detail_total=%s blocked=%s suspicious=%s board_zero=%s counters=%s",
+            self.site.name_cn, total, snap["detail_blocked"], snap["detail_suspicious"],
+            snap["board_zero_cards"], snap["counters"],
+        )
+        print(f"\n[封控检测] {self.site.name_cn}: 疑似 IP 处于 Amazon 临时封禁/风控状态")
+        print(f"  当前 TLS 指纹: {snap['fingerprint']}, 已轮换次数: {snap['rotations']}")
+        print(
+            f"  详情页样本: {total}, 明确封控/限流: {snap['detail_blocked']} "
+            f"({blocked_rate:.1f}%), 异常合计: {snap['detail_blocked'] + snap['detail_suspicious']} "
+            f"({abnormal_rate:.1f}%)"
+        )
+        print(f"  榜单异常: 0商品页={snap['board_zero_cards']}, 异常退出={snap['board_exceptions']}")
+        if snap["counters"]:
+            top = ", ".join(f"{k}={v}" for k, v in Counter(snap["counters"]).most_common(6))
+            print(f"  证据: {top}")
+        for example in snap["examples"]:
+            print(f"  - {example}")
+        print("  建议: 本轮停止继续加压该站点, 冷却后再试; 后续可启用熔断+降频策略。")
+
+        for idx, item in enumerate(snap["circuit_history"], 1):
+            total0 = item["detail_total"]
+            abnormal0 = item["detail_blocked"] + item["detail_suspicious"]
+            print(
+                f"  熔断历史{idx}: TLS={item['fingerprint']}, "
+                f"详情页异常={abnormal0}/{total0}, 榜单0商品={item['board_zero_cards']}"
+            )
+
 # 每次请求随机选一个浏览器 TLS 指纹 (而不是每次都用同一个 "chrome"),
 # 让 198 个请求不会呈现"完全一样的客户端指纹"这种机器特征。
 _IMPERSONATE_POOL = ["chrome", "firefox", "safari", "edge"]
@@ -441,7 +789,7 @@ def _close_all_sessions():
     _all_sessions.clear()
 
 
-def resolve_product(asin, site, attempts=3):
+def resolve_product(asin, site, attempts=3, monitor=None):
     """纯 HTTP 拉商品详情页, 返回 {brand, bsr_rank, sold_by}。
 
     品牌取 byline "Visit the X Store" (匿名访问下榜单列表标题不含品牌, 详情页才可靠)。
@@ -456,20 +804,35 @@ def resolve_product(asin, site, attempts=3):
     url = f"{site.dp_base}{asin}"
     page = None
     for i in range(1, attempts + 1):
+        impersonate = monitor.current_impersonate() if monitor else _IMPERSONATE_POOL
+        proxy = monitor.current_proxy() if monitor else None
         try:
-            candidate = _get_thread_session().get(
-                url, impersonate=_IMPERSONATE_POOL, cookies=site.locale_cookies or None)
+            request_kwargs = {
+                "impersonate": impersonate,
+                "cookies": site.locale_cookies or None,
+            }
+            if proxy:
+                request_kwargs["proxy"] = proxy
+            candidate = _get_thread_session().get(url, **request_kwargs)
         except Exception as e:
+            if monitor:
+                monitor.record_detail_exception(asin, i, e)
             logger.warning("详情页拉取异常 asin=%s 第%d次: %s", asin, i, e)
             continue
         if candidate.status != 200:
+            if monitor:
+                monitor.record_detail_status(asin, i, candidate.status)
             logger.warning("详情页 asin=%s 第%d次 status=%s", asin, i, candidate.status)
             continue
         if candidate.css("#productTitle").first:
+            if monitor:
+                monitor.record_detail_valid()
             page = candidate
             break
         text = candidate.get_all_text(separator=" ", strip=True)
         hit_marker = next((m for m in _BLOCK_MARKERS if m in text), None)
+        if monitor:
+            monitor.record_detail_soft_failure(asin, i, len(text), hit_marker)
         logger.warning(
             "详情页 asin=%s 第%d次 status=200 但无#productTitle (软失败), 文本长度=%d, 拦截关键词=%s",
             asin, i, len(text), hit_marker,
@@ -488,7 +851,7 @@ def resolve_product(asin, site, attempts=3):
     return {"brand": brand, "bsr_rank": bsr_rank, "sold_by": sold_by}
 
 
-def resolve_all(asins, site, workers=8):
+def resolve_all(asins, site, workers=8, monitor=None):
     """并发解析所有 asin 的品牌与销量榜排名, 返回 asin -> {brand, bsr_rank}。
 
     asin 属于 site 所在站点, 详情页只能用该站 dp 前缀查 (跨站 asin 不通用)。
@@ -500,14 +863,64 @@ def resolve_all(asins, site, workers=8):
     """
     asins = list(asins)
     result, done = {}, 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(resolve_product, a, site): a for a in asins}
-        for fut in as_completed(futs):
-            result[futs[fut]] = fut.result()
-            done += 1
-            if done % 20 == 0 or done == len(asins):
-                print(f"    品牌解析进度 {done}/{len(asins)}")
-    _close_all_sessions()
+
+    if monitor is None:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(resolve_product, a, site): a for a in asins}
+            for fut in as_completed(futs):
+                result[futs[fut]] = fut.result()
+                done += 1
+                if done % 20 == 0 or done == len(asins):
+                    print(f"    品牌解析进度 {done}/{len(asins)}")
+        _close_all_sessions()
+        return result
+
+    next_index = 0
+    active_workers = workers
+    while next_index < len(asins):
+        monitor.open_circuit_if_needed()
+        submitted_until = next_index
+        with ThreadPoolExecutor(max_workers=active_workers) as ex:
+            pending = {}
+
+            def submit_more():
+                nonlocal submitted_until
+                while (
+                    submitted_until < len(asins)
+                    and len(pending) < active_workers
+                    and not monitor.circuit_open
+                ):
+                    asin = asins[submitted_until]
+                    pending[ex.submit(resolve_product, asin, site, monitor=monitor)] = asin
+                    submitted_until += 1
+
+            submit_more()
+            while pending:
+                finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in finished:
+                    asin = pending.pop(fut)
+                    try:
+                        result[asin] = fut.result()
+                    except Exception as e:
+                        logger.exception("详情页解析线程异常 asin=%s: %s", asin, e)
+                        result[asin] = {"brand": None, "bsr_rank": None, "sold_by": None}
+                    done += 1
+                    if done % 20 == 0 or done == len(asins):
+                        print(f"    品牌解析进度 {done}/{len(asins)}")
+                    monitor.open_circuit_if_needed()
+                submit_more()
+
+        _close_all_sessions()
+        next_index = submitted_until
+        if next_index >= len(asins):
+            break
+        if not monitor.circuit_open:
+            continue
+        if not monitor.cooldown_and_rotate_tls():
+            skipped = len(asins) - next_index
+            logger.warning("[%s] 熔断停止: 跳过剩余 %d 个 asin", site.name_cn, skipped)
+            print(f"    [熔断] {site.name_cn} 跳过剩余 {skipped} 个商品详情页，避免继续触发封控")
+            break
     return result
 
 
@@ -678,7 +1091,7 @@ def screenshot_cards(results):
     return shots
 
 
-def _scrape_one(url, label):
+def _scrape_one(url, label, monitor=None):
     """独立开一个浏览器会话抓单个榜单, 供两榜并行抓取调用。
 
     不用 network_idle (亚马逊后台埋点常年不空闲, 等它纯属浪费且时长不可控);
@@ -697,7 +1110,7 @@ def _scrape_one(url, label):
         timeout=40000,
     ) as session:
         print(f"\n[{label}]")
-        return scrape_ranking(session, url, label)
+        return scrape_ranking(session, url, label, monitor=monitor)
 
 
 def _match_brands(site, bestseller_items, new_release_items):
@@ -780,11 +1193,12 @@ def _board_stats_from_results(results):
 def _collect_site(site):
     """抓单站两榜 + 详情页解析 + 按品牌匹配, 返回 (命中记录列表, stats)。"""
     print(f"\n{'=' * 70}\n{site.flag} {site.name_cn}\n{'=' * 70}")
+    monitor = AmazonBlockMonitor(site)
     # 1) 两个独立浏览器会话并行抓两个榜单 (asin + 排名 + 图片)
     t_scrape0 = time.time()
     with ThreadPoolExecutor(max_workers=2) as ex:
-        fut_bs = ex.submit(_scrape_one, site.bestsellers_url, f"{site.name_cn}销量榜")
-        fut_nr = ex.submit(_scrape_one, site.new_releases_url, f"{site.name_cn}新品榜")
+        fut_bs = ex.submit(_scrape_one, site.bestsellers_url, f"{site.name_cn}销量榜", monitor)
+        fut_nr = ex.submit(_scrape_one, site.new_releases_url, f"{site.name_cn}新品榜", monitor)
         bestseller_items = fut_bs.result()
         new_release_items = fut_nr.result()
     t_scrape = time.time() - t_scrape0
@@ -796,10 +1210,11 @@ def _collect_site(site):
     all_asins = {it["asin"] for it in bestseller_items + new_release_items if it["asin"]}
     print(f"\n[品牌解析] {site.name_cn} 共 {len(all_asins)} 个商品, 并发查询详情页...")
     logger.info("[%s] 开始品牌解析, 共 %d 个 asin", site.name_cn, len(all_asins))
-    info = resolve_all(all_asins, site)
+    info = resolve_all(all_asins, site, monitor=monitor)
     t_resolve = time.time() - t_resolve0
     logger.info("[%s] 阶段耗时: 详情页并发解析 %.1fs", site.name_cn, t_resolve)
     print(f"[耗时] {site.name_cn} 详情页并发解析: {t_resolve:.1f}s")
+    monitor.print_summary()
     for it in bestseller_items + new_release_items:
         meta = info.get(it["asin"]) or {}
         it["brand"] = meta.get("brand")
