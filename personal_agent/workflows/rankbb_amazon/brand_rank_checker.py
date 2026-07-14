@@ -408,12 +408,14 @@ def _needs_delivery_location_sold_by(asin, site):
 _BLOCK_MARKERS = ("Enter the characters you see", "Robot Check", "api-services-support@amazon.com",
                    "Sorry, we just need to make sure you're not a robot", "Continue shopping")
 
-_TEMP_BAN_MIN_SAMPLES = 10
+_TEMP_BAN_MIN_SAMPLES = 20
 _TEMP_BAN_BLOCK_RATE = 0.35
 _TEMP_BAN_SUSPICIOUS_RATE = 0.50
 _TEMP_BAN_COOLDOWN_SECONDS = 120  # 用户要求不超过 3 分钟; 这里固定冷却 2 分钟
 _MAX_TLS_ROTATIONS_PER_SITE = 1
 _MAX_PROXY_FALLBACKS_PER_SITE = 3
+_DETAIL_WAIT_HEARTBEAT_SECONDS = 15
+_DETAIL_BATCH_STALL_SECONDS = 90
 _PROXIFLY_HTTPS_PROXY_URL = (
     "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/https/data.txt"
 )
@@ -472,6 +474,10 @@ class AmazonBlockMonitor:
         self.detail_valid = 0
         self.detail_blocked = 0
         self.detail_suspicious = 0
+        self.detail_asins = set()
+        self.detail_valid_asins = set()
+        self.detail_blocked_asins = set()
+        self.detail_suspicious_asins = set()
         self.board_zero_cards = 0
         self.board_exceptions = 0
         self.counters = Counter()
@@ -496,10 +502,28 @@ class AmazonBlockMonitor:
         self.detail_valid = 0
         self.detail_blocked = 0
         self.detail_suspicious = 0
+        self.detail_asins.clear()
+        self.detail_valid_asins.clear()
+        self.detail_blocked_asins.clear()
+        self.detail_suspicious_asins.clear()
         self.board_zero_cards = 0
         self.board_exceptions = 0
         self.counters.clear()
         self.examples.clear()
+
+    def _mark_detail_asin_locked(self, asin, *, blocked=False, suspicious=False, valid=False):
+        self.detail_asins.add(asin)
+        if valid:
+            self.detail_valid_asins.add(asin)
+            self.detail_blocked_asins.discard(asin)
+            self.detail_suspicious_asins.discard(asin)
+            return
+        if asin in self.detail_valid_asins:
+            return
+        if blocked:
+            self.detail_blocked_asins.add(asin)
+        if suspicious:
+            self.detail_suspicious_asins.add(asin)
 
     def record_board_exception(self, label, pg, url, exc):
         with self._lock:
@@ -531,6 +555,7 @@ class AmazonBlockMonitor:
             self.detail_total += 1
             self.detail_suspicious += 1
             self.counters["detail_exception"] += 1
+            self._mark_detail_asin_locked(asin, suspicious=True)
             self._add_example(f"详情页 {asin} 第{attempt}次异常: {type(exc).__name__}: {str(exc)[:120]}")
 
     def record_detail_status(self, asin, attempt, status):
@@ -540,9 +565,11 @@ class AmazonBlockMonitor:
             self.counters[key] += 1
             if status in (403, 429, 503):
                 self.detail_blocked += 1
+                self._mark_detail_asin_locked(asin, blocked=True)
                 self._add_example(f"详情页 {asin} 第{attempt}次 status={status}")
             else:
                 self.detail_suspicious += 1
+                self._mark_detail_asin_locked(asin, suspicious=True)
 
     def record_detail_soft_failure(self, asin, attempt, text_len, marker):
         with self._lock:
@@ -551,15 +578,27 @@ class AmazonBlockMonitor:
             self.counters["detail_no_product_title"] += 1
             if marker:
                 self.detail_blocked += 1
+                self._mark_detail_asin_locked(asin, blocked=True)
                 self.counters[f"detail_marker:{marker}"] += 1
+            else:
+                self._mark_detail_asin_locked(asin, suspicious=True)
             self._add_example(
                 f"详情页 {asin} 第{attempt}次无#productTitle, text_len={text_len}, marker={marker}"
             )
 
-    def record_detail_valid(self):
+    def record_detail_timeout(self, asin, seconds):
+        with self._lock:
+            self.detail_total += 1
+            self.detail_suspicious += 1
+            self.counters["detail_wait_timeout"] += 1
+            self._mark_detail_asin_locked(asin, suspicious=True)
+            self._add_example(f"详情页 {asin} 等待线程返回超时: {seconds:.0f}s")
+
+    def record_detail_valid(self, asin):
         with self._lock:
             self.detail_total += 1
             self.detail_valid += 1
+            self._mark_detail_asin_locked(asin, valid=True)
 
     def snapshot(self):
         with self._lock:
@@ -578,6 +617,11 @@ class AmazonBlockMonitor:
                 "detail_valid": self.detail_valid,
                 "detail_blocked": self.detail_blocked,
                 "detail_suspicious": self.detail_suspicious,
+                "detail_unique": len(self.detail_asins),
+                "detail_valid_unique": len(self.detail_valid_asins),
+                "detail_blocked_unique": len(self.detail_blocked_asins),
+                "detail_suspicious_unique": len(self.detail_suspicious_asins),
+                "detail_abnormal_unique": len(self.detail_blocked_asins | self.detail_suspicious_asins),
                 "board_zero_cards": self.board_zero_cards,
                 "board_exceptions": self.board_exceptions,
                 "counters": dict(self.counters),
@@ -586,13 +630,13 @@ class AmazonBlockMonitor:
 
     def is_temp_ban_suspected(self):
         snap = self.snapshot()
-        total = snap["detail_total"]
         if snap["board_exceptions"] >= 2 or snap["board_zero_cards"] >= 3:
             return True
-        if total < _TEMP_BAN_MIN_SAMPLES:
+        unique_total = snap["detail_unique"]
+        if unique_total < _TEMP_BAN_MIN_SAMPLES:
             return False
-        blocked_rate = snap["detail_blocked"] / total
-        suspicious_rate = (snap["detail_blocked"] + snap["detail_suspicious"]) / total
+        blocked_rate = snap["detail_blocked_unique"] / unique_total
+        suspicious_rate = snap["detail_abnormal_unique"] / unique_total
         return blocked_rate >= _TEMP_BAN_BLOCK_RATE or suspicious_rate >= _TEMP_BAN_SUSPICIOUS_RATE
 
     def open_circuit_if_needed(self):
@@ -611,6 +655,10 @@ class AmazonBlockMonitor:
                 "detail_total": self.detail_total,
                 "detail_blocked": self.detail_blocked,
                 "detail_suspicious": self.detail_suspicious,
+                "detail_unique": len(self.detail_asins),
+                "detail_blocked_unique": len(self.detail_blocked_asins),
+                "detail_suspicious_unique": len(self.detail_suspicious_asins),
+                "detail_abnormal_unique": len(self.detail_blocked_asins | self.detail_suspicious_asins),
                 "board_zero_cards": self.board_zero_cards,
                 "board_exceptions": self.board_exceptions,
                 "counters": dict(self.counters),
@@ -631,11 +679,11 @@ class AmazonBlockMonitor:
             new_fp = _IMPERSONATE_POOL[new_index]
 
         print(
-            f"\n[熔断] {self.site.name_cn}: 检测到疑似 IP 临时封禁，"
+            f"\n[熔断] {self.site.name_cn}: 检测到详情页疑似 Amazon 风控/限流，"
             f"暂停 { _TEMP_BAN_COOLDOWN_SECONDS } 秒后切换 TLS 指纹 {old_fp} -> {new_fp}"
         )
         logger.warning(
-            "[%s] IP 临时封禁熔断: cooldown=%ss tls=%s->%s",
+            "[%s] Amazon 详情页疑似风控/限流熔断: cooldown=%ss tls=%s->%s",
             self.site.name_cn, _TEMP_BAN_COOLDOWN_SECONDS, old_fp, new_fp,
         )
         time.sleep(_TEMP_BAN_COOLDOWN_SECONDS)
@@ -698,53 +746,62 @@ class AmazonBlockMonitor:
             if snap["circuit_history"]:
                 print(
                     f"\n[封控检测] {self.site.name_cn}: 本轮曾触发熔断，"
-                    f"当前 TLS 指纹 {snap['fingerprint']} 未达到临时封禁阈值"
+                    f"当前 TLS 指纹 {snap['fingerprint']} 未达到详情页风控阈值"
                 )
                 for idx, item in enumerate(snap["circuit_history"], 1):
                     total0 = item["detail_total"]
-                    abnormal0 = item["detail_blocked"] + item["detail_suspicious"]
+                    unique0 = item.get("detail_unique", 0)
+                    abnormal0 = item.get("detail_abnormal_unique", item["detail_blocked"] + item["detail_suspicious"])
                     print(
                         f"  熔断历史{idx}: TLS={item['fingerprint']}, "
-                        f"详情页异常={abnormal0}/{total0}, 榜单0商品={item['board_zero_cards']}"
+                        f"详情页异常ASIN={abnormal0}/{unique0}, 请求异常={item['detail_blocked'] + item['detail_suspicious']}/{total0}, "
+                        f"榜单0商品={item['board_zero_cards']}"
                     )
             elif snap["detail_blocked"] or snap["detail_suspicious"] or snap["board_zero_cards"]:
                 print(
-                    f"\n[封控检测] {self.site.name_cn}: 未达到 IP 临时封禁阈值 "
-                    f"(详情页异常={snap['detail_blocked'] + snap['detail_suspicious']}/{total}, "
+                    f"\n[封控检测] {self.site.name_cn}: 未达到详情页风控阈值 "
+                    f"(异常ASIN={snap['detail_abnormal_unique']}/{snap['detail_unique']}, "
+                    f"请求异常={snap['detail_blocked'] + snap['detail_suspicious']}/{total}, "
                     f"榜单0商品={snap['board_zero_cards']})"
                 )
             return
 
-        blocked_rate = (snap["detail_blocked"] / total * 100) if total else 0
+        unique_total = snap["detail_unique"]
+        blocked_rate = (snap["detail_blocked_unique"] / unique_total * 100) if unique_total else 0
         abnormal_rate = (
-            (snap["detail_blocked"] + snap["detail_suspicious"]) / total * 100
-        ) if total else 0
+            snap["detail_abnormal_unique"] / unique_total * 100
+        ) if unique_total else 0
         logger.warning(
-            "[%s] 疑似 IP 临时封禁: detail_total=%s blocked=%s suspicious=%s board_zero=%s counters=%s",
-            self.site.name_cn, total, snap["detail_blocked"], snap["detail_suspicious"],
+            "[%s] 疑似 Amazon 详情页风控/限流: detail_unique=%s abnormal_unique=%s blocked_unique=%s "
+            "detail_total=%s blocked=%s suspicious=%s board_zero=%s counters=%s",
+            self.site.name_cn, unique_total, snap["detail_abnormal_unique"], snap["detail_blocked_unique"],
+            total, snap["detail_blocked"], snap["detail_suspicious"],
             snap["board_zero_cards"], snap["counters"],
         )
-        print(f"\n[封控检测] {self.site.name_cn}: 疑似 IP 处于 Amazon 临时封禁/风控状态")
+        print(f"\n[封控检测] {self.site.name_cn}: 疑似触发 Amazon 详情页风控/限流")
         print(f"  当前 TLS 指纹: {snap['fingerprint']}, 已轮换次数: {snap['rotations']}")
         print(
-            f"  详情页样本: {total}, 明确封控/限流: {snap['detail_blocked']} "
-            f"({blocked_rate:.1f}%), 异常合计: {snap['detail_blocked'] + snap['detail_suspicious']} "
+            f"  详情页ASIN样本: {unique_total}, 明确封控/限流ASIN: {snap['detail_blocked_unique']} "
+            f"({blocked_rate:.1f}%), 异常ASIN合计: {snap['detail_abnormal_unique']} "
             f"({abnormal_rate:.1f}%)"
         )
+        print(f"  详情页请求样本: {total}, 请求异常={snap['detail_blocked'] + snap['detail_suspicious']}")
         print(f"  榜单异常: 0商品页={snap['board_zero_cards']}, 异常退出={snap['board_exceptions']}")
         if snap["counters"]:
             top = ", ".join(f"{k}={v}" for k, v in Counter(snap["counters"]).most_common(6))
             print(f"  证据: {top}")
         for example in snap["examples"]:
             print(f"  - {example}")
-        print("  建议: 本轮停止继续加压该站点, 冷却后再试; 后续可启用熔断+降频策略。")
+        print("  处理: 冷却 120 秒后切换 TLS 指纹，并保持原并发继续。")
 
         for idx, item in enumerate(snap["circuit_history"], 1):
             total0 = item["detail_total"]
-            abnormal0 = item["detail_blocked"] + item["detail_suspicious"]
+            unique0 = item.get("detail_unique", 0)
+            abnormal0 = item.get("detail_abnormal_unique", item["detail_blocked"] + item["detail_suspicious"])
             print(
                 f"  熔断历史{idx}: TLS={item['fingerprint']}, "
-                f"详情页异常={abnormal0}/{total0}, 榜单0商品={item['board_zero_cards']}"
+                f"详情页异常ASIN={abnormal0}/{unique0}, 请求异常={item['detail_blocked'] + item['detail_suspicious']}/{total0}, "
+                f"榜单0商品={item['board_zero_cards']}"
             )
 
 # 每次请求随机选一个浏览器 TLS 指纹 (而不是每次都用同一个 "chrome"),
@@ -826,7 +883,7 @@ def resolve_product(asin, site, attempts=3, monitor=None):
             continue
         if candidate.css("#productTitle").first:
             if monitor:
-                monitor.record_detail_valid()
+                monitor.record_detail_valid(asin)
             page = candidate
             break
         text = candidate.get_all_text(separator=" ", strip=True)
@@ -880,23 +937,65 @@ def resolve_all(asins, site, workers=8, monitor=None):
     while next_index < len(asins):
         monitor.open_circuit_if_needed()
         submitted_until = next_index
-        with ThreadPoolExecutor(max_workers=active_workers) as ex:
-            pending = {}
+        ex = ThreadPoolExecutor(max_workers=active_workers)
+        pending = {}
+        batch_stalled = False
+        last_progress = time.monotonic()
 
-            def submit_more():
-                nonlocal submitted_until
-                while (
-                    submitted_until < len(asins)
-                    and len(pending) < active_workers
-                    and not monitor.circuit_open
-                ):
-                    asin = asins[submitted_until]
-                    pending[ex.submit(resolve_product, asin, site, monitor=monitor)] = asin
-                    submitted_until += 1
+        def submit_more():
+            nonlocal submitted_until
+            while (
+                submitted_until < len(asins)
+                and len(pending) < active_workers
+                and not monitor.circuit_open
+            ):
+                asin = asins[submitted_until]
+                pending[ex.submit(resolve_product, asin, site, monitor=monitor)] = asin
+                submitted_until += 1
 
+        try:
             submit_more()
             while pending:
-                finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+                finished, _ = wait(
+                    pending,
+                    timeout=_DETAIL_WAIT_HEARTBEAT_SECONDS,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not finished:
+                    stalled_for = time.monotonic() - last_progress
+                    logger.warning(
+                        "[%s] 详情页解析等待中: done=%s/%s pending=%s stalled=%.0fs",
+                        site.name_cn, done, len(asins), len(pending), stalled_for,
+                    )
+                    print(
+                        f"    品牌解析等待中 {done}/{len(asins)}，"
+                        f"仍有 {len(pending)} 个详情页请求未返回，已等待 {stalled_for:.0f}s"
+                    )
+                    if stalled_for < _DETAIL_BATCH_STALL_SECONDS:
+                        continue
+
+                    batch_stalled = True
+                    stalled_asins = list(pending.values())
+                    logger.error(
+                        "[%s] 详情页解析等待超过 %.0fs, 标记当前批次 %d 个 asin 失败并触发熔断",
+                        site.name_cn, stalled_for, len(stalled_asins),
+                    )
+                    print(
+                        f"    [详情页超时] {site.name_cn} 当前批次 {len(stalled_asins)} 个请求"
+                        f"超过 {stalled_for:.0f}s 未返回，标记失败并进入熔断处理"
+                    )
+                    for fut, asin in list(pending.items()):
+                        fut.cancel()
+                        monitor.record_detail_timeout(asin, stalled_for)
+                        result[asin] = {"brand": None, "bsr_rank": None, "sold_by": None}
+                        done += 1
+                    pending.clear()
+                    if done % 20 == 0 or done == len(asins):
+                        print(f"    品牌解析进度 {done}/{len(asins)}")
+                    monitor.open_circuit_if_needed()
+                    break
+
+                last_progress = time.monotonic()
                 for fut in finished:
                     asin = pending.pop(fut)
                     try:
@@ -909,6 +1008,8 @@ def resolve_all(asins, site, workers=8, monitor=None):
                         print(f"    品牌解析进度 {done}/{len(asins)}")
                     monitor.open_circuit_if_needed()
                 submit_more()
+        finally:
+            ex.shutdown(wait=not batch_stalled, cancel_futures=batch_stalled)
 
         _close_all_sessions()
         next_index = submitted_until
