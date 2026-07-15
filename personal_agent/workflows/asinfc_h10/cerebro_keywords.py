@@ -194,6 +194,8 @@ MANUAL_EXPORT_MARKET_PREFIXES = {
 
 def normalize_site_suffix(site: str) -> str:
     normalized = site.strip().lower()
+    if normalized.endswith("站"):
+        normalized = normalized[:-1].strip()
     normalized = SITE_ALIASES.get(normalized, normalized)
     for prefix in ("https://www.amazon.", "http://www.amazon.", "www.amazon.", "amazon."):
         if normalized.startswith(prefix):

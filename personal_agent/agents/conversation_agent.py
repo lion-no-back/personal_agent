@@ -355,8 +355,9 @@ class ConversationAgent(BaseAgent):
                 progress_publisher(help_text, "done")
             return help_text
 
+        content_for_match = content.casefold()
         for meta in self._get_ondemand_workflows():
-            if not any(trigger in content for trigger in meta.intent_triggers):
+            if not any(trigger.casefold() in content_for_match for trigger in meta.intent_triggers):
                 continue
 
             delivery_key = self._derive_delivery_key(event)

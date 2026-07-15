@@ -65,7 +65,7 @@ def _parse_request(content: str) -> tuple[str, str] | None:
 
     raw_asin = matches[0]
     asin = raw_asin.upper()
-    site = content.replace(_LOOKUP_TRIGGER, "").replace(raw_asin, "")
+    site = re.sub(re.escape(_LOOKUP_TRIGGER), "", content, flags=re.IGNORECASE).replace(raw_asin, "")
     site = re.sub(r"[\s+＋:：,，;；]+", "", site).strip()
     if not site:
         return None
