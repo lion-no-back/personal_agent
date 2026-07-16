@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from openai import AsyncOpenAI
@@ -13,6 +14,7 @@ if TYPE_CHECKING:
 _BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "10"))
 _MAX_CONCURRENT = 5
 _DIMENSION_CACHE: dict[tuple[str, str], int] = {}
+_EMBED_TEXT_VERSION = "ctx-v1"
 
 
 def _cache_key(content: str, model: str, base_url: str | None, dimension: int) -> str:
@@ -37,6 +39,26 @@ async def _detect_dimension(client: AsyncOpenAI, model: str, base_url: str | Non
     return dimension
 
 
+def _embedding_text(chunk: KBChunk) -> str:
+    """Build retrieval text with compact source context.
+
+    chunk.content stays unchanged for display; this text is only for embedding.
+    Keep the template stable because it is part of the embedding cache identity.
+    """
+    parts = [
+        _EMBED_TEXT_VERSION,
+        f"文件: {Path(chunk.source_path).name}",
+    ]
+    if chunk.title:
+        parts.append(f"标题: {chunk.title}")
+    if chunk.source_type:
+        parts.append(f"类型: {chunk.source_type}")
+    if chunk.page_num is not None:
+        parts.append(f"页码: 第{chunk.page_num}页")
+    parts.append(f"内容:\n{chunk.content}")
+    return "\n".join(parts)
+
+
 async def embed_chunks(
     chunks: list[KBChunk],
     model: str | None = None,
@@ -46,7 +68,9 @@ async def embed_chunks(
         model = os.getenv("EMBED_MODEL_ID", "text-embedding-3-small")
     """Fill chunk.embedding via OpenAI-compatible embedding API.
 
-    Checks kb_embed_cache first (cache_key = sha256(content + model)).
+    Embeds compact contextual text:
+    filename/title/source type/page + chunk.content.
+    Checks kb_embed_cache first.
     Only calls the API for cache misses. Batches up to 200 texts per request.
     """
     if not chunks:
@@ -63,9 +87,10 @@ async def embed_chunks(
 
     to_embed: list[tuple[int, KBChunk]] = []
     for i, chunk in enumerate(chunks):
+        text = _embedding_text(chunk)
         if store is not None:
             cached = store.get_embed_cache(
-                _cache_key(chunk.content, model, base_url, dimension)
+                _cache_key(text, model, base_url, dimension)
             )
             if cached is not None:
                 if len(cached) != dimension:
@@ -87,7 +112,7 @@ async def embed_chunks(
 
     async def _call_batch(batch: list[tuple[int, KBChunk]]) -> None:
         async with sem:
-            texts = [c.content for _, c in batch]
+            texts = [_embedding_text(c) for _, c in batch]
             resp = await client.embeddings.create(input=texts, model=model)
             for (_, chunk), emb_obj in zip(batch, resp.data):
                 if len(emb_obj.embedding) != dimension:
@@ -98,7 +123,9 @@ async def embed_chunks(
                 chunk.embedding = emb_obj.embedding
                 if store is not None:
                     store.set_embed_cache(
-                        _cache_key(chunk.content, model, base_url, dimension),
+                        _cache_key(
+                            _embedding_text(chunk), model, base_url, dimension
+                        ),
                         emb_obj.embedding,
                     )
 
