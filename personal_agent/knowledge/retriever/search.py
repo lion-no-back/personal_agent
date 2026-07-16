@@ -8,6 +8,7 @@ from .keyword import keyword_search_all
 from .query_decomposer import decompose_query
 from .rerank import rerank
 from .rrf import rrf_merge
+from .trace import KBSearchTrace, summarize_pairs, summarize_results
 from .vector import vector_search_all
 
 if TYPE_CHECKING:
@@ -88,74 +89,152 @@ class Retriever:
         return results
 
     async def search(self, query: str, top_k: int = 5) -> list[KBSearchResult]:
-        sub_queries = await decompose_query(query, self._llm)
-
-        # Larger candidate pool so parent-expansion doesn't starve diversity.
-        leaf_recall = max(top_k * 6, 30)
-
-        # Candidate generation from both indexes — each bounded by SQL LIMIT,
-        # no full-table scan. Kick off vector (I/O-bound) before FTS (local).
-        vec_task = asyncio.create_task(
-            vector_search_all(self._store, sub_queries, n=leaf_recall)
-        )
-        kw_cand_ids = self._store.fts_search_all(sub_queries, n=leaf_recall)
-
+        trace = KBSearchTrace("full", query, top_k)
         try:
-            vec_results = await vec_task
-        except Exception:
-            logger.warning("向量检索失败，降级为纯关键词模式", exc_info=True)
-            vec_results = []
+            started = trace.mark()
+            sub_queries = await decompose_query(query, self._llm)
+            trace.latency("decompose", started)
+            trace.set("sub_queries", sub_queries)
 
-        # Fetch only the small candidate union, then run the bespoke keyword
-        # scorer over it (preserves filename/title bonuses on a bounded set).
-        cand_ids = set(kw_cand_ids) | {cid for cid, _ in vec_results}
-        if not cand_ids:
-            return []
-        cand_chunks = self._store.get_chunks_by_ids(list(cand_ids))
-        id_map = {c.id: c for c in cand_chunks}
+            # Larger candidate pool so parent-expansion doesn't starve diversity.
+            leaf_recall = max(top_k * 6, 30)
+            trace.set("leaf_recall", leaf_recall)
 
-        kw_results = keyword_search_all(cand_chunks, sub_queries, n=leaf_recall)
-        fused = rrf_merge(kw_results, vec_results, top_n=leaf_recall)
-        if not fused:
-            return []
+            # Candidate generation from both indexes — each bounded by SQL LIMIT,
+            # no full-table scan. Kick off vector (I/O-bound) before FTS (local).
+            vector_started = trace.mark()
+            vec_task = asyncio.create_task(
+                vector_search_all(self._store, sub_queries, n=leaf_recall)
+            )
+            started = trace.mark()
+            kw_cand_ids = self._store.fts_search_all(sub_queries, n=leaf_recall)
+            trace.latency("fts_candidates", started)
+            trace.set("keyword_candidate_ids", kw_cand_ids)
 
-        kw_ids = {cid for cid, _ in kw_results}
-        vec_ids = {cid for cid, _ in vec_results}
+            try:
+                vec_results = await vec_task
+                trace.latency("vector", vector_started)
+            except Exception as exc:
+                trace.error("vector", exc)
+                logger.warning("向量检索失败，降级为纯关键词模式", exc_info=True)
+                vec_results = []
+            trace.set("vector_candidate_ids", [cid for cid, _ in vec_results])
 
-        ranked = self._expand_parents(fused, id_map)
-        self._fetch_parents(ranked[: top_k * 3], id_map)
-        candidates = self._build_results(ranked[: top_k * 3], id_map, kw_ids, vec_ids)
+            # Fetch only the small candidate union, then run the bespoke keyword
+            # scorer over it (preserves filename/title bonuses on a bounded set).
+            cand_ids = set(kw_cand_ids) | {cid for cid, _ in vec_results}
+            trace.set("candidate_union_ids", list(cand_ids))
+            if not cand_ids:
+                trace.set("final_results", [])
+                return []
 
-        reranked = await rerank(query, candidates, self._llm)
-        return reranked[:top_k]
+            started = trace.mark()
+            cand_chunks = self._store.get_chunks_by_ids(list(cand_ids))
+            trace.latency("fetch_candidates", started)
+            id_map = {c.id: c for c in cand_chunks}
+
+            trace.set("vector_results", summarize_pairs(vec_results, id_map))
+
+            started = trace.mark()
+            kw_results = keyword_search_all(cand_chunks, sub_queries, n=leaf_recall)
+            trace.latency("keyword_score", started)
+            trace.set("keyword_results", summarize_pairs(kw_results, id_map))
+
+            started = trace.mark()
+            fused = rrf_merge(kw_results, vec_results, top_n=leaf_recall)
+            trace.latency("rrf", started)
+            trace.set("rrf_top", summarize_pairs(fused, id_map))
+            if not fused:
+                trace.set("final_results", [])
+                return []
+
+            kw_ids = {cid for cid, _ in kw_results}
+            vec_ids = {cid for cid, _ in vec_results}
+
+            started = trace.mark()
+            ranked = self._expand_parents(fused, id_map)
+            self._fetch_parents(ranked[: top_k * 3], id_map)
+            trace.latency("parent_expand", started)
+            trace.set("expanded_top", summarize_pairs(ranked, id_map, limit=top_k * 3))
+
+            candidates = self._build_results(ranked[: top_k * 3], id_map, kw_ids, vec_ids)
+            trace.set("rerank_input", summarize_results(candidates, limit=top_k * 3))
+
+            started = trace.mark()
+            reranked = await rerank(query, candidates, self._llm)
+            trace.latency("rerank", started)
+            final = reranked[:top_k]
+            trace.set("final_results", summarize_results(final, limit=top_k))
+            return final
+        except Exception as exc:
+            trace.error("search", exc)
+            raise
+        finally:
+            trace.write()
 
     async def search_lightweight(self, query: str, top_k: int = 3) -> list[KBSearchResult]:
         """No-LLM fast path: keyword + vector only, no decompose/rerank."""
-        sub_queries = [query]
-        vec_task = asyncio.create_task(
-            vector_search_all(self._store, sub_queries, n=20)
-        )
-        kw_cand_ids = self._store.fts_search_all(sub_queries, n=20)
-
+        trace = KBSearchTrace("lightweight", query, top_k)
         try:
-            vec_results = await vec_task
-        except Exception:
-            vec_results = []
+            sub_queries = [query]
+            trace.set("sub_queries", sub_queries)
+            vector_started = trace.mark()
+            vec_task = asyncio.create_task(
+                vector_search_all(self._store, sub_queries, n=20)
+            )
+            started = trace.mark()
+            kw_cand_ids = self._store.fts_search_all(sub_queries, n=20)
+            trace.latency("fts_candidates", started)
+            trace.set("keyword_candidate_ids", kw_cand_ids)
 
-        cand_ids = set(kw_cand_ids) | {cid for cid, _ in vec_results}
-        if not cand_ids:
-            return []
-        cand_chunks = self._store.get_chunks_by_ids(list(cand_ids))
-        id_map = {c.id: c for c in cand_chunks}
+            try:
+                vec_results = await vec_task
+                trace.latency("vector", vector_started)
+            except Exception as exc:
+                trace.error("vector", exc)
+                vec_results = []
+            trace.set("vector_candidate_ids", [cid for cid, _ in vec_results])
 
-        kw_results = keyword_search_all(cand_chunks, sub_queries, n=20)
-        fused = rrf_merge(kw_results, vec_results, top_n=top_k * 4)
-        if not fused:
-            return []
+            cand_ids = set(kw_cand_ids) | {cid for cid, _ in vec_results}
+            trace.set("candidate_union_ids", list(cand_ids))
+            if not cand_ids:
+                trace.set("final_results", [])
+                return []
 
-        kw_ids = {cid for cid, _ in kw_results}
-        vec_ids = {cid for cid, _ in vec_results}
+            started = trace.mark()
+            cand_chunks = self._store.get_chunks_by_ids(list(cand_ids))
+            trace.latency("fetch_candidates", started)
+            id_map = {c.id: c for c in cand_chunks}
 
-        ranked = self._expand_parents(fused, id_map)
-        self._fetch_parents(ranked[:top_k], id_map)
-        return self._build_results(ranked[:top_k], id_map, kw_ids, vec_ids)
+            trace.set("vector_results", summarize_pairs(vec_results, id_map))
+
+            started = trace.mark()
+            kw_results = keyword_search_all(cand_chunks, sub_queries, n=20)
+            trace.latency("keyword_score", started)
+            trace.set("keyword_results", summarize_pairs(kw_results, id_map))
+
+            started = trace.mark()
+            fused = rrf_merge(kw_results, vec_results, top_n=top_k * 4)
+            trace.latency("rrf", started)
+            trace.set("rrf_top", summarize_pairs(fused, id_map))
+            if not fused:
+                trace.set("final_results", [])
+                return []
+
+            kw_ids = {cid for cid, _ in kw_results}
+            vec_ids = {cid for cid, _ in vec_results}
+
+            started = trace.mark()
+            ranked = self._expand_parents(fused, id_map)
+            self._fetch_parents(ranked[:top_k], id_map)
+            trace.latency("parent_expand", started)
+            trace.set("expanded_top", summarize_pairs(ranked, id_map, limit=top_k))
+
+            final = self._build_results(ranked[:top_k], id_map, kw_ids, vec_ids)
+            trace.set("final_results", summarize_results(final, limit=top_k))
+            return final
+        except Exception as exc:
+            trace.error("search", exc)
+            raise
+        finally:
+            trace.write()

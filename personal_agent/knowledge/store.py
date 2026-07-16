@@ -38,8 +38,14 @@ class KBStore:
         self._migrate_schema()
 
     def _create_tables(self) -> None:
-        self._conn.executescript(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS kb_fts USING fts5({_FTS_SCHEMA});
+        fts_exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'kb_fts'"
+        ).fetchone() is not None
+        if not fts_exists:
+            self._conn.execute(f"CREATE VIRTUAL TABLE kb_fts USING fts5({_FTS_SCHEMA})")
+            self._conn.commit()
+
+        self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS kb_chunks (
                 id          TEXT PRIMARY KEY,
                 source_hash TEXT NOT NULL,
