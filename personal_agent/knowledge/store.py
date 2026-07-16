@@ -1,8 +1,11 @@
 import array
+from contextlib import contextmanager
 import json
 import logging
 import re
 import sqlite3
+import threading
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,6 +28,8 @@ class KBStore:
     def __init__(self, db_path: str | Path):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._write_lock = threading.RLock()
+        self._tx_depth = 0
         self._conn.enable_load_extension(True)
         sqlite_vec.load(self._conn)
         self._conn.enable_load_extension(False)
@@ -118,6 +123,38 @@ class KBStore:
     def _placeholders(ids: list[str]) -> str:
         return ",".join("?" * len(ids))
 
+    def _commit_if_needed(self) -> None:
+        if self._tx_depth == 0:
+            self._conn.commit()
+
+    @contextmanager
+    def write_transaction(self) -> Iterator[None]:
+        """Serialize writes and make a single ingest file commit atomically.
+
+        BEGIN IMMEDIATE takes SQLite's write lock up front, so concurrent writers
+        wait instead of interleaving chunk deletion, vector writes, and lineage
+        updates. Nested calls join the outer transaction.
+        """
+        with self._write_lock:
+            if self._tx_depth > 0:
+                self._tx_depth += 1
+                try:
+                    yield
+                finally:
+                    self._tx_depth -= 1
+                return
+
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._tx_depth = 1
+            try:
+                yield
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            finally:
+                self._tx_depth = 0
+
     def _table_exists(self, name: str) -> bool:
         row = self._conn.execute(
             "SELECT 1 FROM sqlite_master WHERE name = ?",
@@ -146,7 +183,7 @@ class KBStore:
                 embedding FLOAT[{dimension}]
             )"""
         )
-        self._conn.commit()
+        self._commit_if_needed()
 
     def _get_meta(self, key: str) -> str | None:
         row = self._conn.execute(
@@ -160,7 +197,7 @@ class KBStore:
             "INSERT OR REPLACE INTO kb_meta (key, value) VALUES (?, ?)",
             (key, value),
         )
-        self._conn.commit()
+        self._commit_if_needed()
 
     def ensure_embedding_config(
         self,
@@ -174,38 +211,39 @@ class KBStore:
         changes while vectors exist, the old vectors must be rebuilt rather
         than mixed with the new coordinate space.
         """
-        if dimension <= 0:
-            raise ValueError(f"invalid embedding dimension: {dimension}")
+        with self._write_lock:
+            if dimension <= 0:
+                raise ValueError(f"invalid embedding dimension: {dimension}")
 
-        active = {
-            "model": model,
-            "base_url": base_url or "",
-            "dimension": dimension,
-        }
-        existing_json = self._get_meta("embedding_config")
-        if existing_json:
-            try:
-                existing = json.loads(existing_json)
-            except json.JSONDecodeError:
-                existing = {}
-            if existing != active and self.vector_count() > 0:
-                raise RuntimeError(
-                    "Embedding config changed; rebuild the knowledge base vectors "
-                    f"before searching or ingesting. existing={existing}, active={active}"
-                )
+            active = {
+                "model": model,
+                "base_url": base_url or "",
+                "dimension": dimension,
+            }
+            existing_json = self._get_meta("embedding_config")
+            if existing_json:
+                try:
+                    existing = json.loads(existing_json)
+                except json.JSONDecodeError:
+                    existing = {}
+                if existing != active and self.vector_count() > 0:
+                    raise RuntimeError(
+                        "Embedding config changed; rebuild the knowledge base vectors "
+                        f"before searching or ingesting. existing={existing}, active={active}"
+                    )
 
-        current_dim = self.get_vector_dim()
-        if current_dim != dimension:
-            if current_dim is not None and self.vector_count() > 0:
-                raise RuntimeError(
-                    "Embedding dimension changed; rebuild the knowledge base vectors "
-                    f"before searching or ingesting. existing={current_dim}, active={dimension}"
-                )
-            self._conn.execute("DROP TABLE IF EXISTS kb_vec")
-            self._conn.commit()
-            self._create_vector_table(dimension)
+            current_dim = self.get_vector_dim()
+            if current_dim != dimension:
+                if current_dim is not None and self.vector_count() > 0:
+                    raise RuntimeError(
+                        "Embedding dimension changed; rebuild the knowledge base vectors "
+                        f"before searching or ingesting. existing={current_dim}, active={dimension}"
+                    )
+                self._conn.execute("DROP TABLE IF EXISTS kb_vec")
+                self._commit_if_needed()
+                self._create_vector_table(dimension)
 
-        self._set_meta("embedding_config", json.dumps(active, ensure_ascii=False))
+            self._set_meta("embedding_config", json.dumps(active, ensure_ascii=False))
 
     def _upsert_vec(self, cur: sqlite3.Cursor, chunk_id: str, embedding: list[float]) -> None:
         dim = self.get_vector_dim()
@@ -251,7 +289,7 @@ class KBStore:
         for chunk in chunks:
             if chunk.embedding is not None:
                 self._upsert_vec(cur, chunk.id, chunk.embedding)
-        self._conn.commit()
+        self._commit_if_needed()
 
     def upsert_source(self, source: KBSource) -> None:
         self._conn.execute(
@@ -264,7 +302,7 @@ class KBStore:
                 json.dumps(source.chunk_ids),
             ),
         )
-        self._conn.commit()
+        self._commit_if_needed()
 
     def get_source(self, path: str | Path) -> KBSource | None:
         row = self._conn.execute(
@@ -286,7 +324,7 @@ class KBStore:
         if self._table_exists("kb_vec"):
             self._conn.execute(f"DELETE FROM kb_vec WHERE chunk_id IN ({ph})", ids)
         self._conn.execute(f"DELETE FROM kb_fts WHERE chunk_id IN ({ph})", ids)
-        self._conn.commit()
+        self._commit_if_needed()
 
     def delete_source(self, path: str | Path) -> None:
         p = str(path)
@@ -299,7 +337,7 @@ class KBStore:
         )
         self._conn.execute("DELETE FROM kb_chunks WHERE source_path = ?", (p,))
         self._conn.execute("DELETE FROM kb_sources WHERE path = ?", (p,))
-        self._conn.commit()
+        self._commit_if_needed()
 
     def get_chunks_by_ids(self, ids: list[str]) -> list[KBChunk]:
         if not ids:
@@ -334,13 +372,14 @@ class KBStore:
         return array.array("f", row[0]).tolist()
 
     def set_embed_cache(self, content_hash: str, embedding: list[float]) -> None:
-        self._conn.execute(
-            """INSERT OR REPLACE INTO kb_embed_cache (content_hash, embedding, created_at)
-               VALUES (?,?,?)""",
-            (content_hash, array.array("f", embedding).tobytes(),
-             datetime.now(timezone.utc).isoformat()),
-        )
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO kb_embed_cache (content_hash, embedding, created_at)
+                   VALUES (?,?,?)""",
+                (content_hash, array.array("f", embedding).tobytes(),
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            self._commit_if_needed()
 
     def get_all_chunks(self) -> list[KBChunk]:
         rows = self._conn.execute(

@@ -136,17 +136,21 @@ class Pipeline:
         _embedded = {c.id: c for c in _to_embed}
         chunks = [_embedded.get(c.id, c) for c in chunks]
 
-        # Step 6: Write lineage & replace old chunks
-        if source:
-            self._store.delete_chunks(source.chunk_ids)
-        self._store.upsert_chunks(chunks)
-        self._store.upsert_source(KBSource(
-            path=str(path),
-            hash=current_hash,
-            last_synced=datetime.now(timezone.utc).isoformat(),
-            cot_used=cot_was_used,
-            chunk_ids=[c.id for c in chunks],
-        ))
+        # Step 6: Write lineage & replace old chunks.
+        # Keep the expensive parse/LLM/embed work outside the lock; only the
+        # delete+insert+lineage swap is serialized and atomic.
+        with self._store.write_transaction():
+            latest_source = self._store.get_source(path)
+            if latest_source:
+                self._store.delete_chunks(latest_source.chunk_ids)
+            self._store.upsert_chunks(chunks)
+            self._store.upsert_source(KBSource(
+                path=str(path),
+                hash=current_hash,
+                last_synced=datetime.now(timezone.utc).isoformat(),
+                cot_used=cot_was_used,
+                chunk_ids=[c.id for c in chunks],
+            ))
         return IngestResult(chunks_added=len(chunks))
 
     async def ingest_batch(
