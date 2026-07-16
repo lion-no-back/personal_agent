@@ -11,25 +11,34 @@ if TYPE_CHECKING:
 _DEFAULT_MODEL = os.getenv("EMBED_MODEL_ID", "text-embedding-3-small")
 
 
-@functools.lru_cache(maxsize=1)
-def _get_client() -> AsyncOpenAI:
+@functools.lru_cache(maxsize=8)
+def _get_client(base_url: str | None) -> AsyncOpenAI:
     """Lazy singleton — defers construction until first call so env vars are read at use time."""
     return AsyncOpenAI(
         api_key=os.getenv("EMBED_API_KEY"),
-        base_url=os.getenv("EMBED_BASE_URL") or None,
+        base_url=base_url,
     )
 
 
-async def _embed_query(query: str, model: str = _DEFAULT_MODEL) -> list[float]:
-    resp = await _get_client().embeddings.create(input=[query], model=model)
-    return resp.data[0].embedding
+def _embedding_settings() -> tuple[str, str | None]:
+    return (
+        os.getenv("EMBED_MODEL_ID", _DEFAULT_MODEL),
+        os.getenv("EMBED_BASE_URL") or None,
+    )
+
+
+async def _embed_query(query: str) -> tuple[list[float], str, str | None]:
+    model, base_url = _embedding_settings()
+    resp = await _get_client(base_url).embeddings.create(input=[query], model=model)
+    return resp.data[0].embedding, model, base_url
 
 
 async def vector_search(
     store: "KBStore", query: str, n: int = 40
 ) -> list[tuple[str, float]]:
     """Return (chunk_id, similarity_score) pairs; higher = more similar."""
-    embedding = await _embed_query(query)
+    embedding, model, base_url = await _embed_query(query)
+    store.ensure_embedding_config(len(embedding), model, base_url)
     raw = store.vector_search(embedding, n)
     return [(chunk_id, 1.0 / (1.0 + dist)) for chunk_id, dist in raw]
 

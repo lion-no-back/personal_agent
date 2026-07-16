@@ -1,7 +1,7 @@
 import array
 import json
 import logging
-import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,8 +11,6 @@ import sqlite_vec
 from .types import KBChunk, KBSource
 
 logger = logging.getLogger(__name__)
-
-_EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
 
 # FTS5 trigram requires each query term to be >= 3 characters.
 # Shorter queries fall back to LIKE on title + source_path (both short fields).
@@ -35,10 +33,6 @@ class KBStore:
 
     def _create_tables(self) -> None:
         self._conn.executescript(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS kb_vec USING vec0(
-                chunk_id TEXT,
-                embedding FLOAT[{_EMBED_DIM}]
-            );
             CREATE VIRTUAL TABLE IF NOT EXISTS kb_fts USING fts5({_FTS_SCHEMA});
             CREATE TABLE IF NOT EXISTS kb_chunks (
                 id          TEXT PRIMARY KEY,
@@ -67,6 +61,10 @@ class KBStore:
                 content_hash TEXT PRIMARY KEY,
                 embedding    BLOB NOT NULL,
                 created_at   TEXT
+            );
+            CREATE TABLE IF NOT EXISTS kb_meta (
+                key         TEXT PRIMARY KEY,
+                value       TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_chunks_source ON kb_chunks(source_path);
             CREATE INDEX IF NOT EXISTS idx_chunks_title  ON kb_chunks(title);
@@ -120,7 +118,103 @@ class KBStore:
     def _placeholders(ids: list[str]) -> str:
         return ",".join("?" * len(ids))
 
+    def _table_exists(self, name: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = ?",
+            (name,),
+        ).fetchone()
+        return row is not None
+
+    def get_vector_dim(self) -> int | None:
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'kb_vec'"
+        ).fetchone()
+        if row is None or not row[0]:
+            return None
+        match = re.search(r"embedding\s+FLOAT\[(\d+)\]", row[0], re.IGNORECASE)
+        return int(match.group(1)) if match else None
+
+    def vector_count(self) -> int:
+        if not self._table_exists("kb_vec"):
+            return 0
+        return int(self._conn.execute("SELECT COUNT(1) FROM kb_vec").fetchone()[0])
+
+    def _create_vector_table(self, dimension: int) -> None:
+        self._conn.execute(
+            f"""CREATE VIRTUAL TABLE kb_vec USING vec0(
+                chunk_id TEXT,
+                embedding FLOAT[{dimension}]
+            )"""
+        )
+        self._conn.commit()
+
+    def _get_meta(self, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM kb_meta WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def _set_meta(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO kb_meta (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        self._conn.commit()
+
+    def ensure_embedding_config(
+        self,
+        dimension: int,
+        model: str,
+        base_url: str | None,
+    ) -> None:
+        """Ensure kb_vec matches the active embedding provider/model/dimension.
+
+        sqlite-vec tables are dimension-fixed. If the active embedding config
+        changes while vectors exist, the old vectors must be rebuilt rather
+        than mixed with the new coordinate space.
+        """
+        if dimension <= 0:
+            raise ValueError(f"invalid embedding dimension: {dimension}")
+
+        active = {
+            "model": model,
+            "base_url": base_url or "",
+            "dimension": dimension,
+        }
+        existing_json = self._get_meta("embedding_config")
+        if existing_json:
+            try:
+                existing = json.loads(existing_json)
+            except json.JSONDecodeError:
+                existing = {}
+            if existing != active and self.vector_count() > 0:
+                raise RuntimeError(
+                    "Embedding config changed; rebuild the knowledge base vectors "
+                    f"before searching or ingesting. existing={existing}, active={active}"
+                )
+
+        current_dim = self.get_vector_dim()
+        if current_dim != dimension:
+            if current_dim is not None and self.vector_count() > 0:
+                raise RuntimeError(
+                    "Embedding dimension changed; rebuild the knowledge base vectors "
+                    f"before searching or ingesting. existing={current_dim}, active={dimension}"
+                )
+            self._conn.execute("DROP TABLE IF EXISTS kb_vec")
+            self._conn.commit()
+            self._create_vector_table(dimension)
+
+        self._set_meta("embedding_config", json.dumps(active, ensure_ascii=False))
+
     def _upsert_vec(self, cur: sqlite3.Cursor, chunk_id: str, embedding: list[float]) -> None:
+        dim = self.get_vector_dim()
+        if dim is None:
+            raise RuntimeError("kb_vec has not been created for the active embedding dimension")
+        if len(embedding) != dim:
+            raise RuntimeError(
+                f"Embedding dimension mismatch for chunk {chunk_id}: got {len(embedding)}, expected {dim}"
+            )
         cur.execute("DELETE FROM kb_vec WHERE chunk_id = ?", (chunk_id,))
         cur.execute(
             "INSERT INTO kb_vec (chunk_id, embedding) VALUES (?, ?)",
@@ -189,15 +283,17 @@ class KBStore:
             return
         ph = self._placeholders(ids)
         self._conn.execute(f"DELETE FROM kb_chunks WHERE id IN ({ph})", ids)
-        self._conn.execute(f"DELETE FROM kb_vec WHERE chunk_id IN ({ph})", ids)
+        if self._table_exists("kb_vec"):
+            self._conn.execute(f"DELETE FROM kb_vec WHERE chunk_id IN ({ph})", ids)
         self._conn.execute(f"DELETE FROM kb_fts WHERE chunk_id IN ({ph})", ids)
         self._conn.commit()
 
     def delete_source(self, path: str | Path) -> None:
         p = str(path)
-        self._conn.execute(
-            "DELETE FROM kb_vec WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE source_path = ?)", (p,)
-        )
+        if self._table_exists("kb_vec"):
+            self._conn.execute(
+                "DELETE FROM kb_vec WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE source_path = ?)", (p,)
+            )
         self._conn.execute(
             "DELETE FROM kb_fts WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE source_path = ?)", (p,)
         )
@@ -255,6 +351,13 @@ class KBStore:
         return [self._row_to_chunk(row) for row in rows]
 
     def vector_search(self, embedding: list[float], n: int = 40) -> list[tuple[str, float]]:
+        dim = self.get_vector_dim()
+        if dim is None:
+            return []
+        if len(embedding) != dim:
+            raise RuntimeError(
+                f"Query embedding dimension mismatch: got {len(embedding)}, expected {dim}"
+            )
         rows = self._conn.execute(
             "SELECT chunk_id, distance FROM kb_vec WHERE embedding MATCH ? LIMIT ?",
             (json.dumps(embedding), n),
@@ -309,4 +412,6 @@ class KBStore:
         print(f"Sources  : {row[0]}")
         print(f"Chunks   : {row[1]}")
         print(f"EmbCache : {row[2]} entries")
+        print(f"VecDim   : {self.get_vector_dim() or 'not initialized'}")
+        print(f"VecRows  : {self.vector_count()}")
         print(f"Last sync: {row[3] or 'never'}")
