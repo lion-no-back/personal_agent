@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..paths import canonical_source_path
 from ..store import KBStore
 from ..types import KBChunk, KBSource
 from . import chunker, embedder
@@ -90,7 +91,7 @@ class Pipeline:
     # ── main entry points ──────────────────────────────────────────
 
     async def ingest(self, path: str | Path, force: bool = False) -> IngestResult:
-        path = Path(path)
+        path = canonical_source_path(path)
         if not path.exists():
             return IngestResult(skipped=True, reason="not found")
 

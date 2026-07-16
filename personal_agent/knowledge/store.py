@@ -11,6 +11,7 @@ from pathlib import Path
 
 import sqlite_vec
 
+from .paths import canonical_source_path
 from .types import KBChunk, KBSource
 
 logger = logging.getLogger(__name__)
@@ -305,6 +306,7 @@ class KBStore:
         self._commit_if_needed()
 
     def get_source(self, path: str | Path) -> KBSource | None:
+        path = canonical_source_path(path)
         row = self._conn.execute(
             "SELECT path, hash, last_synced, cot_used, chunk_ids FROM kb_sources WHERE path = ?",
             (str(path),),
@@ -327,7 +329,7 @@ class KBStore:
         self._commit_if_needed()
 
     def delete_source(self, path: str | Path) -> None:
-        p = str(path)
+        p = str(canonical_source_path(path))
         if self._table_exists("kb_vec"):
             self._conn.execute(
                 "DELETE FROM kb_vec WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE source_path = ?)", (p,)

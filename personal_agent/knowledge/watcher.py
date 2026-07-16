@@ -8,6 +8,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .ingester.pipeline import Pipeline, _SOURCE_TYPE_MAP
+from .paths import canonical_source_path
 from .store import KBStore
 
 logger = logging.getLogger(__name__)
@@ -42,7 +43,8 @@ class KBWatcher:
     # ── called from watchdog thread ────────────────────────────────
 
     def _schedule(self, path: str, action: Action) -> None:
-        self._loop.call_soon_threadsafe(self._debounce, path, action)
+        canonical = str(canonical_source_path(path))
+        self._loop.call_soon_threadsafe(self._debounce, canonical, action)
 
     # ── runs on loop thread ────────────────────────────────────────
 
